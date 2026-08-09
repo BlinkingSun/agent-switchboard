@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""switchboard — slot registry, event-driven waits, and a background status
+service for AI agent lanes (Agent Switchboard).
+
+OBSERVE/ALERT ONLY. This tool never signals, kills, restarts, or re-dispatches
+anything (design rule: no autonomous destructive enforcement).
+It derives lane state from facts that exist anyway — pids, grok session file
+mtimes, slot records written by agent-dispatch — so workers never have to
+self-report heartbeats.
+
+Cross-platform: macOS / Linux / Windows, Python 3.9+ stdlib only.
+
+State layout ($AGENT_SWITCHBOARD_ROOT, default ~/.agent-switchboard/state):
+  <task>/slot-<lane>.json   written by agent-dispatch, derived fields on read
+  <task>/events.jsonl       append-only observation log
+  <task>/history/           archived slots from finished/replaced lanes
+
+Derived states:
+  RUNNING  worker pid alive with recent/unknown activity — ALSO shown briefly
+           when the worker just exited and its wrapper is still finalizing
+  QUIET    worker pid alive but no session activity for --quiet-after secs
+  ORPHAN   worker alive but its wrapper died: exit will never be auto-
+           recorded. Alert-worthy, but the worker may still be progressing —
+           do NOT treat as dead.
+  DONE     wrapper finalized, exit code 0
+  FAILED   wrapper finalized, exit code != 0
+  DIED     worker AND wrapper both gone without finalization (silent kill)
+  CORRUPT  slot file unreadable — surfaced, never silently dropped
+
+Commands:
+  switchboard status [--task T] [--json] [--quiet-after S]
+  switchboard wait   --task T [--timeout S] [--interval S] [--lane L ...]
+                     [--watch-file P ...] [--alert-quiet] [--quiet-after S]
+  switchboard events --task T [-n N]
+  switchboard serve  [--host 127.0.0.1] [--port 17920]
+
+wait exit codes: 0 = event occurred (or all watched lanes already terminal),
+3 = timeout with no event. wait returns on transitions to DONE/FAILED/DIED/
+ORPHAN/CORRUPT, on --watch-file changes, and (with --alert-quiet) on QUIET.
+
+serve HTTP API (read-only): GET /v1/health /v1/tasks /v1/status /v1/events
+and long-poll /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55].
+
+PID-reuse hardening: on POSIX every liveness pass takes ONE `ps` snapshot and
+requires the recorded program name to still appear in the pid's command line;
+a recycled pid therefore reads as dead. On Windows OpenProcess is used
+(never os.kill — sig 0 there TERMINATES the target) and access-denied counts
+as alive (fail-open: a query failure must not fabricate a DIED alert).
+"""
+
+import argparse
+import datetime
+import glob
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+VERSION = "1.0.0"
+ROOT = os.environ.get(
+    "AGENT_SWITCHBOARD_ROOT",
+    os.path.expanduser("~/.agent-switchboard/state"),
+)
+GROK_SESS_ROOT = os.path.expanduser("~/.grok/sessions")
+TERMINAL = {"DONE", "FAILED", "DIED", "ORPHAN"}
+ALERTING = TERMINAL | {"CORRUPT"}
+DEFAULT_QUIET_AFTER = 300
+DEFAULT_PORT = 17920
+
+
+def name_ok(name):
+    return bool(name) and all(c.isalnum() or c in "-_." for c in name) and name not in (".", "..")
+
+
+def iso(t=None):
+    return datetime.datetime.fromtimestamp(t if t is not None else time.time()).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+
+
+def task_dir(task):
+    return os.path.join(ROOT, task)
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- process probe
+
+if os.name == "nt":
+    import ctypes
+
+    def pid_alive(pid):
+        # NEVER use os.kill(pid, 0) on Windows — any sig other than the two
+        # CTRL events unconditionally TerminateProcess()es the target.
+        if not pid:
+            return False
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_ACCESS_DENIED = 5
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            # query failure != death; only a definitive lookup miss is dead
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED or \
+                k32.GetLastError() == ERROR_ACCESS_DENIED
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return True  # fail-open
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+else:
+
+    def pid_alive(pid):
+        if not pid:
+            return False
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+
+def ps_snapshot():
+    """POSIX: one {pid: command} map per liveness pass (also defeats pid reuse)."""
+    if os.name == "nt":
+        return None
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "pid=,command="], text=True, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        return None
+    snap = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_s, _, cmd = line.partition(" ")
+        try:
+            snap[int(pid_s)] = cmd
+        except ValueError:
+            pass
+    return snap
+
+
+def proc_alive(pid, expect_substr=None, snap=None):
+    """Alive AND (when identity is recorded) still the same program."""
+    if not pid:
+        return False
+    if snap is not None:
+        cmd = snap.get(int(pid))
+        if cmd is None:
+            return False
+        if expect_substr and expect_substr not in cmd:
+            return False  # pid recycled by an unrelated process
+        return True
+    return pid_alive(pid)
+
+
+# ---------------------------------------------------------------- slot reading
+
+
+def session_dir_for(slot):
+    """Best-effort: locate the grok CLI session dir backing this lane.
+    Reliable only when the lane has a session_id (resumed channel) or a
+    unique -d per lane; documented in INTEGRATIONS.md."""
+    cwd = slot.get("cwd")
+    if not cwd:
+        return None
+    root = os.path.join(GROK_SESS_ROOT, urllib.parse.quote(cwd, safe=""))
+    sid = slot.get("session_id")
+    if sid:
+        d = os.path.join(root, sid)
+        if os.path.isdir(d):
+            return d
+    best = None
+    try:
+        for name in os.listdir(root):
+            d = os.path.join(root, name)
+            if not os.path.isdir(d):
+                continue
+            st = os.stat(d)
+            birth = getattr(st, "st_birthtime", st.st_mtime)
+            if birth >= slot.get("started", 0) - 5:
+                if best is None or birth < best[0]:
+                    best = (birth, d)
+    except FileNotFoundError:
+        return None
+    return best[1] if best else None
+
+
+def activity_age(slot):
+    d = session_dir_for(slot)
+    if not d:
+        return None
+    newest = 0.0
+    for name in ("updates.jsonl", "events.jsonl", "chat_history.jsonl"):
+        try:
+            newest = max(newest, os.stat(os.path.join(d, name)).st_mtime)
+        except FileNotFoundError:
+            pass
+    return (time.time() - newest) if newest else None
+
+
+def derive(slot, quiet_after=DEFAULT_QUIET_AFTER, snap=None):
+    """-> (STATE, activity_age_or_None)"""
+    if slot.get("corrupt"):
+        return ("CORRUPT", None)
+    if slot.get("status") == "exited":
+        return ("DONE" if slot.get("exit_code") == 0 else "FAILED", None)
+    child_ok = proc_alive(slot.get("pid"), slot.get("prog_base"), snap)
+    wrapper_ok = proc_alive(slot.get("wrapper_pid"), slot.get("wrapper_base", "agent-dispatch"), snap)
+    if not child_ok and not wrapper_ok:
+        return ("DIED", None)  # silent kill: nobody left to finalize
+    if child_ok and not wrapper_ok:
+        return ("ORPHAN", activity_age(slot))
+    if not child_ok and wrapper_ok:
+        # worker just exited; wrapper is finalizing — NOT a death (audit #1)
+        return ("RUNNING", None)
+    age = activity_age(slot)
+    if age is not None and age > quiet_after:
+        return ("QUIET", age)
+    return ("RUNNING", age)
+
+
+def load_slots(task):
+    out = {}
+    for path in sorted(glob.glob(os.path.join(task_dir(task), "slot-*.json"))):
+        lane = os.path.basename(path)[5:-5]
+        slot = read_json(path)
+        if slot is None:
+            # unreadable slot must be VISIBLE, never silently dropped (audit #8)
+            slot = {"lane": lane, "corrupt": True}
+        out[slot.get("lane", lane)] = slot
+    return out
+
+
+def append_event(task, event):
+    event = dict(event, ts=iso())
+    os.makedirs(task_dir(task), exist_ok=True)
+    with open(os.path.join(task_dir(task), "events.jsonl"), "a") as f:
+        f.write(json.dumps(event) + "\n")
+    return event
+
+
+def list_tasks():
+    if not os.path.isdir(ROOT):
+        return []
+    return sorted(d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d)))
+
+
+def task_status(task, quiet_after=DEFAULT_QUIET_AFTER, snap=None):
+    if snap is None:
+        snap = ps_snapshot()
+    rows = []
+    for lane, slot in sorted(load_slots(task).items()):
+        state, age = derive(slot, quiet_after, snap)
+        rows.append(
+            {
+                "lane": lane,
+                "state": state,
+                "pid": slot.get("pid"),
+                "wrapper_pid": slot.get("wrapper_pid"),
+                "started": iso(slot.get("started", 0)) if not slot.get("corrupt") else None,
+                "age_s": round(time.time() - slot.get("started", time.time())),
+                "activity_s": round(age) if age is not None else None,
+                "exit_code": slot.get("exit_code"),
+                "channel": slot.get("channel"),
+                "report": slot.get("report"),
+            }
+        )
+    return {"task": task, "slots": rows}
+
+
+# ---------------------------------------------------------------- CLI: status
+
+
+def fmt_age(secs):
+    if secs is None:
+        return "-"
+    if secs < 90:
+        return f"{secs:.0f}s"
+    if secs < 5400:
+        return f"{secs / 60:.0f}m"
+    return f"{secs / 3600:.1f}h"
+
+
+def print_status(task, quiet_after, snap=None):
+    st = task_status(task, quiet_after, snap)
+    print(f"TASK {task}  ({task_dir(task)})")
+    if not st["slots"]:
+        print("  (no slots)")
+        return
+    print(
+        f"  {'LANE':22} {'STATE':8} {'PID':>7} {'UP':>6} {'ACTIVITY':>9} {'EXIT':>4}  CHANNEL"
+    )
+    for r in st["slots"]:
+        act = fmt_age(r["activity_s"]) + " ago" if r["activity_s"] is not None else "-"
+        ec = "-" if r["exit_code"] is None else str(r["exit_code"])
+        print(
+            f"  {r['lane']:22} {r['state']:8} {str(r['pid'] or '-'):>7} "
+            f"{fmt_age(r['age_s']):>6} {act:>9} {ec:>4}  {r['channel'] or '-'}"
+        )
+
+
+def cmd_status(args):
+    tasks = [args.task] if args.task else list_tasks()
+    if not tasks:
+        print("no tasks registered")
+        return 0
+    snap = ps_snapshot()
+    if args.json:
+        print(json.dumps([task_status(t, args.quiet_after, snap) for t in tasks], indent=2))
+    else:
+        for t in tasks:
+            print_status(t, args.quiet_after, snap)
+    return 0
+
+
+# ---------------------------------------------------------------- CLI: wait
+
+
+def file_sig(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime, st.st_size)
+    except FileNotFoundError:
+        return None
+
+
+def cmd_wait(args):
+    lanes_filter = set(args.lane or [])
+
+    def snapshot():
+        snap = ps_snapshot()
+        slots = load_slots(args.task)
+        if lanes_filter:
+            slots = {k: v for k, v in slots.items() if k in lanes_filter}
+        return {k: derive(v, args.quiet_after, snap)[0] for k, v in slots.items()}
+
+    base_states = snapshot()
+    base_files = {p: file_sig(p) for p in (args.watch_file or [])}
+
+    # ORPHAN alerts on transition but does NOT count as settled here — its
+    # worker is still alive, and early-returning on it would let a caller
+    # spin no-op waits (audit residual #1).
+    settled = {"DONE", "FAILED", "DIED"}
+    live = [l for l, s in base_states.items() if s not in settled]
+    if base_states and not live and not base_files:
+        print("all watched lanes already terminal:")
+        print_status(args.task, args.quiet_after)
+        return 0
+
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        time.sleep(args.interval)
+        events = []
+        cur = snapshot()
+        for lane, state in cur.items():
+            old = base_states.get(lane)
+            if state == old:
+                continue
+            if state in ALERTING or (args.alert_quiet and state == "QUIET"):
+                events.append({"event": "lane", "lane": lane, "from": old, "to": state})
+            base_states[lane] = state
+        for path, sig in base_files.items():
+            new = file_sig(path)
+            if new != sig:
+                events.append({"event": "file", "path": path})
+                base_files[path] = new
+        if events:
+            for e in events:
+                append_event(args.task, e)
+                if e["event"] == "lane":
+                    print(f"EVENT lane {e['lane']}: {e['from']} -> {e['to']}")
+                else:
+                    print(f"EVENT file changed: {e['path']}")
+            print_status(args.task, args.quiet_after)
+            return 0
+    print(f"TIMEOUT after {args.timeout}s, no event")
+    print_status(args.task, args.quiet_after)
+    return 3
+
+
+def cmd_events(args):
+    path = os.path.join(task_dir(args.task), "events.jsonl")
+    if not os.path.exists(path):
+        print("(no events)")
+        return 0
+    with open(path) as f:
+        lines = f.readlines()
+    for line in lines[-args.n:]:
+        sys.stdout.write(line)
+    return 0
+
+
+# ---------------------------------------------------------------- serve (daemon)
+
+
+class EventBus:
+    def __init__(self, maxlen=2000):
+        self.cond = threading.Condition()
+        self.events = []
+        self.seq = 0
+        self.maxlen = maxlen
+
+    def publish(self, task, event):
+        with self.cond:
+            self.seq += 1
+            rec = dict(event, seq=self.seq, task=task)
+            self.events.append(rec)
+            if len(self.events) > self.maxlen:
+                self.events = self.events[-self.maxlen:]
+            self.cond.notify_all()
+            return rec
+
+    def wait_for(self, cursor, task=None, lanes=None, timeout=55.0):
+        deadline = time.time() + timeout
+        with self.cond:
+            while True:
+                hits = [
+                    e
+                    for e in self.events
+                    if e["seq"] > cursor
+                    and (task is None or e["task"] == task)
+                    and (not lanes or e.get("lane") in lanes or e["event"] == "file")
+                ]
+                if hits:
+                    return self.seq, hits
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return self.seq, []
+                self.cond.wait(min(remaining, 1.0))
+
+
+def watcher_loop(bus, quiet_after, stop_evt, tick=1.0):
+    last = {}
+    while not stop_evt.is_set():
+        snap = ps_snapshot()
+        for task in list_tasks():
+            for lane, slot in load_slots(task).items():
+                state, _ = derive(slot, quiet_after, snap)
+                key = (task, lane)
+                old = last.get(key)
+                if old is not None and old != state:
+                    ev = {"event": "lane", "lane": lane, "from": old, "to": state}
+                    append_event(task, ev)
+                    bus.publish(task, ev)
+                last[key] = state
+        stop_evt.wait(tick)
+
+
+def cmd_serve(args):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    os.makedirs(ROOT, exist_ok=True)
+
+    # Bind FIRST — the port is the real mutex; the lock file is advisory
+    # metadata for humans and tools (audit #10).
+    try:
+        srv_holder = {}
+        bus = EventBus()
+        t0 = time.time()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _json(self, obj, code=200):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                u = urllib.parse.urlparse(self.path)
+                q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+                if u.path == "/v1/health":
+                    self._json(
+                        {
+                            "ok": True,
+                            "version": VERSION,
+                            "uptime_s": round(time.time() - t0),
+                            "root": ROOT,
+                            "cursor": bus.seq,
+                        }
+                    )
+                elif u.path == "/v1/tasks":
+                    self._json(list_tasks())
+                elif u.path == "/v1/status":
+                    tasks = [q["task"]] if q.get("task") else list_tasks()
+                    snap = ps_snapshot()
+                    self._json([task_status(t, args.quiet_after, snap) for t in tasks])
+                elif u.path == "/v1/events":
+                    task = q.get("task")
+                    if not task or not name_ok(task):
+                        return self._json({"error": "valid task required"}, 400)
+                    n = int(q.get("n", 50))
+                    path = os.path.join(task_dir(task), "events.jsonl")
+                    out = []
+                    if os.path.exists(path):
+                        with open(path) as f:
+                            for line in f.readlines()[-n:]:
+                                try:
+                                    out.append(json.loads(line))
+                                except Exception:
+                                    pass
+                    self._json(out)
+                elif u.path == "/v1/wait":
+                    cursor = int(q.get("cursor", 0))
+                    lanes = set(q["lanes"].split(",")) if q.get("lanes") else None
+                    timeout = min(float(q.get("timeout", 55)), 120.0)
+                    seq, hits = bus.wait_for(cursor, q.get("task"), lanes, timeout)
+                    self._json({"cursor": seq, "events": hits})
+                else:
+                    self._json({"error": "not found"}, 404)
+
+        srv = ThreadingHTTPServer((args.host, args.port), Handler)
+        srv_holder["srv"] = srv
+    except OSError as e:
+        print(f"switchboard serve: cannot bind {args.host}:{args.port} ({e}) — "
+              f"another instance is likely running", file=sys.stderr)
+        return 2
+
+    lock_path = os.path.join(ROOT, "serve.lock")
+    with open(lock_path, "w") as f:
+        json.dump({"pid": os.getpid(), "port": args.port, "started": iso()}, f)
+
+    stop_evt = threading.Event()
+    threading.Thread(
+        target=watcher_loop, args=(bus, args.quiet_after, stop_evt), daemon=True
+    ).start()
+
+    print(f"switchboard serve v{VERSION} on http://{args.host}:{args.port}  root={ROOT}")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_evt.set()
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+    return 0
+
+
+# ---------------------------------------------------------------- entry
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Slot registry, event waits, and status service for agent lanes (observe-only)."
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("status", help="derived state of every slot")
+    p.add_argument("--task")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--quiet-after", type=float, default=DEFAULT_QUIET_AFTER)
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser(
+        "wait", help="block until a lane/file event (exit 0) or timeout (exit 3)"
+    )
+    p.add_argument("--task", required=True)
+    p.add_argument("--timeout", type=float, default=570)
+    p.add_argument("--interval", type=float, default=2)
+    p.add_argument("--lane", action="append")
+    p.add_argument("--watch-file", action="append")
+    p.add_argument("--alert-quiet", action="store_true",
+                   help="also return on RUNNING->QUIET transitions")
+    p.add_argument("--quiet-after", type=float, default=DEFAULT_QUIET_AFTER)
+    p.set_defaults(fn=cmd_wait)
+
+    p = sub.add_parser("events", help="tail the observation log")
+    p.add_argument("--task", required=True)
+    p.add_argument("-n", type=int, default=20)
+    p.set_defaults(fn=cmd_events)
+
+    p = sub.add_parser("serve", help="background HTTP status service (long-poll)")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--quiet-after", type=float, default=DEFAULT_QUIET_AFTER)
+    p.set_defaults(fn=cmd_serve)
+
+    args = ap.parse_args()
+    if getattr(args, "task", None) is not None and not name_ok(args.task):
+        print(f"switchboard: bad task name {args.task!r} (alnum, dash, underscore, dot)",
+              file=sys.stderr)
+        return 2
+    for lane in getattr(args, "lane", None) or []:
+        if not name_ok(lane):
+            print(f"switchboard: bad lane name {lane!r}", file=sys.stderr)
+            return 2
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+viewer/src-tauri/target/
+viewer/src-tauri/gen/
+viewer/src-tauri/Cargo.lock
+node_modules/
+state/

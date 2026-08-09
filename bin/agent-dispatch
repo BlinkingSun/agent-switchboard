@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""agent-dispatch — dispatch wrapper for agent lanes (Agent Switchboard).
+
+Registers a switchboard slot, runs the worker (--exec PROG, or the
+$AGENT_SWITCHBOARD_WORKER default), passes stdout/stderr straight through, finalizes the slot with
+the worker's exit code, and exits with that same code. Existing redirections
+like `agent-dispatch ... > lane.log 2>&1` behave exactly as with the bare worker.
+
+Usage:
+  agent-dispatch --task T --lane L [--report PATH] [--max N]
+                 [--exec PROG] -- <worker args...>
+
+Exit codes: worker's own code on a normal run; 2 = slot refused (cap reached,
+lane still active, or bad names — nothing was started); 128+sig if signalled.
+
+Safety properties:
+- Dispatch is serialized per task with a file lock, so parallel fan-outs
+  cannot overshoot the capacity cap (TOCTOU-safe).
+- Every run carries a run_id; finalize only writes the slot if it still owns
+  it, so a stale wrapper can never clobber a newer dispatch on the same lane.
+- An ACTIVE same-lane slot is always refused (ORPHAN included — its worker is
+  still alive). After a genuine DIED both pids are gone, the slot reads
+  inactive, and re-dispatch proceeds normally (old slot is auto-archived).
+- Observe-only policy: this wrapper only ever signals ITS OWN child, and only
+  when it is itself told to stop (normal parent behavior, not enforcement).
+
+Cross-platform: macOS / Linux / Windows, stdlib only (Windows liveness uses
+OpenProcess via ctypes — os.kill(pid, 0) on Windows would TERMINATE).
+Pick your worker deliberately — auth and billing are your choice (e.g. a
+subscription CLI vs a paid API entrypoint); the wrapper runs what you name.
+"""
+
+import argparse
+import contextlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+ROOT = os.environ.get(
+    "AGENT_SWITCHBOARD_ROOT",
+    os.path.expanduser("~/.agent-switchboard/state"),
+)
+DEFAULT_WORKER = os.environ.get("AGENT_SWITCHBOARD_WORKER", "")
+# Optional bridge integration: a channel-state dir mapping channel name ->
+# {"sessionId": ...} lets QUIET detection follow the worker's own session
+# files. Env-only; unset means the heuristic session lookup is used instead.
+CHANNEL_DIR = os.environ.get("AGENT_SWITCHBOARD_CHANNEL_DIR", "")
+
+
+def name_ok(name):
+    return bool(name) and all(c.isalnum() or c in "-_." for c in name) and name not in (".", "..")
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_json_atomic(path, obj):
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
+
+
+if os.name == "nt":
+    import ctypes
+
+    def pid_alive(pid):
+        if not pid:
+            return False
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_ACCESS_DENIED = 5
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return k32.GetLastError() == ERROR_ACCESS_DENIED
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return True
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+else:
+
+    def pid_alive(pid):
+        if not pid:
+            return False
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+
+def ps_snapshot():
+    """POSIX: one {pid: command} map so recycled pids don't fake liveness."""
+    if os.name == "nt":
+        return None
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "pid=,command="], text=True, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        return None
+    snap = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_s, _, cmd = line.partition(" ")
+        try:
+            snap[int(pid_s)] = cmd
+        except ValueError:
+            pass
+    return snap
+
+
+def proc_alive(pid, expect_substr=None, snap=None):
+    if not pid:
+        return False
+    if snap is not None:
+        cmd = snap.get(int(pid))
+        if cmd is None:
+            return False
+        if expect_substr and expect_substr not in cmd:
+            return False  # pid recycled by an unrelated process
+        return True
+    return pid_alive(pid)
+
+
+def slot_active(slot, snap=None):
+    """Non-terminal = consumes capacity. Corrupt counts as active (fail-safe).
+    Identity-checked on POSIX so a recycled pid can't block re-dispatch."""
+    if slot is None:
+        return True  # unreadable -> assume live so we never overshoot capacity
+    if slot.get("status") == "exited":
+        return False
+    return proc_alive(slot.get("pid"), slot.get("prog_base"), snap) or \
+        proc_alive(slot.get("wrapper_pid"), slot.get("wrapper_base", "agent-dispatch"), snap)
+
+
+@contextlib.contextmanager
+def task_lock(tdir):
+    """Serialize dispatch decisions per task (capacity TOCTOU fix)."""
+    path = os.path.join(tdir, "dispatch.lock")
+    f = open(path, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+def append_event(tdir, event):
+    event = dict(event, ts=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    with open(os.path.join(tdir, "events.jsonl"), "a") as f:
+        f.write(json.dumps(event) + "\n")
+
+
+def extract_worker_meta(worker_args):
+    """Pull -c/--channel and -d/--cwd (spaced or = forms) for metadata."""
+    channel = cwd = None
+    i = 0
+    while i < len(worker_args):
+        a = worker_args[i]
+        if a in ("-c", "--channel") and i + 1 < len(worker_args):
+            channel = worker_args[i + 1]
+            i += 2
+            continue
+        if a in ("-d", "--cwd") and i + 1 < len(worker_args):
+            cwd = worker_args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--channel="):
+            channel = a.split("=", 1)[1]
+        elif a.startswith("--cwd="):
+            cwd = a.split("=", 1)[1]
+        i += 1
+    return channel, cwd
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--task", required=True)
+    ap.add_argument("--lane", required=True)
+    ap.add_argument("--report", help="path to the lane's progress/report file (metadata)")
+    ap.add_argument("--max", type=int,
+                    help="capacity override (default: $AGENT_SWITCHBOARD_MAX, else 10). "
+                         "Capacity is PER TASK.")
+    ap.add_argument("--replace", action="store_true",
+                    help="(kept for compatibility) archive an INACTIVE unfinalized slot; an "
+                         "ACTIVE lane is always refused — wait for DIED or stop it yourself")
+    ap.add_argument("--exec", dest="prog", default=DEFAULT_WORKER,
+                    help="worker executable (default: $AGENT_SWITCHBOARD_WORKER)")
+    ap.add_argument("worker_args", nargs=argparse.REMAINDER,
+                    help="args after -- go to the worker verbatim")
+    args = ap.parse_args()
+
+    worker_args = args.worker_args
+    if worker_args and worker_args[0] == "--":
+        worker_args = worker_args[1:]
+
+    if not args.prog:
+        print("agent-dispatch: no worker — pass --exec PROG or set "
+              "$AGENT_SWITCHBOARD_WORKER", file=sys.stderr)
+        return 2
+    if not name_ok(args.task) or not name_ok(args.lane):
+        print(f"agent-dispatch: bad task/lane name ({args.task!r}/{args.lane!r}) — "
+              f"alnum, dash, underscore, dot only", file=sys.stderr)
+        return 2
+
+    tdir = os.path.join(ROOT, args.task)
+    os.makedirs(os.path.join(tdir, "history"), exist_ok=True)
+    slot_path = os.path.join(tdir, f"slot-{args.lane}.json")
+
+    cap = args.max
+    if cap is None:
+        cap = int(os.environ.get("AGENT_SWITCHBOARD_MAX", "10"))
+
+    channel, cwd = extract_worker_meta(worker_args)
+    session_id = None
+    if channel and CHANNEL_DIR:
+        ch = read_json(os.path.join(CHANNEL_DIR, f"{channel}.json"))
+        if ch:
+            session_id = ch.get("sessionId")  # resumed channel -> same session
+
+    run_id = uuid.uuid4().hex
+
+    # --- decide + start + register under the task lock (TOCTOU-safe) ---
+    with task_lock(tdir):
+        snap = ps_snapshot()
+        active = 0
+        for name in os.listdir(tdir):
+            if not (name.startswith("slot-") and name.endswith(".json")):
+                continue
+            if name == f"slot-{args.lane}.json":
+                continue
+            p = os.path.join(tdir, name)
+            s = read_json(p)
+            if s is None and os.path.getsize(p) == 0:
+                continue  # empty stub, ignore
+            if slot_active(s, snap):
+                active += 1
+        if active >= cap:
+            print(f"agent-dispatch: capacity reached ({active}/{cap} active lanes in "
+                  f"task {args.task!r}) — refusing dispatch", file=sys.stderr)
+            return 2
+
+        existing = read_json(slot_path) if os.path.exists(slot_path) else False
+        if existing is not False:
+            if slot_active(existing, snap):
+                print(f"agent-dispatch: lane {args.lane!r} is still ACTIVE (worker or "
+                      f"wrapper alive — ORPHAN counts). Refusing: never double-dispatch "
+                      f"a live lane. If it truly must go, stop it yourself first.",
+                      file=sys.stderr)
+                return 2
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            os.replace(slot_path, os.path.join(tdir, "history", f"{args.lane}-{stamp}.json"))
+
+        child = subprocess.Popen([args.prog] + worker_args)
+
+        slot = {
+            "task": args.task,
+            "lane": args.lane,
+            "run_id": run_id,
+            "status": "running",
+            "wrapper_pid": os.getpid(),
+        "wrapper_base": os.path.basename(sys.argv[0]) or "agent-dispatch",
+            "pid": child.pid,
+            "prog": args.prog,
+            "prog_base": os.path.basename(args.prog),
+            "channel": channel,
+            "cwd": cwd,
+            "session_id": session_id,
+            "report": args.report,
+            "started": time.time(),
+            "exit_code": None,
+            "ended": None,
+        }
+        write_json_atomic(slot_path, slot)
+        append_event(tdir, {"event": "dispatch", "lane": args.lane, "pid": child.pid,
+                            "run_id": run_id, "channel": channel})
+
+    def finalize(rc):
+        # Only write if we still own the slot (audit #2: a stale wrapper must
+        # never clobber a newer dispatch on the same lane).
+        cur = read_json(slot_path)
+        if cur is not None and cur.get("run_id") != run_id:
+            append_event(tdir, {"event": "stale_finalize_skipped", "lane": args.lane,
+                                "run_id": run_id, "exit_code": rc})
+            return
+        slot["status"] = "exited"
+        slot["exit_code"] = rc
+        slot["ended"] = time.time()
+        write_json_atomic(slot_path, slot)
+        append_event(tdir, {"event": "exit", "lane": args.lane, "run_id": run_id,
+                            "exit_code": rc})
+
+    def on_signal(signum, _frame):
+        # We were told to stop: pass it to OUR child, record the outcome.
+        try:
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        finally:
+            finalize(128 + signum)
+        sys.exit(128 + signum)
+
+    for sig in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"):
+        if hasattr(signal, sig):
+            try:
+                signal.signal(getattr(signal, sig), on_signal)
+            except (ValueError, OSError):
+                pass
+
+    rc = child.wait()
+    finalize(rc)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

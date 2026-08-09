@@ -1,0 +1,107 @@
+# Agent Switchboard — using it with any AI agent
+
+Agent Switchboard tracks **lanes** — background agent processes — without
+requiring the agents to cooperate. Liveness is derived (pids + output-file
+mtimes), so anything you can launch from a shell can be tracked: a Claude
+subagent, a Grok Build run, a Codex exec, a plain script.
+
+**The contract is three verbs:**
+
+| Verb | Command | What it does |
+|---|---|---|
+| dispatch | `agent-dispatch --task T --lane L -- <worker cmd...>` | registers a slot, runs the worker, records its exit code |
+| observe | `switchboard status [--task T] [--json]` | derived state of every lane, instantly |
+| wait | `switchboard wait --task T [--lane L] [--watch-file F] --timeout 570` | blocks until a lane finishes/dies or a file changes (exit 0) or timeout (exit 3) |
+
+Plus an HTTP API for tools/UIs: `GET /v1/status`, `/v1/events`, and long-poll
+`/v1/wait?cursor=N` on `127.0.0.1:17920` (`switchboard serve`). Everything is
+**observe-only**: the switchboard never kills, restarts, or re-dispatches —
+your orchestrator reads the alerts and decides.
+
+## The pattern for ANY orchestrating agent
+
+1. Wrap every spawned worker in `agent-dispatch` instead of launching it bare.
+   Output redirection, arguments, and the exit code pass straight through.
+2. Replace every `sleep`-and-check loop with ONE `switchboard wait` call —
+   it returns the moment something actually happens.
+3. On wake, read `switchboard status --json` and act on transitions:
+   `DONE` → review the lane's report now (don't wait for the others).
+   `FAILED` → read its log; rework or re-dispatch (your call).
+   `DIED` → the process was killed without finishing (crash, OOM, harness
+   kill). Investigate, then usually re-dispatch on the same channel/session.
+   `QUIET` → warning only: alive but silent (long local builds do this).
+
+## Harness recipes
+
+### Claude Code — primary session
+The primary session IS re-invoked when a background Bash task exits — combine
+that with the wrapper and you get event-driven fan-out with liveness:
+
+```bash
+# dispatch lanes as background tasks (run_in_background), wrapped:
+agent-dispatch --task mytask --lane worker-1 -- \
+    <worker cmd...> > lane1.log 2>&1
+# then END the tool round. Task notifications wake you per completion;
+# `switchboard wait --task mytask --timeout 570` is the belt-and-braces
+# fallback (Bash timeout 600000). NEVER write `until ...; do sleep 30` loops.
+```
+Optionally register a `PostToolUse` hook that runs `switchboard status` after
+dispatches, so lane state is visible in-transcript.
+
+### Claude Code — Agent-tool subagents (important difference)
+A subagent that ends its turn is DONE — it is **not** re-woken by
+background-task notifications the way the primary session is. A supervising
+subagent (e.g. an execution-master) must therefore stay in its loop and
+**block** on `switchboard wait` between reviews, and only return once every
+watched lane is terminal. Ending its turn with lanes still RUNNING silently
+abandons supervision.
+
+### Grok Build
+Headless Grok runs (`grok -p ... --output-format json`) are just processes:
+
+```bash
+agent-dispatch --task mytask --lane research \
+    --exec ~/.grok/bin/grok -- -p "..." --output-format json --cwd /work/dir
+```
+If you drive Grok through a bridge script (e.g. [claude-grok-bridge](https://github.com/BlinkingSun/claude-grok-bridge)'s grok-ask), wrap the bridge —
+the wrapper reads `-c <channel>` / `-d <cwd>` from the args and uses Grok's
+own session files as the activity heartbeat, so QUIET detection is free.
+
+### OpenAI Codex CLI
+```bash
+agent-dispatch --task mytask --lane refactor \
+    --exec codex -- exec --full-auto "refactor X per SPEC.md" 
+```
+`codex exec` is non-interactive; exit code lands in the slot. Point
+`--report` at the file you told Codex to write its summary into.
+
+### Cursor
+Cursor's background/CLI agents (`cursor-agent`) wrap the same way:
+```bash
+agent-dispatch --task mytask --lane fix-tests \
+    --exec cursor-agent -- -p "make the test suite green" --output-format text
+```
+For IDE-side agents you can't wrap, you still get the observe side: have your
+orchestrator watch their declared output artifact with
+`switchboard wait --watch-file <artifact>`.
+
+### Anything else
+If it runs from a shell, `--exec <prog>` wraps it. If you can't wrap it,
+`--watch-file` its output. The HTTP long-poll (`/v1/wait?cursor=N`) serves
+dashboards, TVs, and other tools without polling cost.
+
+## Notes
+- Capacity: the wrapper refuses dispatch past the configured cap (exit 2) —
+  backpressure your orchestrator can see, instead of a silent pile-up. The
+  cap is **per task**: concurrent tasks each get their own budget.
+- QUIET detection reads the worker's own session/log files (for grok-ask, the
+  grok CLI session dir). It is reliable when the lane has a resumed channel
+  or a **unique `-d` working dir per lane**; with several fresh sessions
+  sharing one cwd, activity may attach to the wrong session — pid liveness
+  (RUNNING/DIED) is unaffected.
+- `AGENT_SWITCHBOARD_ROOT` relocates all state (useful for tests/CI).
+- Windows: fully supported; liveness uses `OpenProcess`, never `os.kill`
+  (which would terminate the probed process on Windows).
+- Subscription/billing: pick your worker deliberately — e.g. for grok,
+  a CLI on subscription login vs. a paid API entrypoint. The wrapper runs
+  whatever `--exec` names; it does not vet billing for you.

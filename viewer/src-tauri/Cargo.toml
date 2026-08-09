@@ -1,0 +1,15 @@
+[package]
+name = "agent-switchboard"
+version = "1.0.0"
+description = "Agent Switchboard — live viewer for AI agent lanes"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+[profile.release]
+strip = true
+lto = true

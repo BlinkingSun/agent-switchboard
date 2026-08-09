@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Read-only dashboard window",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
