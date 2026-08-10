@@ -21,6 +21,7 @@
   --done: #4a5261;
   --font: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
   --ease: 150ms ease;
+  --guide: #2a3340;
 }
 
 html,
@@ -176,21 +177,77 @@ body {
 .global-totals .gt[data-state="FAILED"] strong { color: var(--danger); }
 .global-totals .gt[data-state="DONE"] strong { color: var(--done); }
 .global-totals .gt[data-state="ORPHAN"] strong { color: var(--quiet); }
+.global-totals .gt-hidden { opacity: 0.45; }
+
+/* CLI mini chips in header (mockup: total-chip.cli) */
+.global-totals .gt.gt-cli {
+  color: #9aa3b2;
+  border: 1px solid #2a3340;
+  background: var(--slot);
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.global-totals .gt.gt-cli strong {
+  color: var(--text);
+  font-weight: 600;
+}
 
 /* ── Offline banner ─────────────────────────────────── */
 
 .offline-banner {
-  background: #3a1518;
-  color: #ff8a8f;
-  border-bottom: 1px solid #5a2024;
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  padding: 4px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: #2a1214;
+  color: #f0a0a4;
+  border-bottom: 1px solid #5a2228;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  padding: 8px 14px;
   text-align: center;
   flex-shrink: 0;
 }
 
 .offline-banner[hidden] {
+  display: none !important;
+}
+
+.offline-banner .offline-msg {
+  letter-spacing: 0.1em;
+}
+
+.start-btn {
+  appearance: none;
+  border: 1px solid #7a3a40;
+  background: #3a1a1e;
+  color: #f5c4c7;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  padding: 5px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  transition: background var(--ease), border-color var(--ease), color var(--ease);
+}
+
+.start-btn:hover:not(:disabled) {
+  background: #4a2228;
+  border-color: #9a4a50;
+  color: #ffe0e2;
+}
+
+.start-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.start-btn[hidden] {
   display: none !important;
 }
 
@@ -586,6 +643,242 @@ body {
   font-size: 12px;
   padding: 24px 12px;
   text-align: center;
+}
+
+.empty-msg.dim {
+  color: var(--done);
+  letter-spacing: 0.06em;
+}
+
+/* ── CLI SESSIONS spawn tree (cli-tree-v2 mockup) ───── */
+
+.cli-section {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.cli-section.collapsed .cli-body {
+  display: none;
+}
+
+.cli-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: #12161c;
+  color: inherit;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.cli-section.collapsed .cli-head {
+  border-bottom: 0;
+}
+
+.cli-section:not(.collapsed) .cli-head .disclosure {
+  transform: rotate(90deg);
+}
+
+.cli-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text);
+}
+
+.cli-meta {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cli-meta b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.cli-meta .ok {
+  color: var(--running);
+}
+
+.cli-meta .unreachable {
+  color: var(--done);
+}
+
+.cli-body {
+  padding: 10px 12px 12px;
+}
+
+.cli-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tree-node {
+  position: relative;
+}
+
+.tree-children {
+  margin-left: 14px;
+  margin-top: 4px;
+  padding-left: 14px;
+  border-left: 1px solid var(--guide);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tree-node.collapsed > .tree-children {
+  display: none;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--slot);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+  min-height: 34px;
+  min-width: 0;
+}
+
+.tree-row.bridge {
+  background: #161b24;
+  border-color: #2a3340;
+}
+
+.tree-row .twisty {
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: default;
+  color: inherit;
+}
+
+.tree-row .twisty.has-kids {
+  cursor: pointer;
+}
+
+.tree-row .twisty .tri {
+  width: 0;
+  height: 0;
+  border-left: 5px solid var(--muted);
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transform: rotate(90deg);
+  transition: transform var(--ease);
+}
+
+.tree-node.collapsed > .tree-row .twisty .tri {
+  transform: rotate(0deg);
+}
+
+.tree-row .twisty.empty {
+  width: 12px;
+  pointer-events: none;
+}
+
+.tree-row .name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.tree-row .meta,
+.tree-row .channel {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.tree-row .uptime {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.badge {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  padding: 2px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  background: #161b23;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.badge.interactive {
+  color: #9fd4ff;
+  border-color: #2a4a66;
+  background: #14202c;
+}
+
+.badge.headless {
+  color: #a8b0bc;
+  border-color: #323a48;
+}
+
+.badge.bridge-badge {
+  color: #c4b5a0;
+  border-color: #3d362c;
+  background: #1c1914;
+}
+
+/* model chip: same family as badges, lower emphasis */
+.badge.model {
+  color: #6b7380;
+  border-color: #2a3340;
+  background: #12161c;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  opacity: 0.9;
+}
+
+/* Running lamp for live CLI rows (no data-state needed) */
+.lamp.lamp-live {
+  width: 12px;
+  height: 12px;
+  background: radial-gradient(circle at 35% 30%, #7aefb0, var(--running) 55%, #1a8f4e);
+  box-shadow: 0 0 7px rgba(53, 208, 122, 0.5), 0 0 2px rgba(53, 208, 122, 0.9);
+  flex-shrink: 0;
+}
+
+/* Offline body dim (mockup opacity on main while offline) */
+.main.is-offline {
+  opacity: 0.45;
+}
+.rail.is-offline {
+  opacity: 0.4;
 }
 
 /* ── Responsive ≤720px ──────────────────────────────── */

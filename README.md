@@ -7,11 +7,9 @@
 heartbeats, no silent deaths — plus a native dashboard for watching 100+
 agents across concurrent orchestrations.
 
-Born from a measured pathology: a 7-hour multi-agent build in which the
-coordinating agent spent **309 of its 448 minutes blocked inside blind
-`sleep 30` polling loops**, and one worker process was silently killed and
-sat undetected for ~70 minutes because a log file read "still running."
-Agent Switchboard replaces that pattern with derived liveness and
+Born from a common multi-agent failure mode: coordinators blocked in blind
+`sleep` polling loops, and workers that die silently while logs still look
+"running." Agent Switchboard replaces that pattern with derived liveness and
 event-driven waits.
 
 ![Dashboard with 123 lanes across 5 tasks](assets/dashboard-123-lanes.png)
@@ -51,7 +49,9 @@ switchboard wait --task mytask [--lane worker-1] [--watch-file PHASE.txt] --time
 nothing starts) and refuses to double-dispatch a lane whose worker is still
 alive. Dispatch decisions are lock-serialized, finalization is
 ownership-checked (`run_id`), and pid liveness is identity-checked against
-the process table so a recycled pid can't fake a live lane.
+the process table so a recycled pid can't fake a live lane. Re-dispatch of
+an inactive lane archives the prior slot with a `run_id` suffix and keeps
+the live path populated until the new slot is written (no visibility gap).
 
 ## Background service + HTTP API
 
@@ -59,16 +59,37 @@ the process table so a recycled pid can't fake a live lane.
 switchboard serve            # 127.0.0.1:17920, read-only
 ```
 
-`GET /v1/health` · `GET /v1/tasks` · `GET /v1/status[?task=T]` ·
-`GET /v1/events?task=T` · long-poll `GET /v1/wait?cursor=N[&task=T]` —
-returns within ~1s of any observed transition. Autostart templates for
-launchd / systemd / Task Scheduler are in [`service/`](service/).
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/health` | liveness, `version`, `boot_id`, `busy` / `busy_reasons` |
+| `GET /v1/tasks` | known task names |
+| `GET /v1/status[?task=T]` | derived lanes (includes `ended_s` for terminal rows) |
+| `GET /v1/events?task=T` | recent observation log (tail-read; rotates under size cap) |
+| `GET /v1/cli` | spawn-tree forest of live CLI sessions (claude / grok / agent_dispatch) |
+| `GET /v1/wait?cursor=N[&task=T][&timeout=55]` | long-poll; returns within ~1s of a transition; `gap:true` if the cursor fell behind the ring |
+
+CLI and status also support best-effort daemon wake-up via `--ensure` or
+`AGENT_SWITCHBOARD_ENSURE=1` (launchd kickstart on macOS when the health probe
+fails). Duplicate `serve` binds exit 0 after a healthy peer probe. SIGTERM
+drains in-flight long-polls before exit. Idle self-exit (exit 0) arms only
+after consecutive idle ticks and `IDLE_GRACE` when no CLI, viewer, or active
+slot is present (fail-closed if process enumeration fails).
+
+Autostart templates for launchd / systemd / Task Scheduler are in
+[`service/`](service/). The launchd plist uses
+`KeepAlive.SuccessfulExit = false` so intentional idle / duplicate-peer exits
+stay down.
 
 ## Viewer app
 
 A Tauri 2 desktop app (macOS + Windows) renders the daemon live: collapsible
 per-task sections, panel rows or dense lamp grid (auto past 15 lanes),
-attention-sorted DIED/FAILED, clickable state-filter tiles, event ticker.
+attention-sorted DIED/FAILED, clickable state-filter tiles, event ticker,
+**CLI SESSIONS** tree (model chips, apply-ordering guard), and a **START
+DAEMON** button (launchd kickstart only — never kills lanes). Finished lanes
+hide from the board after 30 minutes (`ended_s`); the CLI/JSON stay complete
+(presentation-only retention).
+
 Grab the signed DMG from [Releases](../../releases), or build it yourself:
 
 ```bash
@@ -91,8 +112,21 @@ launch from a shell.
 | Env | Default | |
 |---|---|---|
 | `AGENT_SWITCHBOARD_ROOT` | `~/.agent-switchboard/state` | state location |
-| `AGENT_SWITCHBOARD_WORKER` | *(unset)* | default `--exec` worker |
+| `AGENT_SWITCHBOARD_WORKER` | *(unset)* | default `--exec` worker for `agent-dispatch` |
 | `AGENT_SWITCHBOARD_MAX` | `10` | per-task capacity cap |
+| `AGENT_SWITCHBOARD_CHANNEL_DIR` | *(unset)* | optional channel→sessionId map for QUIET |
+| `AGENT_SWITCHBOARD_HOST` / `_PORT` | `127.0.0.1` / `17920` | daemon bind / ensure probe |
+| `AGENT_SWITCHBOARD_EVENTS_MAX_BYTES` | `1000000` | events.jsonl rotate threshold |
+| `AGENT_SWITCHBOARD_COLD_AFTER` | `86400` | cold-archive terminal slots (seconds) |
+| `AGENT_SWITCHBOARD_BUS_MAXLEN` | `2000` | in-memory event-bus ring size |
+| `AGENT_SWITCHBOARD_CLI_CACHE_TTL` | `5.0` | `/v1/cli` snapshot reuse (seconds) |
+| `AGENT_SWITCHBOARD_IDLE_GRACE` | `300` | idle self-exit grace (seconds) |
+| `AGENT_SWITCHBOARD_IDLE_DISABLE` | *(unset)* | `1` disables idle self-exit |
+| `AGENT_SWITCHBOARD_IDLE_TEST_FORCE` | *(unset)* | test-only: treat CLI/viewer as not-busy |
+| `AGENT_SWITCHBOARD_WAIT_CAP` | `24` | concurrent `/v1/wait` long-polls (503 beyond) |
+| `AGENT_SWITCHBOARD_ENSURE` | *(unset)* | `1` = best-effort ensure_daemon on CLI |
+| `AGENT_SWITCHBOARD_ENSURE_DISABLE` | *(unset)* | `1` = no-op ensure (tests) |
+| `AGENT_SWITCHBOARD_ENSURE_NO_KICKSTART` | *(unset)* | `1` = probe only, no launchctl |
 
 Python 3.9+ stdlib only — no dependencies. macOS / Linux / Windows.
 (Windows liveness uses `OpenProcess` via ctypes; `os.kill(pid, 0)` there
@@ -101,12 +135,14 @@ would *terminate* the probed process — don't roll your own with it.)
 ## Tests
 
 ```bash
-bash tests/sb_test.sh    # 29 checks in an isolated temp state root
+bash tests/sb_test.sh    # ~70 checks in an isolated temp state root
 ```
 
-Covers the happy paths and the dangerous ones: silent kills, the
-finalize-window DIED false alarm, stale-wrapper clobbering, parallel
-capacity races, corrupt slots, orphan lanes, path-escape names.
+Covers happy paths and the dangerous ones: silent kills, the finalize-window
+DIED false alarm, stale-wrapper clobbering, parallel capacity races, corrupt
+slots, orphan lanes, path-escape names, first-sight publish, flocked events
+rotation, re-dispatch visibility, boot_id/gap, cold-archive, idle self-exit,
+SIGTERM drain, wait capacity 503, and `/v1/cli` forest unit + live checks.
 
 ## License
 

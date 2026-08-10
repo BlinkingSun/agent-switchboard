@@ -25,7 +25,10 @@
       </div>
     </header>
 
-    <div id="offline-banner" class="offline-banner" hidden>DAEMON OFFLINE — retrying</div>
+    <div id="offline-banner" class="offline-banner" hidden>
+      <span class="offline-msg">DAEMON OFFLINE — retrying</span>
+      <button type="button" id="start-daemon-btn" class="start-btn" hidden>START DAEMON</button>
+    </div>
 
     <div class="body">
       <main class="main" id="main"></main>

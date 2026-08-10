@@ -39,7 +39,13 @@ wait exit codes: 0 = event occurred (or all watched lanes already terminal),
 ORPHAN/CORRUPT, on --watch-file changes, and (with --alert-quiet) on QUIET.
 
 serve HTTP API (read-only): GET /v1/health /v1/tasks /v1/status /v1/events
-and long-poll /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55].
+/v1/cli (spawn-tree forest of claude/grok/agent_dispatch nodes) and long-poll
+/v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55].
+
+Status rows carry ended_s for terminal lanes (seconds since finish; source:
+slot 'ended', else last terminal transition in events.jsonl, else slot file
+mtime). The viewer uses it to hide finished lanes after 30 min — the CLI and
+JSON stay complete; retention is presentation-only.
 
 PID-reuse hardening: on POSIX every liveness pass takes ONE `ps` snapshot and
 requires the recorded program name to still appear in the pid's command line;
@@ -49,17 +55,22 @@ as alive (fail-open: a query failure must not fabricate a DIED alert).
 """
 
 import argparse
+import contextlib
 import datetime
 import glob
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
+import uuid
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 ROOT = os.environ.get(
     "AGENT_SWITCHBOARD_ROOT",
     os.path.expanduser("~/.agent-switchboard/state"),
@@ -69,6 +80,29 @@ TERMINAL = {"DONE", "FAILED", "DIED", "ORPHAN"}
 ALERTING = TERMINAL | {"CORRUPT"}
 DEFAULT_QUIET_AFTER = 300
 DEFAULT_PORT = 17920
+EVENTS_MAX_BYTES = int(os.environ.get("AGENT_SWITCHBOARD_EVENTS_MAX_BYTES", 1_000_000))
+COLD_AFTER = float(os.environ.get("AGENT_SWITCHBOARD_COLD_AFTER", 86400))
+BUS_MAXLEN = int(os.environ.get("AGENT_SWITCHBOARD_BUS_MAXLEN", 2000))
+CLI_CACHE_TTL = float(os.environ.get("AGENT_SWITCHBOARD_CLI_CACHE_TTL", 5.0))
+
+# ---- Lifecycle env knobs ----
+# Idle self-exit: busy = cli_busy() OR viewer_running() OR any ACTIVE slot,
+# fail-closed (ps failure -> busy), armed only after IDLE_MIN_SAMPLES
+# consecutive idle watcher ticks AND IDLE_GRACE elapsed seconds.
+IDLE_GRACE = float(os.environ.get("AGENT_SWITCHBOARD_IDLE_GRACE", 300))
+IDLE_DISABLE = os.environ.get("AGENT_SWITCHBOARD_IDLE_DISABLE") == "1"
+# Test-only: force the cli/viewer OR-terms to read not-busy so a real dev
+# machine (with an actual claude/grok session attached) can still exercise
+# idle-exit; the active-slot OR-term is NEVER masked by this.
+IDLE_TEST_FORCE_NOT_BUSY = os.environ.get("AGENT_SWITCHBOARD_IDLE_TEST_FORCE") == "1"
+IDLE_MIN_SAMPLES = 3
+WAIT_CAP = int(os.environ.get("AGENT_SWITCHBOARD_WAIT_CAP", 24))
+LAUNCHD_LABEL = "com.agent-switchboard"
+# Test-only kill switches — MUST stay unused in production. Guard the two
+# real-world-touching steps of ensure_daemon() independently: skip the
+# `launchctl kickstart` subprocess call, or skip ensure_daemon() entirely.
+ENSURE_NO_KICKSTART = os.environ.get("AGENT_SWITCHBOARD_ENSURE_NO_KICKSTART") == "1"
+ENSURE_DISABLE = os.environ.get("AGENT_SWITCHBOARD_ENSURE_DISABLE") == "1"
 
 
 def name_ok(name):
@@ -135,27 +169,86 @@ else:
             return False
 
 
-def ps_snapshot():
-    """POSIX: one {pid: command} map per liveness pass (also defeats pid reuse)."""
+# ---------------------------------------------------------------- CLI detect + forest
+# CLI forest: classify from argv0/path only; collapse shims; reattach to keep-nodes.
+
+PS_CLI_CMD = ["ps", "-axo", "pid=,ppid=,tty=,lstart=,command="]
+# lstart is exactly 5 whitespace-separated tokens: Mon Aug  9 22:09:11 2026
+_PS_CLI_LINE = re.compile(
+    r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+"
+    r"(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$"
+)
+_PYTHON_NAMES = {
+    "Python",
+    "Python3",
+    "python",
+    "python3",
+    "python3.9",
+    "python3.10",
+    "python3.11",
+    "python3.12",
+    "python3.13",
+    "python3.14",
+}
+_SHELL_NAMES = {"bash", "sh", "zsh"}
+# Keep-nodes emitted in the forest. Internal kinds use *_cli names.
+_KEEP_KINDS = frozenset({"claude_cli", "grok_cli", "agent_dispatch"})
+_KIND_OUT = {"claude_cli": "claude", "grok_cli": "grok", "agent_dispatch": "agent_dispatch"}
+
+# /v1/cli cache: one ps+classify per TTL window (default 5s).
+_CLI_CACHE = {
+    "payload": None,
+    "mono": 0.0,
+    "sweep_ms": 0.0,
+    "sweep_count": 0,
+}
+_CLI_CACHE_LOCK = threading.Lock()
+_MODEL_DEFAULTS = {"claude": None, "grok": None, "loaded_at": 0.0}
+
+
+def ps_cli_snapshot():
+    """Rich process map for CLI classification (argv0/path identity).
+
+    One call: ps -axo pid=,ppid=,tty=,lstart=,command=
+    Returns {pid: {pid, ppid, tty, lstart, command}} or None on failure.
+    """
     if os.name == "nt":
         return None
     try:
         out = subprocess.check_output(
-            ["ps", "-axo", "pid=,command="], text=True, stderr=subprocess.DEVNULL
+            PS_CLI_CMD, text=True, stderr=subprocess.DEVNULL
         )
     except Exception:
         return None
     snap = {}
     for line in out.splitlines():
-        line = line.strip()
-        if not line:
+        m = _PS_CLI_LINE.match(line)
+        if not m:
             continue
-        pid_s, _, cmd = line.partition(" ")
+        pid_s, ppid_s, tty, lstart, command = m.groups()
         try:
-            snap[int(pid_s)] = cmd
+            pid = int(pid_s)
+            snap[pid] = {
+                "pid": pid,
+                "ppid": int(ppid_s),
+                "tty": tty,
+                "lstart": lstart,
+                "command": command,
+            }
         except ValueError:
-            pass
+            continue
     return snap
+
+
+def ps_snapshot():
+    """POSIX: one {pid: command} map per liveness pass (also defeats pid reuse).
+
+    Derived from a single rich ps_cli_snapshot() — no second ps sweep.
+    """
+    rich = ps_cli_snapshot()
+    if rich is None:
+        return None
+    return {pid: rec["command"] for pid, rec in rich.items()}
 
 
 def proc_alive(pid, expect_substr=None, snap=None):
@@ -163,13 +256,537 @@ def proc_alive(pid, expect_substr=None, snap=None):
     if not pid:
         return False
     if snap is not None:
-        cmd = snap.get(int(pid))
-        if cmd is None:
+        # Accept either thin {pid: cmd} or rich {pid: {command: ...}} maps.
+        entry = snap.get(int(pid))
+        if entry is None:
             return False
+        cmd = entry["command"] if isinstance(entry, dict) else entry
         if expect_substr and expect_substr not in cmd:
             return False  # pid recycled by an unrelated process
         return True
     return pid_alive(pid)
+
+
+def _argv0(command):
+    return command.split(None, 1)[0] if command else ""
+
+
+def _tokens(command):
+    return command.split() if command else []
+
+
+def viewer_process_match(command):
+    """Viewer identity from argv0/path ONLY (never free-text prompt).
+
+    Never pgrep -f "Agent Switchboard" (prompt-pollution class). App-bundle
+    paths contain a space ("Agent Switchboard.app"), so a naive split of
+    command into argv0 truncates early — structural path markers are also
+    checked on the full command string.
+    """
+    if not command:
+        return False
+    a0 = _argv0(command)
+    if os.path.basename(a0) == "agent-switchboard":
+        return True
+    if "/agent-switchboard" in a0:
+        return True
+    # Space-bearing install path (argv0 split loses the rest of the path).
+    if "/Agent Switchboard.app/Contents/MacOS/" in command:
+        return True
+    if re.search(r"/agent-switchboard(?:\s|$)", command):
+        return True
+    return False
+
+
+def kind_from_command(command):
+    """Classify a process from argv0/early argv ONLY (no free-text matching).
+
+    Returns internal kind or None. Keep-nodes: claude_cli, grok_cli, agent_dispatch.
+    Classified-but-never-emitted: grok_ask, switchboard_daemon, shell_tool, viewer.
+    Claude.app helpers return None (excluded).
+    """
+    if not command:
+        return None
+    # Desktop noise: full-path markers are not free-text prompts.
+    if "/Applications/Claude.app/" in command or "Claude Helper" in command:
+        return None
+    a0 = _argv0(command)
+    if viewer_process_match(command):
+        return "viewer"
+    b0 = os.path.basename(a0)
+    toks = _tokens(command)
+
+    if b0 in _PYTHON_NAMES and len(toks) >= 2:
+        script = os.path.basename(toks[1])
+        if script in ("agent-dispatch", "team-dispatch"):
+            return "agent_dispatch"
+        if script == "switchboard":
+            return "switchboard_daemon"
+        return None
+
+    if b0 in _SHELL_NAMES and len(toks) >= 2:
+        if os.path.basename(toks[1]) == "grok-ask":
+            return "grok_ask"
+        # Pure tool shells (zsh -c / bash -c) — classify for completeness, never emit.
+        if toks[1] in ("-c", "-lc") or (len(toks) >= 3 and toks[1] in ("-c", "-lc")):
+            return "shell_tool"
+        return "shell_tool"
+
+    if b0 in ("claude", "claude.exe") or a0.endswith("/claude") or a0.endswith(
+        "/claude.exe"
+    ):
+        return "claude_cli"
+    if b0 in ("grok", "agent"):
+        return "grok_cli"
+    if re.match(r"^grok-[\d.]+-macos-", b0) or re.match(r"^grok-macos-", b0):
+        return "grok_cli"
+    if "/.grok/bin/grok" in a0 or "/.grok/downloads/grok" in a0:
+        return "grok_cli"
+    # node + claude-code only in early tokens (legacy install)
+    if b0 == "node" and any("claude-code" in t for t in toks[:6]):
+        return "claude_cli"
+    return None
+
+
+def mode_from_tty(tty):
+    return "headless" if (not tty or tty in ("??", "?")) else "interactive"
+
+
+def _parse_wrapper_flags(command, kind):
+    meta = {
+        "channel": None,
+        "cwd_arg": None,
+        "task": None,
+        "lane": None,
+        "work_mode": False,
+        "headless_flag": False,
+        "model": None,
+    }
+    toks = _tokens(command)
+    if not toks:
+        return meta
+
+    def take_model(toks, i):
+        t = toks[i]
+        if t in ("-m", "--model") and i + 1 < len(toks):
+            return toks[i + 1], i + 2
+        if t.startswith("--model="):
+            return t.split("=", 1)[1], i + 1
+        if t.startswith("-m=") and len(t) > 3:
+            return t.split("=", 1)[1], i + 1
+        return None, i
+
+    if kind in ("grok_ask", "agent_dispatch"):
+        i = 0
+        if i < len(toks) and os.path.basename(toks[i]) in (_PYTHON_NAMES | _SHELL_NAMES):
+            i += 1
+        if i < len(toks) and os.path.basename(toks[i]) in ("grok-ask", "agent-dispatch", "team-dispatch"):
+            i += 1
+        while i < len(toks):
+            t = toks[i]
+            mval, ni = take_model(toks, i)
+            if mval is not None:
+                meta["model"] = mval
+                i = ni
+                continue
+            if t in ("-c", "--channel") and i + 1 < len(toks):
+                meta["channel"] = toks[i + 1]
+                i += 2
+                continue
+            if t in ("-d", "--cwd") and i + 1 < len(toks):
+                meta["cwd_arg"] = toks[i + 1]
+                i += 2
+                continue
+            if t.startswith("--channel="):
+                meta["channel"] = t.split("=", 1)[1]
+                i += 1
+                continue
+            if t.startswith("--cwd="):
+                meta["cwd_arg"] = t.split("=", 1)[1]
+                i += 1
+                continue
+            if t in ("-w", "--work"):
+                meta["work_mode"] = True
+                i += 1
+                continue
+            if t in ("--task", "--lane", "--report", "--max", "--exec") and i + 1 < len(
+                toks
+            ):
+                if t == "--task":
+                    meta["task"] = toks[i + 1]
+                if t == "--lane":
+                    meta["lane"] = toks[i + 1]
+                i += 2
+                continue
+            if t in ("--", "--replace"):
+                i += 1
+                continue
+            if t.startswith("-"):
+                i += 1
+                continue
+            break  # free-text prompt
+        return meta
+
+    if kind == "grok_cli":
+        if len(toks) >= 2 and toks[1] == "-p":
+            meta["headless_flag"] = True
+        for j, t in enumerate(toks):
+            if t in ("-m", "--model") and j + 1 < len(toks):
+                meta["model"] = toks[j + 1]
+            elif t.startswith("--model="):
+                meta["model"] = t.split("=", 1)[1]
+            if t == "--cwd" and j + 1 < len(toks) and toks[j + 1][:1] in "/~":
+                meta["cwd_arg"] = toks[j + 1]
+            elif t.startswith("--cwd=") and t.split("=", 1)[1][:1] in "/~":
+                meta["cwd_arg"] = t.split("=", 1)[1]
+        return meta
+
+    if kind == "claude_cli":
+        for j, t in enumerate(toks[1:8], start=1):
+            if t in ("-p", "--print"):
+                meta["headless_flag"] = True
+            if t in ("-m", "--model") and j + 1 < len(toks):
+                meta["model"] = toks[j + 1]
+            elif t.startswith("--model="):
+                meta["model"] = t.split("=", 1)[1]
+        return meta
+
+    # Best-effort -m scan for other kinds
+    for j, t in enumerate(toks):
+        if t in ("-m", "--model") and j + 1 < len(toks):
+            meta["model"] = toks[j + 1]
+            break
+        if t.startswith("--model="):
+            meta["model"] = t.split("=", 1)[1]
+            break
+    return meta
+
+
+def _load_model_defaults(now=None):
+    """Read claude/grok default models once per short window (cached with sweep)."""
+    now = now if now is not None else time.time()
+    if _MODEL_DEFAULTS["loaded_at"] and (now - _MODEL_DEFAULTS["loaded_at"]) < 60:
+        return _MODEL_DEFAULTS["claude"], _MODEL_DEFAULTS["grok"]
+
+    claude_default = "default"
+    try:
+        path = os.path.expanduser("~/.claude/settings.json")
+        data = read_json(path) or {}
+        claude_default = (
+            data.get("defaultModel") or data.get("model") or "default"
+        )
+    except Exception:
+        pass
+
+    grok_default = "grok-4.5"
+    try:
+        path = os.path.expanduser("~/.grok/config.toml")
+        with open(path) as f:
+            text = f.read()
+        # Prefer a plain model = "..." key; ignore fork_secondary_model.
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("#") or "=" not in s:
+                continue
+            key, _, val = s.partition("=")
+            key = key.strip()
+            if key in ("model", "default_model", "defaultModel"):
+                val = val.strip().strip('"').strip("'")
+                if val:
+                    grok_default = val
+                    break
+    except Exception:
+        pass
+
+    _MODEL_DEFAULTS["claude"] = claude_default
+    _MODEL_DEFAULTS["grok"] = grok_default
+    _MODEL_DEFAULTS["loaded_at"] = now
+    return claude_default, grok_default
+
+
+def _lstart_ts(lstart):
+    try:
+        return datetime.datetime.strptime(lstart, "%a %b %d %H:%M:%S %Y").timestamp()
+    except Exception:
+        return None
+
+
+def build_cli_forest(snap, now=None):
+    """Collapse shims and reattach keep-nodes: pure function on a process snap.
+
+    1. Classify from ONE snap.
+    2. Keep-nodes: claude_cli | grok_cli | agent_dispatch only.
+    3. Never emit: grok_ask, pure shells, switchboard_daemon, Claude.app, viewer.
+    4. Re-parent each keep-node to the first keep-node on its ancestor chain
+       (walk at most 10). Roots = keep-nodes with no keep-ancestor.
+    5. Labels: agent_dispatch task/lane; grok channel from nearest collapsed
+       grok_ask + task/lane from agent_dispatch ancestor; claude tty or
+       (exec-master) when headless/-p.
+    6. kind enum out: claude | grok | agent_dispatch. Counts exclude agent_dispatch.
+    Every node carries both started and started_iso (same ISO string) + model.
+    """
+    now = now if now is not None else time.time()
+    if not snap:
+        return {
+            "counts": {
+                "claude": {"interactive": 0, "headless": 0},
+                "grok": {"interactive": 0, "headless": 0},
+            },
+            "roots": [],
+        }
+
+    claude_def, grok_def = _load_model_defaults(now)
+
+    # Classify every process once.
+    kinds = {}  # pid -> kind or None
+    for pid, rec in snap.items():
+        kinds[pid] = kind_from_command(rec.get("command") or "")
+
+    keep_pids = [pid for pid, k in kinds.items() if k in _KEEP_KINDS]
+
+    def walk_ancestors(pid, maxd=10):
+        """Yield ancestor pids walking ppid (not including pid itself), ≤maxd."""
+        seen = set()
+        cur = snap.get(pid, {}).get("ppid")
+        for _ in range(maxd):
+            if cur is None or cur in seen:
+                break
+            seen.add(cur)
+            yield cur
+            if cur not in snap:
+                break
+            cur = snap[cur].get("ppid")
+
+    def first_keep_ancestor(pid):
+        for anc in walk_ancestors(pid, 10):
+            if kinds.get(anc) in _KEEP_KINDS:
+                return anc
+        return None
+
+    def nearest_kind_ancestor(pid, want):
+        for anc in walk_ancestors(pid, 10):
+            if kinds.get(anc) == want:
+                return anc
+        return None
+
+    # Build node dicts keyed by pid.
+    nodes = {}
+    for pid in keep_pids:
+        rec = snap[pid]
+        ikind = kinds[pid]
+        cmd = rec.get("command") or ""
+        meta = _parse_wrapper_flags(cmd, ikind)
+        mode = mode_from_tty(rec.get("tty"))
+        if meta.get("headless_flag"):
+            mode = "headless"
+
+        # Labels + inheritance from nearest keep-node ancestors
+        label = None
+        channel = None
+        task = meta.get("task")
+        lane = meta.get("lane")
+        model = meta.get("model")
+
+        if ikind == "agent_dispatch":
+            if task and lane:
+                label = f"{task}/{lane}"
+            elif task:
+                label = task
+            elif lane:
+                label = lane
+        elif ikind == "grok_cli":
+            ask = nearest_kind_ancestor(pid, "grok_ask")
+            if ask is not None:
+                am = _parse_wrapper_flags(snap[ask].get("command") or "", "grok_ask")
+                channel = am.get("channel")
+                if not meta.get("cwd_arg"):
+                    meta["cwd_arg"] = am.get("cwd_arg")
+                if not model:
+                    model = am.get("model")
+            td = nearest_kind_ancestor(pid, "agent_dispatch")
+            if td is not None:
+                tm = _parse_wrapper_flags(
+                    snap[td].get("command") or "", "agent_dispatch"
+                )
+                task = tm.get("task")
+                lane = tm.get("lane")
+                if not channel:
+                    channel = tm.get("channel")
+            label = channel
+        elif ikind == "claude_cli":
+            if mode == "headless" or meta.get("headless_flag"):
+                label = "(exec-master)"
+            else:
+                label = None  # viewer shows tty from node.tty
+
+        if not model:
+            if ikind == "claude_cli":
+                model = claude_def
+            elif ikind == "grok_cli":
+                model = grok_def
+            else:
+                model = None
+
+        started_ts = _lstart_ts(rec.get("lstart"))
+        if started_ts is not None:
+            started_iso = iso(started_ts)
+            uptime_s = max(0, int(round(now - started_ts)))
+        else:
+            started_iso = None
+            uptime_s = None
+
+        tty = rec.get("tty")
+        if mode == "headless" or not tty or tty in ("??", "?"):
+            tty_out = None
+        else:
+            tty_out = tty
+
+        nodes[pid] = {
+            "pid": pid,
+            "kind": _KIND_OUT[ikind],
+            "mode": mode,
+            "tty": tty_out,
+            "started": started_iso,
+            "started_iso": started_iso,
+            "uptime_s": uptime_s,
+            "label": label,
+            "model": model,
+            "children": [],
+        }
+        if channel:
+            nodes[pid]["channel"] = channel
+        if task:
+            nodes[pid]["task"] = task
+        if lane:
+            nodes[pid]["lane"] = lane
+
+    # Re-parent: attach each keep-node under first keep-ancestor (≤10 walk).
+    roots = []
+    for pid in sorted(keep_pids):
+        parent = first_keep_ancestor(pid)
+        if parent is not None and parent in nodes:
+            nodes[parent]["children"].append(nodes[pid])
+        else:
+            roots.append(nodes[pid])
+
+    # Stable child order by pid.
+    def sort_tree(node):
+        node["children"].sort(key=lambda c: c["pid"])
+        for c in node["children"]:
+            sort_tree(c)
+
+    for r in roots:
+        sort_tree(r)
+    roots.sort(key=lambda n: n["pid"])
+
+    counts = {
+        "claude": {"interactive": 0, "headless": 0},
+        "grok": {"interactive": 0, "headless": 0},
+    }
+
+    def count_walk(node):
+        k = node["kind"]
+        if k in ("claude", "grok"):
+            m = node["mode"] if node["mode"] in ("interactive", "headless") else "headless"
+            counts[k][m] += 1
+        for c in node.get("children") or []:
+            count_walk(c)
+
+    for r in roots:
+        count_walk(r)
+
+    return {"counts": counts, "roots": roots}
+
+
+def cli_busy(snap=None):
+    """True if any claude_cli or grok_cli process is present (idle busy source).
+
+    Viewer / agent_dispatch / grok_ask / switchboard are NOT CLI instances.
+    """
+    if snap is None:
+        snap = ps_cli_snapshot()
+    if not snap:
+        return False
+    for rec in snap.values():
+        cmd = rec["command"] if isinstance(rec, dict) else rec
+        k = kind_from_command(cmd)
+        if k in ("claude_cli", "grok_cli"):
+            return True
+    return False
+
+
+def viewer_running(snap=None):
+    """True if Agent Switchboard GUI is running (argv0/path identity only).
+
+    Never uses pgrep -f on display name (prompt-pollution bug class).
+    Viewer is NOT counted as a CLI instance.
+    """
+    if snap is None:
+        snap = ps_cli_snapshot()
+    if not snap:
+        return False
+    for rec in snap.values():
+        cmd = rec["command"] if isinstance(rec, dict) else rec
+        if viewer_process_match(cmd):
+            return True
+    return False
+
+
+def get_cli_payload(boot_id=None, force=False, now=None):
+    """Build /v1/cli response with 5s TTL cache (one ps sweep per window)."""
+    now_wall = now if now is not None else time.time()
+    mono = time.monotonic()
+    with _CLI_CACHE_LOCK:
+        if (
+            not force
+            and _CLI_CACHE["payload"] is not None
+            and (mono - _CLI_CACHE["mono"]) < CLI_CACHE_TTL
+        ):
+            payload = dict(_CLI_CACHE["payload"])
+            payload["ts"] = iso(now_wall)
+            if boot_id is not None:
+                payload["boot_id"] = boot_id
+            payload["cached"] = True
+            payload["sweep_ms"] = _CLI_CACHE["sweep_ms"]
+            payload["sweep_count"] = _CLI_CACHE["sweep_count"]
+            return payload
+
+        t0 = time.monotonic()
+        snap = ps_cli_snapshot()
+        forest = build_cli_forest(snap or {}, now=now_wall)
+        sweep_ms = round((time.monotonic() - t0) * 1000.0, 2)
+        _CLI_CACHE["sweep_count"] = _CLI_CACHE["sweep_count"] + 1
+        _CLI_CACHE["sweep_ms"] = sweep_ms
+        _CLI_CACHE["mono"] = mono
+        payload = {
+            "ts": iso(now_wall),
+            "boot_id": boot_id,
+            "counts": forest["counts"],
+            "roots": forest["roots"],
+            "cached": False,
+            "sweep_ms": sweep_ms,
+            "sweep_count": _CLI_CACHE["sweep_count"],
+        }
+        # Cache without volatile ts/boot_id? We re-stamp on hit; store structure.
+        _CLI_CACHE["payload"] = {
+            "counts": forest["counts"],
+            "roots": forest["roots"],
+        }
+        print(
+            f"switchboard cli: sweep {sweep_ms:.1f}ms "
+            f"(claude={forest['counts']['claude']} grok={forest['counts']['grok']})",
+            file=sys.stderr,
+        )
+        return payload
+
+
+def reset_cli_cache():
+    """Test helper: clear /v1/cli TTL cache and sweep counter."""
+    with _CLI_CACHE_LOCK:
+        _CLI_CACHE["payload"] = None
+        _CLI_CACHE["mono"] = 0.0
+        _CLI_CACHE["sweep_ms"] = 0.0
+        _CLI_CACHE["sweep_count"] = 0
 
 
 # ---------------------------------------------------------------- slot reading
@@ -246,16 +863,134 @@ def load_slots(task):
         if slot is None:
             # unreadable slot must be VISIBLE, never silently dropped (audit #8)
             slot = {"lane": lane, "corrupt": True}
+        try:
+            slot["_mtime"] = os.stat(path).st_mtime
+        except OSError:
+            pass
         out[slot.get("lane", lane)] = slot
     return out
 
 
+TERMINAL_STATES = ("DONE", "FAILED", "DIED")
+# Idle busy predicate third OR-term: any slot in one of these states, across
+# ALL tasks, counts as active (not just the CLI/viewer process checks).
+ACTIVE_SLOT_STATES = {"RUNNING", "QUIET", "ORPHAN", "CORRUPT"}
+
+
+def terminal_endings(task):
+    """lane -> epoch of the last observed transition into a terminal state.
+    Fallback 'ended' source for lanes nobody finalized (a DIED lane has no
+    wrapper left to write slot['ended'])."""
+    out = {}
+    try:
+        with open(os.path.join(task_dir(task), "events.jsonl")) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("event") == "lane" and e.get("to") in TERMINAL_STATES:
+                    try:
+                        out[e.get("lane")] = datetime.datetime.fromisoformat(
+                            e["ts"]
+                        ).timestamp()
+                    except (KeyError, ValueError, TypeError):
+                        continue
+    except OSError:
+        pass
+    return out
+
+
+@contextlib.contextmanager
+def file_lock(path):
+    """Cross-platform exclusive lock on a sibling lock file (not the file
+    being written — avoids append-mode byte-range lock quirks on Windows)."""
+    f = open(path, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
 def append_event(task, event):
+    """Append one line to events.jsonl under an exclusive lock, serialized
+    against every other writer (agent-dispatch dispatch/exit, this daemon's
+    own watcher, and CLI `switchboard wait`). Rotates to events.jsonl.1
+    (single rollover kept) once the file crosses EVENTS_MAX_BYTES."""
     event = dict(event, ts=iso())
-    os.makedirs(task_dir(task), exist_ok=True)
-    with open(os.path.join(task_dir(task), "events.jsonl"), "a") as f:
-        f.write(json.dumps(event) + "\n")
+    tdir = task_dir(task)
+    os.makedirs(tdir, exist_ok=True)
+    path = os.path.join(tdir, "events.jsonl")
+    with file_lock(path + ".lock"):
+        try:
+            if os.path.getsize(path) >= EVENTS_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        with open(path, "a") as f:
+            f.write(json.dumps(event) + "\n")
+            f.flush()
     return event
+
+
+def tail_lines(path, n):
+    """Last n lines of a file without loading it whole (F1/F8): read
+    backwards in chunks until n+1 newlines are seen or the file start."""
+    if n <= 0:
+        return []
+    try:
+        f = open(path, "rb")
+    except OSError:
+        return []
+    with f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        block = 65536
+        data = b""
+        while pos > 0 and data.count(b"\n") <= n:
+            read_size = min(block, pos)
+            pos -= read_size
+            f.seek(pos)
+            data = f.read(read_size) + data
+        lines = data.split(b"\n")
+        if lines and lines[-1] == b"":
+            lines.pop()
+        if pos > 0:
+            lines = lines[1:]  # first entry may be a partial line
+        return [l.decode("utf-8", "replace") for l in lines[-n:]]
+
+
+def tail_events(task, n):
+    """Last n parsed events for a task, tailing the live file and, if it
+    doesn't have enough lines yet (just rotated), the previous rollover."""
+    tdir = task_dir(task)
+    lines = tail_lines(os.path.join(tdir, "events.jsonl"), n)
+    if len(lines) < n:
+        more = tail_lines(os.path.join(tdir, "events.jsonl.1"), n - len(lines))
+        lines = more + lines
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
 
 
 def list_tasks():
@@ -268,8 +1003,14 @@ def task_status(task, quiet_after=DEFAULT_QUIET_AFTER, snap=None):
     if snap is None:
         snap = ps_snapshot()
     rows = []
+    endings = None  # events.jsonl read lazily, only if a terminal lane needs it
     for lane, slot in sorted(load_slots(task).items()):
         state, age = derive(slot, quiet_after, snap)
+        ended = slot.get("ended")
+        if ended is None and state in TERMINAL_STATES:
+            if endings is None:
+                endings = terminal_endings(task)
+            ended = endings.get(lane) or slot.get("_mtime")
         rows.append(
             {
                 "lane": lane,
@@ -280,6 +1021,7 @@ def task_status(task, quiet_after=DEFAULT_QUIET_AFTER, snap=None):
                 "age_s": round(time.time() - slot.get("started", time.time())),
                 "activity_s": round(age) if age is not None else None,
                 "exit_code": slot.get("exit_code"),
+                "ended_s": round(time.time() - ended) if ended is not None else None,
                 "channel": slot.get("channel"),
                 "report": slot.get("report"),
             }
@@ -318,7 +1060,20 @@ def print_status(task, quiet_after, snap=None):
         )
 
 
+def _maybe_ensure(args):
+    """Opt-in soft ensure (--ensure flag or AGENT_SWITCHBOARD_ENSURE=1 env) so the
+    HTTP/viewer tier is warmed back up after an idle park. Best-effort and
+    silent: these CLI commands read state from disk directly and must keep
+    working even if the daemon never comes up (spike 4.6.C)."""
+    if getattr(args, "ensure", False) or os.environ.get("AGENT_SWITCHBOARD_ENSURE") == "1":
+        try:
+            ensure_daemon()
+        except Exception:
+            pass
+
+
 def cmd_status(args):
+    _maybe_ensure(args)
     tasks = [args.task] if args.task else list_tasks()
     if not tasks:
         print("no tasks registered")
@@ -344,6 +1099,7 @@ def file_sig(path):
 
 
 def cmd_wait(args):
+    _maybe_ensure(args)
     lanes_filter = set(args.lane or [])
 
     def snapshot():
@@ -398,26 +1154,49 @@ def cmd_wait(args):
 
 
 def cmd_events(args):
-    path = os.path.join(task_dir(args.task), "events.jsonl")
-    if not os.path.exists(path):
+    events = tail_events(args.task, args.n)
+    if not events:
         print("(no events)")
         return 0
-    with open(path) as f:
-        lines = f.readlines()
-    for line in lines[-args.n:]:
-        sys.stdout.write(line)
+    for e in events:
+        sys.stdout.write(json.dumps(e) + "\n")
     return 0
 
 
 # ---------------------------------------------------------------- serve (daemon)
 
+# Last busy-predicate result computed by the watcher tick (T6 /v1/health
+# busy_reasons). Read-mostly from request threads; a single tick behind at
+# worst — deliberately NOT recomputed per-request (would be a second sweep).
+_BUSY_STATE = {"busy": None, "reasons": []}
+_BUSY_STATE_LOCK = threading.Lock()
+
+
+def _set_busy_state(busy, reasons):
+    with _BUSY_STATE_LOCK:
+        _BUSY_STATE["busy"] = busy
+        _BUSY_STATE["reasons"] = list(reasons)
+
+
+def get_busy_reasons():
+    with _BUSY_STATE_LOCK:
+        return list(_BUSY_STATE["reasons"])
+
 
 class EventBus:
-    def __init__(self, maxlen=2000):
+    def __init__(self, maxlen=BUS_MAXLEN):
         self.cond = threading.Condition()
         self.events = []
         self.seq = 0
         self.maxlen = maxlen
+        # highest seq that has been trimmed out of `events`; a cursor at or
+        # below this value can no longer be served — the caller missed a
+        # gap of unknown size and must full-refresh instead.
+        self.floor = 0
+        # Set on graceful drain (SIGTERM/SIGINT/idle-exit) to wake every
+        # blocked wait_for() immediately instead of leaving it to time out
+        # on its own (H2/H5 — a wait that cannot be woken is a lane failure).
+        self.stopping = False
 
     def publish(self, task, event):
         with self.cond:
@@ -425,13 +1204,21 @@ class EventBus:
             rec = dict(event, seq=self.seq, task=task)
             self.events.append(rec)
             if len(self.events) > self.maxlen:
-                self.events = self.events[-self.maxlen:]
+                cut = len(self.events) - self.maxlen
+                self.floor = self.events[cut - 1]["seq"]
+                self.events = self.events[cut:]
             self.cond.notify_all()
             return rec
+
+    def shutdown(self):
+        with self.cond:
+            self.stopping = True
+            self.cond.notify_all()
 
     def wait_for(self, cursor, task=None, lanes=None, timeout=55.0):
         deadline = time.time() + timeout
         with self.cond:
+            gap = cursor < self.floor
             while True:
                 hits = [
                     e
@@ -440,29 +1227,225 @@ class EventBus:
                     and (task is None or e["task"] == task)
                     and (not lanes or e.get("lane") in lanes or e["event"] == "file")
                 ]
-                if hits:
-                    return self.seq, hits
+                if hits or gap or self.stopping:
+                    return self.seq, hits, gap
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    return self.seq, []
+                    return self.seq, [], False
                 self.cond.wait(min(remaining, 1.0))
 
 
-def watcher_loop(bus, quiet_after, stop_evt, tick=1.0):
-    last = {}
+def archived_terminal_state(tdir, lane, run_id):
+    """Best-effort: find the history archive agent-dispatch wrote for run_id
+    and derive its terminal state. Lets a same-tick DONE/FAILED -> re-dispatch
+    (RUNNING -> terminal -> RUNNING collapsed between two watcher ticks)
+    still surface the missed terminal leg instead of looking like nothing
+    happened)."""
+    if not run_id:
+        return None
+    run_id8 = run_id[:8]
+    matches = sorted(glob.glob(os.path.join(tdir, "history", f"{lane}-*-{run_id8}.json")))
+    if not matches:
+        return None
+    slot = read_json(matches[-1])
+    if slot is None or slot.get("status") != "exited":
+        return None
+    return "DONE" if slot.get("exit_code") == 0 else "FAILED"
+
+
+def cold_archive(tdir, lane, slot):
+    """Move a long-finished slot out of the hot task dir into history/ so
+    load_slots() (status + watcher) stops reloading it every tick (F2). The
+    viewer's own 30-min finished-lane retention is presentation-only and
+    unaffected — COLD_AFTER defaults to 24h, far past that window."""
+    os.makedirs(os.path.join(tdir, "history"), exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    run_id8 = (slot.get("run_id") or "cold")[:8]
+    dest = os.path.join(tdir, "history", f"{lane}-{stamp}-{run_id8}.json")
+    src = os.path.join(tdir, f"slot-{lane}.json")
+    try:
+        os.replace(src, dest)
+        return True
+    except OSError:
+        return False
+
+
+def watcher_loop(bus, quiet_after, stop_evt, tick=1.0, idle_cb=None):
+    """Per-tick: one ps sweep drives BOTH lane-state derivation (existing
+    status transitions below) AND the idle busy predicate — never a second
+    ps sweep for idle detection."""
+    last = {}  # (task, lane) -> (state, run_id)
+    idle_since = None
+    idle_samples = 0
     while not stop_evt.is_set():
-        snap = ps_snapshot()
+        rich_snap = ps_cli_snapshot()  # the ONE ps sweep for this tick
+        snap = (
+            {pid: rec["command"] for pid, rec in rich_snap.items()}
+            if rich_snap is not None
+            else None
+        )
+        seen = set()
+        any_active = False
         for task in list_tasks():
+            tdir = task_dir(task)
             for lane, slot in load_slots(task).items():
                 state, _ = derive(slot, quiet_after, snap)
+                if state in ACTIVE_SLOT_STATES:
+                    any_active = True
+                run_id = slot.get("run_id")
                 key = (task, lane)
-                old = last.get(key)
-                if old is not None and old != state:
-                    ev = {"event": "lane", "lane": lane, "from": old, "to": state}
+                old_state, old_run_id = last.get(key, (None, None))
+
+                if old_state is None:
+                    # First sight of this lane: publish an appear event so a
+                    # long-polling client learns about it immediately instead
+                    # of waiting for the next 30s status tick.
+                    ev = {"event": "lane", "lane": lane, "from": None, "to": state}
                     append_event(task, ev)
                     bus.publish(task, ev)
-                last[key] = state
+                elif old_run_id and run_id and run_id != old_run_id:
+                    # Re-dispatched inside one tick window: the derived state
+                    # string can match on both sides (e.g. RUNNING == RUNNING)
+                    # even though a whole DONE/FAILED and restart happened in
+                    # between. Recover the missed terminal leg and publish
+                    # both transitions.
+                    mid = archived_terminal_state(tdir, lane, old_run_id) or old_state
+                    if mid != old_state:
+                        ev = {"event": "lane", "lane": lane, "from": old_state, "to": mid}
+                        append_event(task, ev)
+                        bus.publish(task, ev)
+                    if state != mid:
+                        ev = {"event": "lane", "lane": lane, "from": mid, "to": state}
+                        append_event(task, ev)
+                        bus.publish(task, ev)
+                elif old_state != state:
+                    ev = {"event": "lane", "lane": lane, "from": old_state, "to": state}
+                    append_event(task, ev)
+                    bus.publish(task, ev)
+
+                if state in TERMINAL_STATES:
+                    ended = slot.get("ended") or slot.get("_mtime")
+                    if ended is not None and (time.time() - ended) >= COLD_AFTER:
+                        if cold_archive(tdir, lane, slot):
+                            last.pop(key, None)
+                            continue  # archived: drop from `last`, not `seen`
+
+                seen.add(key)
+                last[key] = (state, run_id)
+
+        for stale in list(last.keys() - seen):
+            del last[stale]
+
+        # ---- Idle busy predicate: cli_busy() OR viewer_running() OR
+        # any_active (computed above from this SAME tick's slot pass) ----
+        # FAIL CLOSED: rich_snap is None (ps sweep failed) OR empty mapping
+        # (total parse failure on a live Mac — never a real idle machine)
+        # -> busy. Empty is NOT "no processes"; ps -ax always yields rows.
+        if rich_snap is None or not rich_snap:
+            busy, reasons = True, ["ps_unavailable"]
+        else:
+            reasons = []
+            if not IDLE_TEST_FORCE_NOT_BUSY:
+                if cli_busy(rich_snap):
+                    reasons.append("cli")
+                if viewer_running(rich_snap):
+                    reasons.append("viewer")
+            if any_active:
+                reasons.append("slots")
+            busy = bool(reasons)
+        _set_busy_state(busy, reasons)
+
+        if idle_cb is not None and not IDLE_DISABLE:
+            if busy:
+                idle_since = None
+                idle_samples = 0
+            else:
+                idle_samples += 1
+                if idle_since is None:
+                    idle_since = time.time()
+                elapsed = time.time() - idle_since
+                # Require N consecutive idle ticks AND the full grace window
+                # elapsed — never arm on one lucky reading.
+                if idle_samples >= IDLE_MIN_SAMPLES and elapsed >= IDLE_GRACE:
+                    idle_cb(f"idle {elapsed:.0f}s (no cli/viewer/active-slot)")
+                    return  # drain_and_exit is taking over; stop ticking
+
         stop_evt.wait(tick)
+
+
+def _health_ok(host, port, timeout=0.3):
+    """Short-timeout GET /v1/health probe. True only on a well-formed
+    {"ok": true} response — never raises."""
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/v1/health", timeout=timeout
+        ) as resp:
+            body = json.loads(resp.read().decode())
+            return bool(body.get("ok"))
+    except Exception:
+        return False
+
+
+def ensure_daemon(host=None, port=None, timeout=5.0):
+    """Health probe; on fail, `launchctl kickstart gui/$(id -u)/LABEL`
+    (never -k — never bounce a healthy peer), then poll; if the
+    job is missing/unloaded or this isn't macOS, fall back to a direct
+    background spawn. Best-effort: never raises, never blocks a caller
+    that doesn't want to wait (see cmd_status/cmd_wait --ensure and
+    agent-dispatch's fire-and-forget call).
+
+    AGENT_SWITCHBOARD_ENSURE_DISABLE=1 makes this a pure no-op (test isolation —
+    the daemon must never call real `launchctl kickstart` against the
+    live com.agent-switchboard job from an automated test run).
+    AGENT_SWITCHBOARD_ENSURE_NO_KICKSTART=1 skips only the launchctl subprocess
+    call (still probes + falls back to direct spawn) — used by tests that
+    want to exercise the fallback path without touching launchctl.
+    """
+    if ENSURE_DISABLE:
+        return False
+    host = host or os.environ.get("AGENT_SWITCHBOARD_HOST", "127.0.0.1")
+    port = port or int(os.environ.get("AGENT_SWITCHBOARD_PORT", DEFAULT_PORT))
+
+    if _health_ok(host, port):
+        return True
+
+    if not ENSURE_NO_KICKSTART and sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["launchctl", "kickstart", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if _health_ok(host, port):
+                return True
+            time.sleep(0.5)
+
+    if _health_ok(host, port):
+        return True
+
+    # Job missing / kickstart unavailable / non-macOS: direct-spawn fallback.
+    try:
+        sb_path = os.path.abspath(__file__)
+        subprocess.Popen(
+            [sys.executable, sb_path, "serve", "--host", host, "--port", str(port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        return False
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _health_ok(host, port):
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def cmd_serve(args):
@@ -475,18 +1458,24 @@ def cmd_serve(args):
     try:
         srv_holder = {}
         bus = EventBus()
+        wait_sem = threading.Semaphore(WAIT_CAP)
         t0 = time.time()
+        # Fresh per serve start: lets clients tell "same daemon, cursor still
+        # valid" from "daemon restarted, in-RAM bus/seq reset — resync".
+        boot_id = uuid.uuid4().hex
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
 
-            def _json(self, obj, code=200):
+            def _json(self, obj, code=200, headers=None):
                 body = json.dumps(obj).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Access-Control-Allow-Origin", "*")
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -501,6 +1490,8 @@ def cmd_serve(args):
                             "uptime_s": round(time.time() - t0),
                             "root": ROOT,
                             "cursor": bus.seq,
+                            "boot_id": boot_id,
+                            "busy_reasons": get_busy_reasons(),
                         }
                     )
                 elif u.path == "/v1/tasks":
@@ -514,52 +1505,130 @@ def cmd_serve(args):
                     if not task or not name_ok(task):
                         return self._json({"error": "valid task required"}, 400)
                     n = int(q.get("n", 50))
-                    path = os.path.join(task_dir(task), "events.jsonl")
-                    out = []
-                    if os.path.exists(path):
-                        with open(path) as f:
-                            for line in f.readlines()[-n:]:
-                                try:
-                                    out.append(json.loads(line))
-                                except Exception:
-                                    pass
-                    self._json(out)
+                    self._json(tail_events(task, n))
+                elif u.path == "/v1/cli":
+                    # Forest of CLI instances (B2). 5s TTL; one ps per miss.
+                    self._json(get_cli_payload(boot_id=boot_id))
                 elif u.path == "/v1/wait":
-                    cursor = int(q.get("cursor", 0))
-                    lanes = set(q["lanes"].split(",")) if q.get("lanes") else None
-                    timeout = min(float(q.get("timeout", 55)), 120.0)
-                    seq, hits = bus.wait_for(cursor, q.get("task"), lanes, timeout)
-                    self._json({"cursor": seq, "events": hits})
+                    # Concurrency cap: the jetsam thread
+                    # limit is 32; a pile of long-polls must fail loud with
+                    # a retryable 503 instead of starving every other route.
+                    if not wait_sem.acquire(blocking=False):
+                        return self._json(
+                            {"error": "wait_capacity"}, 503, {"Retry-After": "5"}
+                        )
+                    try:
+                        cursor = int(q.get("cursor", 0))
+                        lanes = set(q["lanes"].split(",")) if q.get("lanes") else None
+                        timeout = min(float(q.get("timeout", 55)), 120.0)
+                        seq, hits, gap = bus.wait_for(cursor, q.get("task"), lanes, timeout)
+                        resp = {"cursor": seq, "events": hits, "boot_id": boot_id}
+                        if gap:
+                            resp["gap"] = True
+                        self._json(resp)
+                    finally:
+                        wait_sem.release()
                 else:
                     self._json({"error": "not found"}, 404)
 
         srv = ThreadingHTTPServer((args.host, args.port), Handler)
+        # Request threads must never block process exit, and server_close()
+        # must never attempt an unbounded join on them — we wake every
+        # blocked /v1/wait explicitly on drain (bus.shutdown()) and rely on
+        # these two flags as the bound-of-last-resort (H1/H2/H5: "a wait
+        # that cannot be woken is a lane failure").
+        srv.daemon_threads = True
+        srv.block_on_close = False
         srv_holder["srv"] = srv
     except OSError as e:
-        print(f"switchboard serve: cannot bind {args.host}:{args.port} ({e}) — "
-              f"another instance is likely running", file=sys.stderr)
-        return 2
+        # Duplicate instance (D1-D9): probe the peer before deciding this is
+        # a crash. Healthy peer -> exit 0 (nothing to restart;
+        # exit-code convention); dead socket -> exit 1 with an actionable
+        # message (never exit 2 here — that would thrash under
+        # KeepAlive.SuccessfulExit=false keeps intentional exit-0 down).
+        peer_healthy = _health_ok(args.host, args.port, timeout=2.0)
+        if peer_healthy:
+            print(
+                f"switchboard serve: {args.host}:{args.port} already served by a "
+                f"healthy peer ({e}) — exiting 0", file=sys.stderr
+            )
+            return 0
+        print(
+            f"switchboard serve: cannot bind {args.host}:{args.port} ({e}) and no "
+            f"healthy peer answered /v1/health — the port is held by something "
+            f"else. Check `lsof -iTCP:{args.port} -sTCP:LISTEN`, free the port, or "
+            f"pick a different --port.", file=sys.stderr
+        )
+        return 1
 
     lock_path = os.path.join(ROOT, "serve.lock")
     with open(lock_path, "w") as f:
         json.dump({"pid": os.getpid(), "port": args.port, "started": iso()}, f)
 
     stop_evt = threading.Event()
-    threading.Thread(
-        target=watcher_loop, args=(bus, args.quiet_after, stop_evt), daemon=True
-    ).start()
+    shutdown_state = {"done": False}
+    shutdown_lock = threading.Lock()
+
+    def drain_and_exit(code, reason):
+        """Graceful drain: stop accepting, wake every pending
+        /v1/wait, join the watcher with a bound, remove the lock, exit.
+        Idempotent — signal + idle-exit could theoretically race."""
+        with shutdown_lock:
+            if shutdown_state["done"]:
+                return
+            shutdown_state["done"] = True
+        sys.stderr.write(f"switchboard serve: {reason} — draining, exit {code}\n")
+        sys.stderr.flush()
+        stop_evt.set()
+        bus.shutdown()  # wake every blocked wait_for() immediately
+        try:
+            srv.shutdown()  # unblocks serve_forever() on the main thread
+        except Exception:
+            pass
+        try:
+            srv.server_close()
+        except Exception:
+            pass
+        watcher_thread.join(timeout=3)  # bounded — never hang the exit path
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+        os._exit(code)
+
+    def async_drain_and_exit(code, reason):
+        # Always off-thread: srv.shutdown() must be called from a thread
+        # OTHER than the one running serve_forever(), or it deadlocks —
+        # and a signal handler runs ON the main thread that IS running it.
+        threading.Thread(target=drain_and_exit, args=(code, reason), daemon=True).start()
+
+    def handle_signal(signum, _frame):
+        async_drain_and_exit(0, f"signal {signum} received")
+
+    for sig_name in ("SIGTERM", "SIGINT"):
+        if hasattr(signal, sig_name):
+            try:
+                signal.signal(getattr(signal, sig_name), handle_signal)
+            except (ValueError, OSError):
+                pass
+
+    watcher_thread = threading.Thread(
+        target=watcher_loop,
+        args=(bus, args.quiet_after, stop_evt),
+        kwargs={"idle_cb": lambda reason: async_drain_and_exit(0, reason)},
+        daemon=True,
+    )
+    watcher_thread.start()
 
     print(f"switchboard serve v{VERSION} on http://{args.host}:{args.port}  root={ROOT}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        pass
-    finally:
-        stop_evt.set()
-        try:
-            os.remove(lock_path)
-        except FileNotFoundError:
-            pass
+        async_drain_and_exit(0, "KeyboardInterrupt")
+    # serve_forever() only returns once srv.shutdown() has been called, which
+    # only ever happens inside drain_and_exit() on another thread — that
+    # thread always finishes with os._exit(), so this is a defensive
+    # fallback only (e.g. drain_and_exit hasn't reached os._exit() yet).
     return 0
 
 
@@ -576,6 +1645,8 @@ def main():
     p.add_argument("--task")
     p.add_argument("--json", action="store_true")
     p.add_argument("--quiet-after", type=float, default=DEFAULT_QUIET_AFTER)
+    p.add_argument("--ensure", action="store_true",
+                   help="best-effort ensure_daemon() before running (or set AGENT_SWITCHBOARD_ENSURE=1)")
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser(
@@ -589,6 +1660,8 @@ def main():
     p.add_argument("--alert-quiet", action="store_true",
                    help="also return on RUNNING->QUIET transitions")
     p.add_argument("--quiet-after", type=float, default=DEFAULT_QUIET_AFTER)
+    p.add_argument("--ensure", action="store_true",
+                   help="best-effort ensure_daemon() before running (or set AGENT_SWITCHBOARD_ENSURE=1)")
     p.set_defaults(fn=cmd_wait)
 
     p = sub.add_parser("events", help="tail the observation log")

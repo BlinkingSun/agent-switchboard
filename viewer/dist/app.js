@@ -1,12 +1,234 @@
-/* Agent Switchboard viewer — plain ES2020, no modules */
+/* Agent Switchboard viewer — plain ES2020, no modules, no frameworks */
 (function () {
   "use strict";
+
+  /* ════════════════════════════════════════════════════
+   * PURE functions (no DOM) — ordering guard + self-test
+   * Exported on window.__sbTest / global.__sbTest
+   * ════════════════════════════════════════════════════ */
+
+  /**
+   * Monotonic apply-ordering guard.
+   * Every fetch is tagged with a rising seq; apply only if seq > lastApplied.
+   * @param {number} fetchSeq
+   * @param {number} lastAppliedSeq
+   * @returns {boolean}
+   */
+  function shouldApplyStatus(fetchSeq, lastAppliedSeq) {
+    if (typeof fetchSeq !== "number" || !isFinite(fetchSeq)) return false;
+    var last =
+      typeof lastAppliedSeq === "number" && isFinite(lastAppliedSeq)
+        ? lastAppliedSeq
+        : -1;
+    return fetchSeq > last;
+  }
+
+  /**
+   * Apply or drop a payload under the ordering guard.
+   * @returns {{applied:boolean, lastAppliedSeq:number, payload:*} }
+   */
+  function applyOrderingResult(fetchSeq, lastAppliedSeq, payload) {
+    if (!shouldApplyStatus(fetchSeq, lastAppliedSeq)) {
+      return {
+        applied: false,
+        lastAppliedSeq:
+          typeof lastAppliedSeq === "number" && isFinite(lastAppliedSeq)
+            ? lastAppliedSeq
+            : -1,
+        payload: null,
+      };
+    }
+    return { applied: true, lastAppliedSeq: fetchSeq, payload: payload };
+  }
+
+  /**
+   * Stable tree-collapse identity: pid + started (never raw pid alone).
+   * pids churn / reuse; started anchors the process identity.
+   */
+  function cliNodeCollapseKey(node) {
+    if (!node || node.pid == null) return "";
+    var started =
+      node.started != null && node.started !== ""
+        ? String(node.started)
+        : "";
+    return String(node.pid) + ":" + started;
+  }
+
+  /**
+   * Counts for header/section: EXCLUDE agent_dispatch nodes.
+   * kind enum: claude | grok | agent_dispatch
+   */
+  function countCliKinds(roots) {
+    var c = { claude: 0, grok: 0 };
+    function walk(nodes) {
+      if (!nodes) return;
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (n.kind === "claude") c.claude++;
+        else if (n.kind === "grok") c.grok++;
+        // agent_dispatch intentionally not counted
+        if (n.children && n.children.length) walk(n.children);
+      }
+    }
+    walk(roots || []);
+    return c;
+  }
+
+  /**
+   * Display label for node.model (family truncation for known prefixes).
+   * Truncate long ids to family name: claude-fable-5 -> fable.
+   * Short names (opus, sonnet, grok-4.5, default) pass through.
+   * @returns {string|null} null when nothing to show
+   */
+  function formatModelLabel(model) {
+    if (model == null || model === "") return null;
+    var s = String(model).trim();
+    if (!s) return null;
+    // claude-<family>(-<rest>...) → family (e.g. claude-fable-5 → fable)
+    var m = /^claude-([A-Za-z][\w]*)(?:-[\w.]+)*$/i.exec(s);
+    if (m && m[1]) return m[1];
+    return s;
+  }
+
+  function runApplyOrderingSelfTest() {
+    var results = [];
+    function check(name, cond) {
+      results.push({ name: name, ok: !!cond });
+    }
+
+    // Basic comparisons
+    check("apply 1 over 0", shouldApplyStatus(1, 0) === true);
+    check("reject equal", shouldApplyStatus(2, 2) === false);
+    check("reject stale", shouldApplyStatus(1, 5) === false);
+    check("apply newer", shouldApplyStatus(6, 5) === true);
+    check("reject non-number seq", shouldApplyStatus(null, 0) === false);
+    check("reject NaN", shouldApplyStatus(NaN, 0) === false);
+    check("treat missing last as -1", shouldApplyStatus(0, undefined) === true);
+
+    // Concurrent refresh scenario: tick( gen2 ) returns before wait( gen1 )
+    var last = 0;
+    var a = applyOrderingResult(1, last, { slots: "old" });
+    check("seq1 applied", a.applied === true && a.lastAppliedSeq === 1);
+    last = a.lastAppliedSeq;
+    var b = applyOrderingResult(2, last, { slots: "new" });
+    check("seq2 applied", b.applied === true && b.payload.slots === "new");
+    last = b.lastAppliedSeq;
+    var stale = applyOrderingResult(1, last, { slots: "old-again" });
+    check(
+      "stale seq1 dropped after seq2",
+      stale.applied === false && stale.lastAppliedSeq === 2 && stale.payload === null
+    );
+
+    // Out-of-order: gen5 finishes first, then gen3 and gen4 drop
+    last = 0;
+    var g5 = applyOrderingResult(5, last, "five");
+    last = g5.lastAppliedSeq;
+    check("g5 wins", last === 5 && g5.applied);
+    check("g3 drops", applyOrderingResult(3, last, "three").applied === false);
+    check("g4 drops", applyOrderingResult(4, last, "four").applied === false);
+    check("g6 applies", applyOrderingResult(6, last, "six").applied === true);
+
+    // Collapse key stability (T3)
+    check(
+      "collapse key pid+started",
+      cliNodeCollapseKey({ pid: 42, started: "2026-08-09T12:00:00" }) ===
+        "42:2026-08-09T12:00:00"
+    );
+    check(
+      "collapse key not raw pid",
+      cliNodeCollapseKey({ pid: 42, started: "a" }) !== "42" &&
+        cliNodeCollapseKey({ pid: 42, started: "a" }).indexOf(":") !== -1
+    );
+    check(
+      "same pid different started differ",
+      cliNodeCollapseKey({ pid: 9, started: "t1" }) !==
+        cliNodeCollapseKey({ pid: 9, started: "t2" })
+    );
+
+    // Counts exclude agent_dispatch (T5)
+    var roots = [
+      {
+        kind: "claude",
+        children: [
+          {
+            kind: "agent_dispatch",
+            children: [{ kind: "grok", children: [] }],
+          },
+        ],
+      },
+      { kind: "grok", children: [] },
+    ];
+    var cnt = countCliKinds(roots);
+    check("count claude=1", cnt.claude === 1);
+    check("count grok=2", cnt.grok === 2);
+    check("agent_dispatch not in counts", cnt.claude + cnt.grok === 3);
+
+    // model family truncation
+    check("model null -> null", formatModelLabel(null) === null);
+    check("model empty -> null", formatModelLabel("") === null);
+    check("model claude-fable-5 -> fable", formatModelLabel("claude-fable-5") === "fable");
+    check("model opus passthrough", formatModelLabel("opus") === "opus");
+    check("model sonnet passthrough", formatModelLabel("sonnet") === "sonnet");
+    check("model grok-4.5 passthrough", formatModelLabel("grok-4.5") === "grok-4.5");
+    check("model default passthrough", formatModelLabel("default") === "default");
+
+    var failed = [];
+    for (var i = 0; i < results.length; i++) {
+      if (!results[i].ok) failed.push(results[i].name);
+    }
+    return {
+      ok: failed.length === 0,
+      pass: results.length - failed.length,
+      fail: failed.length,
+      total: results.length,
+      failed: failed,
+      results: results,
+    };
+  }
+
+  var __sbTest = {
+    shouldApplyStatus: shouldApplyStatus,
+    applyOrderingResult: applyOrderingResult,
+    cliNodeCollapseKey: cliNodeCollapseKey,
+    countCliKinds: countCliKinds,
+    formatModelLabel: formatModelLabel,
+    runApplyOrderingSelfTest: runApplyOrderingSelfTest,
+  };
+  if (typeof window !== "undefined") window.__sbTest = __sbTest;
+  if (typeof globalThis !== "undefined") globalThis.__sbTest = __sbTest;
+
+  // Headless entry: `node app.js` runs the self-test and exits.
+  if (typeof document === "undefined") {
+    var report = runApplyOrderingSelfTest();
+    var line =
+      "apply-ordering self-test: " +
+      (report.ok ? "PASS" : "FAIL") +
+      " " +
+      report.pass +
+      "/" +
+      report.total;
+    if (typeof console !== "undefined" && console.log) {
+      console.log(line);
+      if (!report.ok) console.log(JSON.stringify(report, null, 2));
+      else console.log(JSON.stringify({ ok: true, pass: report.pass, total: report.total }));
+    }
+    if (typeof process !== "undefined" && process.exit) {
+      process.exit(report.ok ? 0 : 1);
+    }
+    return;
+  }
+
+  /* ════════════════════════════════════════════════════
+   * DOM app
+   * ════════════════════════════════════════════════════ */
 
   var BASE = "http://127.0.0.1:17920";
   var STATES = ["RUNNING", "QUIET", "ORPHAN", "DONE", "FAILED", "DIED"];
   var TILE_STATES = ["RUNNING", "QUIET", "DIED", "FAILED", "DONE"];
   var MAX_EVENTS = 40;
   var STATUS_INTERVAL_MS = 30000;
+  var RETENTION_S = 1800; // finished lanes drop off the board after 30 min
+  var LIVE_STATES = { RUNNING: 1, QUIET: 1, ORPHAN: 1, CORRUPT: 1 };
   var BACKOFF_MIN = 2000;
   var BACKOFF_MAX = 10000;
 
@@ -15,6 +237,7 @@
     totals: document.getElementById("global-totals"),
     density: document.getElementById("density-toggle"),
     offline: document.getElementById("offline-banner"),
+    startBtn: document.getElementById("start-daemon-btn"),
     main: document.getElementById("main"),
     rail: document.getElementById("rail"),
     tickerInner: document.getElementById("ticker-inner"),
@@ -22,9 +245,13 @@
 
   var state = {
     mock: false,
+    fixture: false,
     cursor: 0,
     status: [],
     events: [],
+    cli: null, // { counts:{claude,grok}, roots:[] } or null
+    cliSectionCollapsed: loadCliSectionCollapsed(),
+    cliTreeCollapse: loadCliTreeCollapse(),
     taskFilter: "ALL",
     stateFilter: null,
     density: loadDensity(),
@@ -32,6 +259,12 @@
     offline: false,
     backoff: BACKOFF_MIN,
     mockTick: 0,
+    hidden: 0,
+    // race / ordering
+    statusGen: 0,
+    lastAppliedSeq: 0,
+    bootId: null,
+    startBusy: false,
   };
 
   /* ── localStorage helpers ─────────────────────────── */
@@ -59,6 +292,40 @@
   function saveCollapse() {
     try {
       localStorage.setItem("sb-collapse", JSON.stringify(state.collapse));
+    } catch (e) { /* ignore */ }
+  }
+
+  function loadCliSectionCollapsed() {
+    try {
+      return localStorage.getItem("sb-cli-section-collapsed") === "1";
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function saveCliSectionCollapsed() {
+    try {
+      localStorage.setItem(
+        "sb-cli-section-collapsed",
+        state.cliSectionCollapsed ? "1" : "0"
+      );
+    } catch (e) { /* ignore */ }
+  }
+
+  function loadCliTreeCollapse() {
+    try {
+      var raw = localStorage.getItem("sb-cli-tree-collapse");
+      if (raw) return JSON.parse(raw) || {};
+    } catch (e) { /* ignore */ }
+    return {};
+  }
+
+  function saveCliTreeCollapse() {
+    try {
+      localStorage.setItem(
+        "sb-cli-tree-collapse",
+        JSON.stringify(state.cliTreeCollapse)
+      );
     } catch (e) { /* ignore */ }
   }
 
@@ -103,7 +370,6 @@
     }
     var d = new Date(ts);
     if (isNaN(d.getTime())) {
-      // accept "YYYY-MM-DDTHH:MM:SS" without Z
       var m = String(ts).match(/T(\d{2}):(\d{2}):(\d{2})/);
       if (m) return m[1] + ":" + m[2] + ":" + m[3];
       return String(ts).slice(0, 8);
@@ -185,7 +451,6 @@
     if (Object.prototype.hasOwnProperty.call(state.collapse, taskName)) {
       return !!state.collapse[taskName];
     }
-    // default: fully-DONE tasks start collapsed
     return taskAllDone(slots || []);
   }
 
@@ -195,10 +460,118 @@
     return laneCount > 15 ? "GRID" : "PANEL";
   }
 
-  /* ── mock generator ───────────────────────────────── */
+  /* ── PLAN REV 2 /v1/cli fixture (matches cli-tree-v2 mockup) ── */
+
+  function buildMockCliForest() {
+    // Forest shape: {counts:{claude,grok}, roots:[node…]}
+    // kind: claude | grok | agent_dispatch; each node may carry model
+    // Counts exclude agent_dispatch: claude 2, grok 5
+    return {
+      counts: { claude: 2, grok: 5 },
+      roots: [
+        {
+          pid: 41001,
+          kind: "claude",
+          mode: "interactive",
+          tty: "ttys004",
+          uptime_s: 4320,
+          started: "2026-08-09T20:42:00",
+          label: null,
+          model: "claude-fable-5",
+          children: [
+            {
+              pid: 42010,
+              kind: "agent_dispatch",
+              mode: "headless",
+              tty: null,
+              uptime_s: 840,
+              started: "2026-08-09T22:40:00",
+              label: "mytask/worker-a",
+              model: null,
+              children: [
+                {
+                  pid: 43011,
+                  kind: "grok",
+                  mode: "headless",
+                  tty: null,
+                  uptime_s: 840,
+                  started: "2026-08-09T22:40:05",
+                  label: "mytask-worker-a",
+                  channel: "mytask-worker-a",
+                  model: "grok-4.5",
+                  children: [],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          pid: 41002,
+          kind: "claude",
+          mode: "headless",
+          tty: null,
+          uptime_s: 2520,
+          started: "2026-08-09T21:12:00",
+          label: "(exec-master)",
+          model: "opus",
+          children: [
+            {
+              pid: 43101,
+              kind: "grok",
+              mode: "headless",
+              tty: null,
+              uptime_s: 1140,
+              started: "2026-08-09T22:15:00",
+              label: "mytask-worker-1",
+              channel: "mytask-worker-1",
+              model: "grok-4.5",
+              children: [],
+            },
+            {
+              pid: 43102,
+              kind: "grok",
+              mode: "headless",
+              tty: null,
+              uptime_s: 480,
+              started: "2026-08-09T22:26:00",
+              label: "mytask-worker-2",
+              channel: "mytask-worker-2",
+              model: "grok-4.5",
+              children: [],
+            },
+            {
+              pid: 43103,
+              kind: "grok",
+              mode: "headless",
+              tty: null,
+              uptime_s: 300,
+              started: "2026-08-09T22:29:00",
+              label: "mytask-worker-3",
+              channel: "mytask-worker-3",
+              model: "grok-4.5",
+              children: [],
+            },
+          ],
+        },
+        {
+          pid: 44001,
+          kind: "grok",
+          mode: "interactive",
+          tty: "ttys009",
+          uptime_s: 360,
+          started: "2026-08-09T22:48:00",
+          label: null,
+          model: "grok-4.5",
+          children: [],
+        },
+      ],
+    };
+  }
+
+  /* ── mock status generator ────────────────────────── */
 
   var MOCK_TASKS = [
-    "build-alpha",
+    "demo-task",
     "pipeline-a",
     "pipeline-b",
     "infra-ops",
@@ -211,7 +584,6 @@
   ];
 
   function mockStateMix(i) {
-    // Realistic mix: many DONE, many RUNNING, some QUIET, few alerts
     var r = (i * 17 + 3) % 100;
     if (r < 38) return "RUNNING";
     if (r < 55) return "QUIET";
@@ -224,8 +596,7 @@
   function buildMockStatus() {
     var tasks = [];
     var laneIdx = 0;
-    // Aim for ~120 lanes across 5 tasks with uneven distribution
-    var sizes = [8, 22, 35, 18, 40]; // sum = 123
+    var sizes = [8, 22, 35, 18, 40];
     for (var t = 0; t < MOCK_TASKS.length; t++) {
       var n = sizes[t];
       var slots = [];
@@ -258,7 +629,6 @@
         });
         laneIdx++;
       }
-      // Force one fully-DONE task occasionally (pipeline-b tends DONE-heavy)
       if (t === 2 && state.mockTick % 7 === 0) {
         for (var j = 0; j < slots.length; j++) {
           slots[j].state = "DONE";
@@ -310,7 +680,9 @@
 
   function renderTicker() {
     if (!state.events.length) {
-      els.tickerInner.textContent = "awaiting events";
+      els.tickerInner.textContent = state.offline
+        ? "no events — offline"
+        : "awaiting events";
       return;
     }
     var parts = [];
@@ -342,6 +714,192 @@
       parts.push(seg);
     }
     els.tickerInner.innerHTML = parts.join('<span class="ev-sep"> · </span>');
+  }
+
+  /* ── CLI tree render ──────────────────────────────── */
+
+  function kindDisplayName(kind) {
+    if (kind === "agent_dispatch") return "agent-dispatch";
+    if (kind === "claude") return "claude";
+    if (kind === "grok") return "grok";
+    return kind || "?";
+  }
+
+  /** Muted model chip markup (empty if no model). */
+  function renderModelChip(model) {
+    var label = formatModelLabel(model);
+    if (!label) return "";
+    return (
+      '<span class="badge model" title="' +
+      escapeAttr(String(model)) +
+      '">' +
+      escapeHtml(label) +
+      "</span>"
+    );
+  }
+
+  function isTreeNodeCollapsed(node) {
+    var key = cliNodeCollapseKey(node);
+    if (!key) return false;
+    return !!state.cliTreeCollapse[key];
+  }
+
+  function renderTreeNode(node, depth) {
+    if (!node) return "";
+    var kids = node.children || [];
+    var hasKids = kids.length > 0;
+    var collapsed = hasKids && isTreeNodeCollapsed(node);
+    var key = cliNodeCollapseKey(node);
+    var isBridge = node.kind === "agent_dispatch";
+    var mode = node.mode === "interactive" ? "interactive" : "headless";
+    var html = "";
+    html +=
+      '<div class="tree-node' +
+      (collapsed ? " collapsed" : "") +
+      '" data-cli-key="' +
+      escapeAttr(key) +
+      '">';
+    html +=
+      '<div class="tree-row' +
+      (isBridge ? " bridge" : "") +
+      '">';
+
+    if (hasKids) {
+      html +=
+        '<button type="button" class="twisty has-kids" data-cli-toggle="' +
+        escapeAttr(key) +
+        '" aria-label="Toggle">' +
+        '<span class="tri" aria-hidden="true"></span>' +
+        "</button>";
+    } else {
+      html += '<span class="twisty empty" aria-hidden="true"></span>';
+    }
+
+    if (!isBridge) {
+      html += '<span class="lamp lamp-live" aria-hidden="true"></span>';
+    }
+
+    html +=
+      '<span class="name">' +
+      escapeHtml(kindDisplayName(node.kind)) +
+      "</span>";
+
+    if (isBridge) {
+      // agent-dispatch: label is task/lane
+      if (node.label) {
+        html +=
+          '<span class="meta">' + escapeHtml(String(node.label)) + "</span>";
+      }
+      // model chip on every row when present (bridge has no mode badge)
+      html += renderModelChip(node.model);
+    } else {
+      html +=
+        '<span class="badge ' +
+        mode +
+        '">' +
+        (mode === "interactive" ? "INTERACTIVE" : "HEADLESS") +
+        "</span>";
+      // muted model chip immediately after INTERACTIVE/HEADLESS
+      html += renderModelChip(node.model);
+      if (node.mode === "interactive" && node.tty) {
+        html +=
+          '<span class="meta">' + escapeHtml(String(node.tty)) + "</span>";
+      } else if (node.label && String(node.label).indexOf("(") === 0) {
+        // e.g. (exec-master)
+        html +=
+          '<span class="meta">' + escapeHtml(String(node.label)) + "</span>";
+      } else if (node.channel || (node.label && node.kind === "grok")) {
+        var ch = node.channel || node.label;
+        html +=
+          '<span class="channel">channel ' +
+          escapeHtml(String(ch)) +
+          "</span>";
+      } else if (node.label) {
+        html +=
+          '<span class="meta">' + escapeHtml(String(node.label)) + "</span>";
+      }
+    }
+
+    html +=
+      '<span class="uptime">' +
+      escapeHtml(formatUp(node.uptime_s)) +
+      "</span>";
+    html += "</div>"; // tree-row
+
+    if (hasKids) {
+      html += '<div class="tree-children">';
+      for (var i = 0; i < kids.length; i++) {
+        html += renderTreeNode(kids[i], depth + 1);
+      }
+      html += "</div>";
+    }
+    html += "</div>"; // tree-node
+    return html;
+  }
+
+  function cliCountsFromState() {
+    if (!state.cli) return { claude: 0, grok: 0 };
+    if (state.cli.counts && typeof state.cli.counts.claude === "number") {
+      // Prefer server counts but recompute if roots present (T5 safety)
+      if (state.cli.roots) {
+        return countCliKinds(state.cli.roots);
+      }
+      return {
+        claude: state.cli.counts.claude || 0,
+        grok: state.cli.counts.grok || 0,
+      };
+    }
+    return countCliKinds(state.cli.roots || []);
+  }
+
+  function renderCliSection() {
+    var offline = state.offline;
+    var counts = cliCountsFromState();
+    var live = counts.claude + counts.grok;
+    var meta;
+    if (offline && !state.cli) {
+      meta = '<span class="unreachable">unreachable</span>';
+    } else {
+      meta =
+        "<b>CLAUDE " +
+        counts.claude +
+        "</b> · <b>GROK " +
+        counts.grok +
+        "</b> · <span class=\"ok\">" +
+        live +
+        " live</span>";
+    }
+
+    var body;
+    if (offline && !state.cli) {
+      body =
+        '<div class="empty-msg dim">no data — daemon not connected</div>';
+    } else if (!state.cli || !(state.cli.roots && state.cli.roots.length)) {
+      body = '<div class="empty-msg dim">no CLI sessions</div>';
+    } else {
+      body = '<div class="cli-tree">';
+      for (var i = 0; i < state.cli.roots.length; i++) {
+        body += renderTreeNode(state.cli.roots[i], 0);
+      }
+      body += "</div>";
+    }
+
+    return (
+      '<section class="cli-section task-section' +
+      (state.cliSectionCollapsed ? " collapsed" : "") +
+      '" id="cli-sessions">' +
+      '<button type="button" class="cli-head task-head" data-cli-section="1">' +
+      '<span class="disclosure" aria-hidden="true"></span>' +
+      '<span class="cli-title task-name">CLI SESSIONS</span>' +
+      '<span class="cli-meta task-rollup">' +
+      meta +
+      "</span>" +
+      "</button>" +
+      '<div class="cli-body task-body">' +
+      body +
+      "</div>" +
+      "</section>"
+    );
   }
 
   /* ── render pieces ────────────────────────────────── */
@@ -380,7 +938,6 @@
     for (var i = 0; i < tasks.length; i++) {
       if (names.indexOf(tasks[i].task) === -1) names.push(tasks[i].task);
     }
-    // Keep selected task visible even if temporarily empty
     if (state.taskFilter !== "ALL" && names.indexOf(state.taskFilter) === -1) {
       names.push(state.taskFilter);
     }
@@ -416,6 +973,26 @@
         s +
         "</span>";
     }
+    if (state.hidden) {
+      html +=
+        '<span class="gt gt-hidden">' +
+        state.hidden +
+        " finished hidden</span>";
+    }
+    // CLI chips (T5: exclude agent_dispatch)
+    var cc = cliCountsFromState();
+    if (!state.offline || state.cli) {
+      html +=
+        '<span class="gt gt-cli">CLI: claude <strong>' +
+        cc.claude +
+        "</strong></span>";
+      html +=
+        '<span class="gt gt-cli">grok <strong>' +
+        cc.grok +
+        "</strong></span>";
+    } else {
+      html += '<span class="gt gt-cli">CLI: —</span>';
+    }
     els.totals.innerHTML = html;
   }
 
@@ -450,11 +1027,13 @@
         s +
         "</span>" +
         '<span class="tile-num">' +
-        n +
+        (state.offline && !state.status.length ? "—" : n) +
         "</span>" +
         "</button>";
     }
     els.rail.innerHTML = html;
+    if (state.offline) els.rail.classList.add("is-offline");
+    else els.rail.classList.remove("is-offline");
   }
 
   function tooltipFor(slot) {
@@ -525,14 +1104,33 @@
     return html;
   }
 
-  function renderMain() {
+  function renderTaskSections() {
     var tasks = sortTasks(filteredTasks());
     if (!tasks.length) {
-      els.main.innerHTML =
-        '<div class="empty-msg">No tasks' +
-        (state.offline ? " (daemon offline)" : "") +
-        "</div>";
-      return;
+      if (state.offline) {
+        return (
+          '<section class="task-section">' +
+          '<div class="task-head" style="cursor:default">' +
+          '<span class="disclosure" aria-hidden="true"></span>' +
+          '<span class="task-name">TASKS</span>' +
+          '<span class="task-rollup">—</span>' +
+          "</div>" +
+          '<div class="task-body">' +
+          '<div class="empty-msg dim">waiting for /v1/status</div>' +
+          "</div>" +
+          "</section>"
+        );
+      }
+      var msg = "No tasks";
+      if (state.hidden) {
+        msg =
+          "No live activity — " +
+          state.hidden +
+          " finished lane" +
+          (state.hidden === 1 ? "" : "s") +
+          " hidden";
+      }
+      return '<div class="empty-msg">' + msg + "</div>";
     }
     var html = "";
     for (var i = 0; i < tasks.length; i++) {
@@ -569,7 +1167,15 @@
         "</div>" +
         "</section>";
     }
+    return html;
+  }
+
+  function renderMain() {
+    // CLI SESSIONS pinned above task sections
+    var html = renderCliSection() + renderTaskSections();
     els.main.innerHTML = html;
+    if (state.offline) els.main.classList.add("is-offline");
+    else els.main.classList.remove("is-offline");
   }
 
   function renderAll() {
@@ -579,6 +1185,76 @@
     renderRail();
     renderMain();
     renderTicker();
+    updateStartButton();
+  }
+
+  /* ── Tauri START DAEMON ───────────────────────────── */
+
+  function hasTauriApi() {
+    try {
+      if (window.__TAURI__ && window.__TAURI__.core && typeof window.__TAURI__.core.invoke === "function") {
+        return true;
+      }
+      // Tauri 2 internals / older shapes
+      if (window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === "function") {
+        return true;
+      }
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
+  function invokeStartDaemon() {
+    if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+      return window.__TAURI__.core.invoke("start_daemon");
+    }
+    if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
+      return window.__TAURI_INTERNALS__.invoke("start_daemon", {});
+    }
+    return Promise.reject(new Error("no tauri api"));
+  }
+
+  function updateStartButton() {
+    if (!els.startBtn) return;
+    if (!hasTauriApi()) {
+      els.startBtn.hidden = true;
+      els.startBtn.setAttribute("hidden", "");
+      return;
+    }
+    // Show only when offline (banner visible)
+    if (state.offline) {
+      els.startBtn.hidden = false;
+      els.startBtn.removeAttribute("hidden");
+      els.startBtn.disabled = !!state.startBusy;
+      els.startBtn.textContent = state.startBusy ? "STARTING…" : "START DAEMON";
+    } else {
+      els.startBtn.hidden = true;
+      els.startBtn.setAttribute("hidden", "");
+    }
+  }
+
+  async function onStartDaemon() {
+    if (state.startBusy || !hasTauriApi()) return;
+    state.startBusy = true;
+    updateStartButton();
+    try {
+      await invokeStartDaemon();
+      // Probe health a few times after kickstart
+      for (var i = 0; i < 8; i++) {
+        await sleep(500);
+        try {
+          await initialLoad();
+          if (!state.offline) break;
+        } catch (e) { /* keep trying */ }
+      }
+    } catch (err) {
+      // Stay offline; button re-enabled
+      if (typeof console !== "undefined" && console.warn) {
+        console.warn("start_daemon failed", err);
+      }
+    } finally {
+      state.startBusy = false;
+      updateStartButton();
+    }
   }
 
   /* ── events (delegation) ──────────────────────────── */
@@ -586,6 +1262,12 @@
   function onClick(e) {
     var t = e.target;
     if (!t) return;
+
+    // START DAEMON
+    if (t.id === "start-daemon-btn" || (t.closest && t.closest("#start-daemon-btn"))) {
+      onStartDaemon();
+      return;
+    }
 
     // density
     var densBtn = t.closest ? t.closest(".density-btn") : null;
@@ -617,13 +1299,40 @@
       return;
     }
 
-    // collapse
+    // CLI tree node toggle (pid:started key)
+    var twisty = t.closest ? t.closest("[data-cli-toggle]") : null;
+    if (twisty) {
+      var ck = twisty.getAttribute("data-cli-toggle");
+      if (ck) {
+        state.cliTreeCollapse[ck] = !state.cliTreeCollapse[ck];
+        saveCliTreeCollapse();
+        var nodeEl = twisty.closest(".tree-node");
+        if (nodeEl) {
+          if (state.cliTreeCollapse[ck]) nodeEl.classList.add("collapsed");
+          else nodeEl.classList.remove("collapsed");
+        }
+      }
+      return;
+    }
+
+    // CLI section collapse
+    var cliHead = t.closest ? t.closest("[data-cli-section]") : null;
+    if (cliHead) {
+      state.cliSectionCollapsed = !state.cliSectionCollapsed;
+      saveCliSectionCollapsed();
+      var sec = cliHead.closest(".cli-section");
+      if (sec) {
+        if (state.cliSectionCollapsed) sec.classList.add("collapsed");
+        else sec.classList.remove("collapsed");
+      }
+      return;
+    }
+
+    // task collapse
     var head = t.closest ? t.closest(".task-head") : null;
-    if (head) {
+    if (head && !head.getAttribute("data-cli-section")) {
       var name = head.getAttribute("data-collapse");
       if (name) {
-        var currently = isCollapsed(name, []);
-        // If key missing, isCollapsed may use default DONE rule — resolve from DOM
         var section = head.closest(".task-section");
         var isNowCollapsed = section && section.classList.contains("collapsed");
         state.collapse[name] = !isNowCollapsed;
@@ -650,20 +1359,85 @@
       els.offline.setAttribute("hidden", "");
       state.backoff = BACKOFF_MIN;
     }
+    updateStartButton();
   }
 
+  /**
+   * fetchJson with 503 Retry-After awareness.
+   * Throws Error with .status and optional .retryAfterSec
+   */
   function fetchJson(url, opts) {
     return fetch(url, opts).then(function (res) {
-      if (!res.ok) throw new Error("HTTP " + res.status);
+      if (res.status === 503) {
+        var ra = res.headers.get("Retry-After");
+        var err = new Error("HTTP 503");
+        err.status = 503;
+        err.retryAfterSec = ra != null && ra !== "" ? parseInt(ra, 10) : null;
+        if (err.retryAfterSec != null && !isFinite(err.retryAfterSec)) {
+          err.retryAfterSec = null;
+        }
+        // Try to parse body for wait_capacity etc. (optional)
+        return res.json().catch(function () { return null; }).then(function (body) {
+          err.body = body;
+          throw err;
+        });
+      }
+      if (!res.ok) {
+        var e2 = new Error("HTTP " + res.status);
+        e2.status = res.status;
+        throw e2;
+      }
       return res.json();
     });
   }
 
+  function pruneFinished(tasks) {
+    var out = [];
+    var hidden = 0;
+    for (var i = 0; i < tasks.length; i++) {
+      var slots = tasks[i].slots || [];
+      var keep = [];
+      for (var j = 0; j < slots.length; j++) {
+        var s = slots[j];
+        if (LIVE_STATES[s.state] || s.ended_s == null || s.ended_s < RETENTION_S) {
+          keep.push(s);
+        } else {
+          hidden++;
+        }
+      }
+      if (keep.length) out.push({ task: tasks[i].task, slots: keep });
+    }
+    state.hidden = hidden;
+    return out;
+  }
+
   function applyStatus(data) {
     if (Array.isArray(data)) {
-      state.status = data;
+      state.status = pruneFinished(data);
     } else {
       state.status = [];
+    }
+  }
+
+  function applyCli(data) {
+    if (!data || typeof data !== "object") {
+      state.cli = null;
+      return;
+    }
+    // Accept REV 2 forest {counts, roots} or tolerate {instances} legacy empty
+    if (Array.isArray(data.roots)) {
+      state.cli = {
+        counts: data.counts || countCliKinds(data.roots),
+        roots: data.roots,
+      };
+    } else if (Array.isArray(data.instances)) {
+      // Flat list fallback: promote to single-level roots
+      state.cli = {
+        counts: data.counts || countCliKinds(data.instances),
+        roots: data.instances,
+      };
+    } else {
+      state.cli = { counts: { claude: 0, grok: 0 }, roots: [] };
     }
   }
 
@@ -673,24 +1447,90 @@
     });
   }
 
-  /* ── live loop ────────────────────────────────────── */
+  /* ── live loop (ordering guard + cli piggyback) ───── */
 
+  /**
+   * Single status+cli refresh with monotonic apply seq (drop stale replies).
+   * /v1/cli piggybacks this path — no extra long-poll (T4).
+   */
+  async function refreshStatus() {
+    var g = ++state.statusGen;
+    var status;
+    var cliData = null;
+    try {
+      status = await fetchJson(BASE + "/v1/status");
+    } catch (e) {
+      // If this fetch is still the latest, surface offline
+      if (shouldApplyStatus(g, state.lastAppliedSeq)) {
+        // Do not advance lastApplied on hard failure; let next succeed
+        throw e;
+      }
+      return; // superseded
+    }
+    // Best-effort /v1/cli (daemon may not serve it yet — lane b2)
+    try {
+      cliData = await fetchJson(BASE + "/v1/cli");
+    } catch (eCli) {
+      if (state.fixture || state.mock) {
+        cliData = buildMockCliForest();
+      } else {
+        cliData = null; // leave previous tree if any
+      }
+    }
+
+    var decision = applyOrderingResult(g, state.lastAppliedSeq, {
+      status: status,
+      cli: cliData,
+    });
+    if (!decision.applied) return;
+    state.lastAppliedSeq = decision.lastAppliedSeq;
+    applyStatus(status);
+    if (cliData) applyCli(cliData);
+    setOffline(false);
+    renderAll();
+  }
+
+  /**
+   * Full bootstrap: health (boot_id + cursor) then status+cli.
+   * Used only at boot and intentional resync — NOT from waitLoop catch.
+   */
   async function initialLoad() {
     var health = await fetchJson(BASE + "/v1/health");
     if (health && typeof health.cursor === "number") {
       state.cursor = health.cursor;
     }
-    var status = await fetchJson(BASE + "/v1/status");
-    applyStatus(status);
-    setOffline(false);
-    renderAll();
+    if (health && health.boot_id != null) {
+      if (state.bootId != null && health.boot_id !== state.bootId) {
+        // Daemon restarted — force full refresh path
+        state.cursor = typeof health.cursor === "number" ? health.cursor : 0;
+      }
+      state.bootId = health.boot_id;
+    }
+    await refreshStatus();
   }
 
-  async function refreshStatus() {
-    var status = await fetchJson(BASE + "/v1/status");
-    applyStatus(status);
-    setOffline(false);
-    renderAll();
+  /**
+   * Cursor recovery without nesting full initialLoad inside waitLoop.
+   * Uses health + generation-guarded refreshStatus.
+   */
+  async function recoverFromWaitError() {
+    try {
+      var health = await fetchJson(BASE + "/v1/health");
+      if (health && health.boot_id != null) {
+        if (state.bootId != null && health.boot_id !== state.bootId) {
+          state.cursor = typeof health.cursor === "number" ? health.cursor : 0;
+        } else if (typeof health.cursor === "number") {
+          state.cursor = health.cursor;
+        }
+        state.bootId = health.boot_id;
+      } else if (health && typeof health.cursor === "number") {
+        state.cursor = health.cursor;
+      }
+      await refreshStatus();
+    } catch (e) {
+      setOffline(true);
+      renderAll();
+    }
   }
 
   async function waitLoop() {
@@ -703,25 +1543,53 @@
           "&timeout=55";
         var data = await fetchJson(url);
         setOffline(false);
+        // Success path: reset backoff
+        state.backoff = BACKOFF_MIN;
+
+        // boot_id change or gap → full resync
+        if (data && data.boot_id != null) {
+          if (state.bootId != null && data.boot_id !== state.bootId) {
+            state.bootId = data.boot_id;
+            state.cursor = typeof data.cursor === "number" ? data.cursor : 0;
+            await refreshStatus();
+            continue;
+          }
+          state.bootId = data.boot_id;
+        }
+        if (data && (data.gap || data.trimmed)) {
+          if (typeof data.cursor === "number") state.cursor = data.cursor;
+          await refreshStatus();
+          continue;
+        }
+
         if (data && typeof data.cursor === "number") {
           state.cursor = data.cursor;
         }
         if (data && data.events && data.events.length) {
           pushEvents(data.events);
+          // Piggyback status + /v1/cli on wait events (T4)
           await refreshStatus();
         }
-        // loop immediately (even on timeout with empty events)
       } catch (err) {
+        // 503 wait capacity: honor Retry-After, backoff, no error spiral
+        if (err && err.status === 503) {
+          var waitMs =
+            err.retryAfterSec != null && err.retryAfterSec > 0
+              ? err.retryAfterSec * 1000
+              : state.backoff;
+          waitMs = Math.max(waitMs, BACKOFF_MIN);
+          await sleep(waitMs);
+          state.backoff = Math.min(BACKOFF_MAX, state.backoff + 1000);
+          // Do NOT mark offline / do NOT initialLoad — capacity is temporary
+          continue;
+        }
+
         setOffline(true);
         renderAll();
         await sleep(state.backoff);
         state.backoff = Math.min(BACKOFF_MAX, state.backoff + 1000);
-        // try a status probe to recover cursor
-        try {
-          await initialLoad();
-        } catch (e2) {
-          /* stay offline */
-        }
+        // Single recovery path — no initialLoad inside catch
+        await recoverFromWaitError();
       }
     }
   }
@@ -731,17 +1599,20 @@
       await sleep(STATUS_INTERVAL_MS);
       if (state.mock) continue;
       try {
+        // 30s tick also refreshes /v1/cli (T4)
         await refreshStatus();
       } catch (e) {
         setOffline(true);
+        renderAll();
       }
     }
   }
 
-  /* ── mock loop ────────────────────────────────────── */
+  /* ── mock / fixture loops ─────────────────────────── */
 
   async function mockLoop() {
     state.status = buildMockStatus();
+    state.cli = buildMockCliForest();
     state.cursor = 1;
     setOffline(false);
     renderAll();
@@ -750,10 +1621,28 @@
       await sleep(2500 + Math.floor(Math.random() * 1500));
       var ev = mockEvent();
       pushEvents([ev]);
-      // drift ages
       state.status = buildMockStatus();
+      state.cli = buildMockCliForest();
       renderAll();
     }
+  }
+
+  /** Fixture mode: drive tree from mock /v1/cli JSON even if daemon lacks endpoint */
+  async function fixtureBoot() {
+    state.fixture = true;
+    try {
+      await initialLoad();
+    } catch (e) {
+      // Daemon down — still show fixture tree offline-style? Prefer online tree.
+      state.status = [];
+      setOffline(true);
+    }
+    // Always apply CLI fixture for UI work when ?mock=1 or daemon has no /v1/cli
+    applyCli(buildMockCliForest());
+    if (!state.offline) setOffline(false);
+    renderAll();
+    waitLoop();
+    statusTickLoop();
   }
 
   /* ── boot ─────────────────────────────────────────── */
@@ -766,24 +1655,47 @@
     }
   }
 
+  function isFixture() {
+    try {
+      // default fixture when ?fixture=1 OR when mock — also auto if ?cli=1
+      return /(?:\?|&)(?:fixture|cli)=1(?:&|$)/.test(location.search);
+    } catch (e) {
+      return false;
+    }
+  }
+
   async function boot() {
     state.mock = isMock();
+    state.fixture = isFixture();
     renderDensity();
     renderTicker();
+    updateStartButton();
+
+    // Auto-run pure self-test once at boot (result on __sbTest.lastRun)
+    try {
+      __sbTest.lastRun = runApplyOrderingSelfTest();
+    } catch (e) {
+      __sbTest.lastRun = { ok: false, error: String(e) };
+    }
 
     if (state.mock) {
       await mockLoop();
       return;
     }
 
+    if (state.fixture) {
+      await fixtureBoot();
+      return;
+    }
+
     try {
       await initialLoad();
+      // If /v1/cli missing, leave state.cli null until it appears
     } catch (e) {
       setOffline(true);
       renderAll();
     }
 
-    // parallel loops
     waitLoop();
     statusTickLoop();
   }

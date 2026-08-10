@@ -13,6 +13,10 @@ launchctl load ~/Library/LaunchAgents/com.agent-switchboard.plist
 curl -s http://127.0.0.1:17920/v1/health
 ```
 
+`KeepAlive` is a dict with `SuccessfulExit = false`: the job restarts on
+crash/nonzero only. Clean exit 0 (idle self-exit or healthy-duplicate bind)
+must stay down — boolean `KeepAlive=true` would immediately resurrect it.
+
 ## Linux (systemd user unit)
 
 `~/.config/systemd/user/agent-switchboard.service`:
@@ -23,7 +27,8 @@ Description=Agent Switchboard daemon
 
 [Service]
 ExecStart=/usr/bin/python3 /PATH/TO/REPO/bin/switchboard serve --port 17920
-Restart=always
+# Match launchd SuccessfulExit:false — do not restart on clean exit 0
+Restart=on-failure
 
 [Install]
 WantedBy=default.target

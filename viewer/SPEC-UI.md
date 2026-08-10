@@ -23,7 +23,7 @@ GET /v1/status  →
 ```
 states: RUNNING | QUIET | ORPHAN | DONE | FAILED | DIED
 
-GET /v1/health → `{"ok":true,"version":"0.1.0","uptime_s":123,"cursor":42}`
+GET /v1/health → `{"ok":true,"version":"1.1.0","uptime_s":123,"cursor":42}`
 
 GET /v1/wait?cursor=N&timeout=55 → long-poll; blocks until an observed
 transition with seq > N or timeout; →

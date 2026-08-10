@@ -13,10 +13,21 @@ subagent, a Grok Build run, a Codex exec, a plain script.
 | observe | `switchboard status [--task T] [--json]` | derived state of every lane, instantly |
 | wait | `switchboard wait --task T [--lane L] [--watch-file F] --timeout 570` | blocks until a lane finishes/dies or a file changes (exit 0) or timeout (exit 3) |
 
-Plus an HTTP API for tools/UIs: `GET /v1/status`, `/v1/events`, and long-poll
-`/v1/wait?cursor=N` on `127.0.0.1:17920` (`switchboard serve`). Everything is
-**observe-only**: the switchboard never kills, restarts, or re-dispatches —
-your orchestrator reads the alerts and decides.
+Plus an HTTP API for tools/UIs on `127.0.0.1:17920` (`switchboard serve`):
+
+| Endpoint | Notes |
+|---|---|
+| `GET /v1/health` | `version`, `boot_id`, `busy`, `busy_reasons` |
+| `GET /v1/tasks` | task list |
+| `GET /v1/status[?task=T]` | lanes with derived `state`; terminal rows include `ended_s` |
+| `GET /v1/events?task=T` | observation log tail |
+| `GET /v1/cli` | spawn-tree forest (`kind`: `claude` \| `grok` \| `agent_dispatch`; optional `model`) |
+| `GET /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55]` | long-poll; `gap:true` if cursor behind ring; HTTP 503 + `Retry-After` when wait capacity is full |
+
+Everything is **observe-only**: the switchboard never kills, restarts, or
+re-dispatches — your orchestrator reads the alerts and decides. (The viewer
+**START DAEMON** button and CLI `--ensure` only kickstart the launchd job for
+the daemon itself.)
 
 ## The pattern for ANY orchestrating agent
 
@@ -30,6 +41,10 @@ your orchestrator reads the alerts and decides.
    `DIED` → the process was killed without finishing (crash, OOM, harness
    kill). Investigate, then usually re-dispatch on the same channel/session.
    `QUIET` → warning only: alive but silent (long local builds do this).
+
+Optional: `switchboard status --ensure` / `wait --ensure` (or
+`AGENT_SWITCHBOARD_ENSURE=1`) best-effort starts the daemon before observing
+so dashboards and long-polls have a live backend.
 
 ## Harness recipes
 
@@ -63,9 +78,11 @@ Headless Grok runs (`grok -p ... --output-format json`) are just processes:
 agent-dispatch --task mytask --lane research \
     --exec ~/.grok/bin/grok -- -p "..." --output-format json --cwd /work/dir
 ```
-If you drive Grok through a bridge script (e.g. [claude-grok-bridge](https://github.com/BlinkingSun/claude-grok-bridge)'s grok-ask), wrap the bridge —
-the wrapper reads `-c <channel>` / `-d <cwd>` from the args and uses Grok's
-own session files as the activity heartbeat, so QUIET detection is free.
+If you drive Grok through a bridge script (e.g. a thin `grok-ask` wrapper),
+wrap the bridge — the wrapper reads `-c <channel>` / `-d <cwd>` from the args
+and uses Grok's own session files as the activity heartbeat, so QUIET
+detection is free. Set `AGENT_SWITCHBOARD_CHANNEL_DIR` if you keep a
+channel→sessionId map on disk.
 
 ### OpenAI Codex CLI
 ```bash
@@ -88,18 +105,26 @@ orchestrator watch their declared output artifact with
 ### Anything else
 If it runs from a shell, `--exec <prog>` wraps it. If you can't wrap it,
 `--watch-file` its output. The HTTP long-poll (`/v1/wait?cursor=N`) serves
-dashboards, TVs, and other tools without polling cost.
+dashboards, TVs, and other tools without polling cost. The `/v1/cli` forest
+classifies live claude/grok processes (and `agent-dispatch` nodes) for the
+viewer's CLI SESSIONS panel.
 
 ## Notes
 - Capacity: the wrapper refuses dispatch past the configured cap (exit 2) —
   backpressure your orchestrator can see, instead of a silent pile-up. The
-  cap is **per task**: concurrent tasks each get their own budget.
-- QUIET detection reads the worker's own session/log files (for grok-ask, the
-  grok CLI session dir). It is reliable when the lane has a resumed channel
+  cap is **per task**: concurrent tasks each get their own budget
+  (`AGENT_SWITCHBOARD_MAX`, default 10).
+- QUIET detection reads the worker's own session/log files (for a grok bridge,
+  the grok CLI session dir). It is reliable when the lane has a resumed channel
   or a **unique `-d` working dir per lane**; with several fresh sessions
   sharing one cwd, activity may attach to the wrong session — pid liveness
   (RUNNING/DIED) is unaffected.
 - `AGENT_SWITCHBOARD_ROOT` relocates all state (useful for tests/CI).
+- Memory hygiene: `events.jsonl` rotates at `AGENT_SWITCHBOARD_EVENTS_MAX_BYTES`;
+  terminal slots cold-archive after `AGENT_SWITCHBOARD_COLD_AFTER` (default 24h).
+- Lifecycle: idle self-exit after `AGENT_SWITCHBOARD_IDLE_GRACE` when no CLI,
+  viewer, or active slot is present; `/v1/wait` returns 503 past
+  `AGENT_SWITCHBOARD_WAIT_CAP` concurrent waiters.
 - Windows: fully supported; liveness uses `OpenProcess`, never `os.kill`
   (which would terminate the probed process on Windows).
 - Subscription/billing: pick your worker deliberately — e.g. for grok,

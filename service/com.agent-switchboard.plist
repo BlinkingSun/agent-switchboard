@@ -15,7 +15,14 @@
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <!-- Restart only on an UNSUCCESSFUL exit (crash / nonzero). A clean
+             exit 0 — idle shutdown or a healthy-duplicate-peer bind-fail —
+             is intentional and must stick. Boolean KeepAlive=true would
+             resurrect idle-exit immediately. -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
     <string>/tmp/agent-switchboard.log</string>
     <key>StandardErrorPath</key>
