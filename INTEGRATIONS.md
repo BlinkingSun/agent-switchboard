@@ -21,7 +21,7 @@ Plus an HTTP API for tools/UIs on `127.0.0.1:17920` (`switchboard serve`):
 | `GET /v1/tasks` | task list |
 | `GET /v1/status[?task=T]` | lanes with derived `state`; terminal rows include `ended_s` |
 | `GET /v1/events?task=T` | observation log tail |
-| `GET /v1/cli` | spawn-tree forest (`kind`: `claude` \| `grok` \| `agent_dispatch`; optional `model`) |
+| `GET /v1/cli` | spawn-tree forest (`kind`: `claude` \| `grok` \| `agent_dispatch`, plus pid-less virtual `grok-sub` children on resumed grok nodes; optional `model`) |
 | `GET /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55]` | long-poll; `gap:true` if cursor behind ring; HTTP 503 + `Retry-After` when wait capacity is full |
 
 Everything is **observe-only**: the switchboard never kills, restarts, or

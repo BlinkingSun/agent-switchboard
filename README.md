@@ -65,7 +65,7 @@ switchboard serve            # 127.0.0.1:17920, read-only
 | `GET /v1/tasks` | known task names |
 | `GET /v1/status[?task=T]` | derived lanes (includes `ended_s` for terminal rows) |
 | `GET /v1/events?task=T` | recent observation log (tail-read; rotates under size cap) |
-| `GET /v1/cli` | spawn-tree forest of live CLI sessions (claude / grok / agent_dispatch) |
+| `GET /v1/cli` | spawn-tree forest of live CLI sessions (claude / grok / agent_dispatch), including **virtual `grok-sub` rows** for a resumed grok session's active in-process native subagents (pid-less, `virtual: true`, counted in `counts.grok_subagents`) |
 | `GET /v1/wait?cursor=N[&task=T][&timeout=55]` | long-poll; returns within ~1s of a transition; `gap:true` if the cursor fell behind the ring |
 
 CLI and status also support best-effort daemon wake-up via `--ensure` or

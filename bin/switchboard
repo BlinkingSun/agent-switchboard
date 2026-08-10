@@ -70,7 +70,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 ROOT = os.environ.get(
     "AGENT_SWITCHBOARD_ROOT",
     os.path.expanduser("~/.agent-switchboard/state"),
@@ -442,13 +442,24 @@ def _parse_wrapper_flags(command, kind):
         return meta
 
     if kind == "claude_cli":
-        for j, t in enumerate(toks[1:8], start=1):
+        # -p/--print is an early flag, so the leading window is right for it.
+        for t in toks[1:8]:
             if t in ("-p", "--print"):
                 meta["headless_flag"] = True
+                break
+        # --model is NOT early: `claude -p <prompt> ... --model sonnet` puts it
+        # after a prompt that ps splits into hundreds of tokens. Scan from the
+        # END so the real flag wins over any lookalike inside the prompt text
+        # (a leading-window scan never sees it, and every dispatched Claude
+        # lane would report the session default instead of its actual model).
+        for j in range(len(toks) - 1, 0, -1):
+            t = toks[j]
+            if t.startswith("--model="):
+                meta["model"] = t.split("=", 1)[1]
+                break
             if t in ("-m", "--model") and j + 1 < len(toks):
                 meta["model"] = toks[j + 1]
-            elif t.startswith("--model="):
-                meta["model"] = t.split("=", 1)[1]
+                break
         return meta
 
     # Best-effort -m scan for other kinds
@@ -511,6 +522,75 @@ def _lstart_ts(lstart):
         return None
 
 
+def _grok_resume_sid(command):
+    """Session id from a grok CLI command's --resume flag (None if absent)."""
+    toks = _tokens(command)
+    for i, t in enumerate(toks):
+        if t == "--resume" and i + 1 < len(toks):
+            return toks[i + 1]
+        if t.startswith("--resume="):
+            return t.split("=", 1)[1]
+    return None
+
+
+def grok_active_subagents(sid, proc_started_ts, now):
+    """Virtual tree nodes for a grok session's ACTIVE in-process subagents.
+
+    Native grok subagents (spawn_subagent) run inside the parent's OS process,
+    so the ps forest can never show them spreading. Their ground truth lives in
+    the session dir: subagents/<id>/meta.json carries status/started_at/
+    description. Active = status not "completed" AND started at/after this
+    grok process (a resumed session keeps stale entries from earlier runs,
+    e.g. crashed subagents that never completed — the start bound filters
+    them). Only sessions launched with --resume are resolvable from ps; a
+    channel's first-open (no --resume yet) shows no virtual children.
+    """
+    if not sid or not name_ok(sid):
+        return []
+    out = []
+    pattern = os.path.join(
+        GROK_SESS_ROOT, "*", sid, "subagents", "*", "meta.json"
+    )
+    for meta_path in glob.glob(pattern):
+        m = read_json(meta_path)
+        if not m or m.get("status") == "completed":
+            continue
+        ts = None
+        st = m.get("started_at")
+        if isinstance(st, str):
+            try:
+                ts = (
+                    datetime.datetime.strptime(st[:19], "%Y-%m-%dT%H:%M:%S")
+                    .replace(tzinfo=datetime.timezone.utc)
+                    .timestamp()
+                )
+            except ValueError:
+                ts = None
+        if (
+            proc_started_ts is not None
+            and ts is not None
+            and ts < proc_started_ts - 60
+        ):
+            continue
+        started_iso = iso(ts) if ts is not None else None
+        out.append({
+            "pid": None,
+            "kind": "grok-sub",
+            "mode": "headless",
+            "tty": None,
+            "started": started_iso,
+            "started_iso": started_iso,
+            "uptime_s": max(0, int(round(now - ts))) if ts is not None else None,
+            "label": m.get("description") or m.get("subagent_type") or "subagent",
+            "model": m.get("effective_model_id") or "grok-4.5",
+            "children": [],
+            "virtual": True,
+            "subagent_id": m.get("subagent_id"),
+        })
+    out.sort(key=lambda n: n.get("started") or "")
+    return out
+
+
 def build_cli_forest(snap, now=None):
     """Collapse shims and reattach keep-nodes: pure function on a process snap.
 
@@ -522,7 +602,10 @@ def build_cli_forest(snap, now=None):
     5. Labels: agent_dispatch task/lane; grok channel from nearest collapsed
        grok_ask + task/lane from agent_dispatch ancestor; claude tty or
        (exec-master) when headless/-p.
-    6. kind enum out: claude | grok | agent_dispatch. Counts exclude agent_dispatch.
+    6. kind enum out: claude | grok | agent_dispatch (+ virtual grok-sub
+       children grafted onto resumed grok nodes for in-process native
+       subagents; pid null, virtual true, excluded from claude/grok counts,
+       totalled in counts.grok_subagents). Counts exclude agent_dispatch.
     Every node carries both started and started_iso (same ISO string) + model.
     """
     now = now if now is not None else time.time()
@@ -531,6 +614,7 @@ def build_cli_forest(snap, now=None):
             "counts": {
                 "claude": {"interactive": 0, "headless": 0},
                 "grok": {"interactive": 0, "headless": 0},
+                "grok_subagents": 0,
             },
             "roots": [],
         }
@@ -571,6 +655,7 @@ def build_cli_forest(snap, now=None):
 
     # Build node dicts keyed by pid.
     nodes = {}
+    grok_sess = {}  # pid -> (resume sid, proc started_ts) for grok_cli nodes
     for pid in keep_pids:
         rec = snap[pid]
         ikind = kinds[pid]
@@ -615,7 +700,28 @@ def build_cli_forest(snap, now=None):
             label = channel
         elif ikind == "claude_cli":
             if mode == "headless" or meta.get("headless_flag"):
-                label = "(exec-master)"
+                # A dispatched Claude lane carries its identity on the
+                # agent_dispatch ancestor, exactly like a grok lane does.
+                # Recover it instead of guessing — otherwise every headless
+                # claude reads "(exec-master)" and dispatched Claude lanes
+                # lose their task/lane in the viewer.
+                td = nearest_kind_ancestor(pid, "agent_dispatch")
+                if td is not None:
+                    tm = _parse_wrapper_flags(
+                        snap[td].get("command") or "", "agent_dispatch"
+                    )
+                    task = task or tm.get("task")
+                    lane = lane or tm.get("lane")
+                    if not channel:
+                        channel = tm.get("channel")
+                    if not meta.get("cwd_arg"):
+                        meta["cwd_arg"] = tm.get("cwd_arg")
+                if lane:
+                    label = f"{task}/{lane}" if task else lane
+                else:
+                    # Headless claude with no dispatch ancestor: a real
+                    # exec-master (subagent) or an ad-hoc claude -p.
+                    label = "(exec-master)"
             else:
                 label = None  # viewer shows tty from node.tty
 
@@ -659,6 +765,10 @@ def build_cli_forest(snap, now=None):
             nodes[pid]["task"] = task
         if lane:
             nodes[pid]["lane"] = lane
+        if ikind == "grok_cli":
+            sid = _grok_resume_sid(cmd)
+            if sid:
+                grok_sess[pid] = (sid, started_ts)
 
     # Re-parent: attach each keep-node under first keep-ancestor (≤10 walk).
     roots = []
@@ -679,9 +789,21 @@ def build_cli_forest(snap, now=None):
         sort_tree(r)
     roots.sort(key=lambda n: n["pid"])
 
+    # Graft virtual grok-sub children AFTER sort_tree (their pid is None,
+    # which the pid sort key cannot order).
+    sub_total = 0
+    for pid, (sid, sts) in grok_sess.items():
+        node = nodes.get(pid)
+        if not node:
+            continue
+        subs = grok_active_subagents(sid, sts, now)
+        node["children"].extend(subs)
+        sub_total += len(subs)
+
     counts = {
         "claude": {"interactive": 0, "headless": 0},
         "grok": {"interactive": 0, "headless": 0},
+        "grok_subagents": sub_total,
     }
 
     def count_walk(node):
