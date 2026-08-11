@@ -14,6 +14,8 @@ event-driven waits.
 
 ![Dashboard with 123 lanes across 5 tasks](assets/dashboard-123-lanes.png)
 
+![Grid view showing a CLI session spawn tree with grok worker lanes](assets/grid-cli-sessions.png)
+
 ## How it works
 
 Workers never have to cooperate or heartbeat. The wrapper records facts at
