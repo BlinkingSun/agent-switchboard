@@ -14,7 +14,7 @@ event-driven waits.
 
 ![Dashboard with 123 lanes across 5 tasks](assets/dashboard-123-lanes.png)
 
-![Grid view: CLI session spawn tree with live Claude/Grok sessions, team-dispatch lanes, and virtual grok-sub rows](assets/grid-cli-sessions.png)
+![Grid view: busy multi-task board — CLI spawn tree plus remote-largefile and studio-pro lanes (Claude + Grok headless workers)](assets/grid-cli-sessions.png)
 
 ## How it works
 
