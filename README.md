@@ -12,7 +12,9 @@ Born from a common multi-agent failure mode: coordinators blocked in blind
 "running." Agent Switchboard replaces that pattern with derived liveness and
 event-driven waits.
 
-![Grid view showing a CLI session spawn tree with grok worker lanes](assets/grid-cli-sessions.png)
+![Dashboard with 123 lanes across 5 tasks](assets/dashboard-123-lanes.png)
+
+![Grid view: CLI session spawn tree with live Claude/Grok sessions, team-dispatch lanes, and virtual grok-sub rows](assets/grid-cli-sessions.png)
 
 ## How it works
 
