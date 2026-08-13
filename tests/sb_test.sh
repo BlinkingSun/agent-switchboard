@@ -7,7 +7,7 @@ TD="${TD_BIN:-$SCRIPT_DIR/../bin/agent-dispatch}"
 AGENT_SWITCHBOARD_ROOT="${AGENT_SWITCHBOARD_ROOT:-$(mktemp -d)}"
 export AGENT_SWITCHBOARD_ROOT
 rm -rf "$AGENT_SWITCHBOARD_ROOT"
-# ABSOLUTE SAFETY (B1): agent-dispatch now fires a best-effort ensure_daemon()
+# ABSOLUTE SAFETY: agent-dispatch now fires a best-effort ensure_daemon()
 # before every dispatch. Disable it for the WHOLE suite so none
 # of the $TD calls below ever probes/kickstarts/spawns against a real
 # daemon or the live :17920 job. Individual tests that need to exercise
@@ -98,10 +98,7 @@ EV=$(curl -s "http://127.0.0.1:17999/v1/wait?task=demo&cursor=$CUR&timeout=30" |
 DT=$(( $(date +%s) - T0 ))
 ck "$EV" "DONE" "T10c long-poll fired on lane completion (${DT}s)"
 # second serve on the SAME port: the first is a HEALTHY peer, so the
-# duplicate now exits 0 (healthy peer already serving — updated from
-# the old exit-2 semantics; the bound port is still the real mutex, only the
-# duplicate's own exit code changed so KeepAlive.SuccessfulExit=false can't
-# thrash on it; keep intentional exit-0 down).
+# duplicate now exits 0.
 $SB serve --port 17999 >/dev/null 2>&1
 ck "$?" "0" "T10d second serve on same port exits 0 (healthy peer already serving)"
 kill "$SRV" 2>/dev/null
@@ -186,7 +183,7 @@ ck "$?" "2" "T15b status rejects path-escape task name"
 
 # T17: first-sight publish — a brand-new lane must be observable via
 # /v1/wait immediately (old=None -> to=state), not only on its next real
-# state transition (first-sight publish on the wait bus).
+# state transition (re-dispatch visibility scenario A).
 $SB serve --port 17998 >/dev/null 2>&1 &
 SRVA=$!
 sleep 1.5
@@ -249,7 +246,7 @@ ck "$TAIL_IS" "70 71 72 73 74 75 76 77 78 79" "T19b /v1/events tail matches last
 
 # T20: re-dispatch never drops the lane from /v1/status mid-swap (poll
 # during the swap; the archive is a copy, the live slot path is atomically
-# replaced and never unlinked — no visibility gap).
+# replaced and never unlinked — re-dispatch visibility).
 $TD --task t20 --lane swap --exec /bin/bash -- -c 'true' >/dev/null 2>&1
 : > "$AGENT_SWITCHBOARD_ROOT/t20-poll.log"
 ( for i in $(seq 1 60); do
@@ -283,7 +280,7 @@ sleep 1.5   # >= one watcher tick: 8 first-sight publishes overflow the 5-slot r
 WAIT_JSON=$(curl -s "http://127.0.0.1:17997/v1/wait?task=t21&cursor=0&timeout=3")
 GAP=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("gap", False), d["cursor"]>0)' "$WAIT_JSON")
 ck "$GAP" "True True" "T21b stale cursor past the ring floor gets gap:true, cursor:now"
-# Every /v1/wait reply must carry boot_id matching /v1/health.
+# Every /v1/wait reply must carry boot_id matching health.
 WBOOT=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("boot_id",""))' "$WAIT_JSON")
 ck "$WBOOT" "$BOOT1" "T21d /v1/wait reply boot_id matches /v1/health"
 
@@ -317,7 +314,7 @@ wait 2>/dev/null
 # ---- CLI forest + /v1/cli ----
 # Ports 17985-17989 only (never 17920; b4 owns 17995-17999).
 
-# T23: synthetic-snap forest attach (unit fixtures) — no live ps.
+# T23: synthetic-snap forest attach (R2.1/R2.5 fixtures) — no live ps.
 python3 - "$SB" <<'EOF'
 import importlib.machinery, importlib.util, sys, json
 
@@ -559,7 +556,7 @@ def walk(nodes):
         yield n
         yield from walk(n.get("children") or [])
 for n in walk(d1.get("roots")):
-    if n.get("kind") not in ("claude","grok","agent_dispatch"):
+    if n.get("kind") not in ("claude","grok","agent_dispatch","grok-sub"):
         ok=False; msgs.append("bad kind "+str(n.get("kind")))
     if "started" not in n or "started_iso" not in n:
         ok=False; msgs.append("missing started pair on pid %s"%n.get("pid"))
@@ -626,7 +623,7 @@ wait 2>/dev/null
 
 # T26: an ACTIVE slot (RUNNING) in ANY task blocks idle-exit even with
 # AGENT_SWITCHBOARD_IDLE_TEST_FORCE=1 — the active-slot OR-term of the busy
-# predicate is never masked by the test force hook.
+# predicate is never masked by the test force hook (R2.5 busy predicate).
 # Same isolated root, plus a fresh task so no other test's slot is involved.
 AGENT_SWITCHBOARD_ROOT="$IDLE_ROOT" AGENT_SWITCHBOARD_IDLE_GRACE=2 AGENT_SWITCHBOARD_IDLE_TEST_FORCE=1 $SB serve --port 17976 >/tmp/sb-t26.log 2>&1 &
 SRV26=$!
@@ -703,9 +700,9 @@ ck "$BODY_OK" "True" "T29c 503 body reports wait_capacity"
 kill "$SRV29" 2>/dev/null
 wait 2>/dev/null
 
-# ---- Gap-closure tests (same-tick double publish, empty-snap
-# hardening). Ports 17965-17969 for anything new; reuse owned ranges where
-# the gap belongs to that lane's surface. ----
+# ---- Gap-closure tests (empty-snap hardening).
+# Ports 17965-17969 for anything new; reuse owned ranges where
+# the gap belongs to that surface. ----
 
 # T30: same-tick RUNNING->terminal->RUNNING double bus publish.
 # Drive watcher_loop with a controlled slot swap between ticks
@@ -806,7 +803,7 @@ if [ $? -eq 0 ]; then ck ok ok "T30 same-tick RUNNING->DONE->RUNNING double bus 
 
 # T31: live /v1/cli forest — suite dispatches a real headless "grok" worker
 # under agent-dispatch and asserts it appears HEADLESS under its own
-# agent_dispatch node under a live dispatched worker.
+# agent_dispatch node.
 # Uses a tiny compiled sleeper named `grok` (not a real LLM) so argv0
 # identity matches; never binds 17920.
 T31_BIN=$(mktemp -d)
@@ -865,7 +862,7 @@ fi
 rm -rf "$T31_BIN"
 
 # T32: fail-closed ps path — when ps_cli_snapshot returns None, busy_reasons
-# reports ps_unavailable (fail-closed when process enumeration fails). Driven via
+# reports ps_unavailable. Driven via
 # watcher_loop + monkeypatch (no live serve required for the reason string).
 python3 - "$SB" <<'EOF'
 import importlib.machinery, importlib.util, sys, tempfile, os, threading, time, shutil
@@ -900,8 +897,7 @@ EOF
 if [ $? -eq 0 ]; then ck ok ok "T32 ps_cli_snapshot=None -> busy_reasons=[ps_unavailable]"; else ck fail ok "T32 ps_cli_snapshot=None -> busy_reasons=[ps_unavailable]"; fi
 
 # T33: dead-socket EADDRINUSE — port held by a non-HTTP listener so health
-# probe fails; second serve must exit 1 with actionable path.
-# Port 17965 (new range).
+# probe fails; second serve must exit 1 with actionable path. Port 17965 (new range).
 python3 - "$SB" <<'EOF'
 import importlib.machinery, importlib.util, socket, subprocess, sys, time, os
 
@@ -973,6 +969,327 @@ if [ $? -eq 0 ]; then ck ok ok "T34 empty ps mapping -> busy_reasons=[ps_unavail
 # T25c already covers HARDENING (b) AGENT_SWITCHBOARD_IDLE_DISABLE=1; re-asserted
 # here as a checklist item only if someone deletes T25c — the
 # count still lives under T25c (no duplicate assertion).
+
+# ---- v1.3.0: model truth, sid graft, stall, advise, refuse ----
+
+python3 - "$SB" <<'EOF'
+import importlib.machinery, importlib.util, sys, os, json, tempfile, shutil, time
+
+loader = importlib.machinery.SourceFileLoader("sb", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+sb = importlib.util.module_from_spec(spec)
+loader.exec_module(sb)
+
+NOW = 1723252800.0
+LSTART = "Fri Aug  9 12:00:00 2024"
+
+def rec(pid, ppid, tty, command, lstart=LSTART):
+    return {"pid": pid, "ppid": ppid, "tty": tty, "lstart": lstart, "command": command}
+
+def find(nodes, pred):
+    for n in nodes:
+        if pred(n):
+            return n
+        hit = find(n.get("children") or [], pred)
+        if hit:
+            return hit
+    return None
+
+tmp = tempfile.mkdtemp(prefix="sb-t35-")
+sess = os.path.join(tmp, "sessions")
+cfg = os.path.join(tmp, "config.toml")
+os.makedirs(sess)
+sb.GROK_SESS_ROOT = sess
+sb.GROK_CONFIG_PATH = cfg
+sb.reset_model_defaults()
+
+# T35a: [models] default is read; no hardcoded 4.5
+open(cfg, "w").write('[ui]\nfork_secondary_model = "ignore-me"\n[models]\ndefault = "grok-4.6"\n')
+sb.reset_model_defaults()
+forest = sb.build_cli_forest({900: rec(900, 1, "ttys009", "/home/user/.grok/bin/grok")}, now=NOW)
+g = forest["roots"][0]
+assert g["model"] == "grok-4.6", g["model"]
+print("PASS_UNIT T35a [models].default -> grok-4.6")
+
+# T35b: missing config + no session => model is None, never grok-4.5
+os.remove(cfg)
+sb.reset_model_defaults()
+forest = sb.build_cli_forest({900: rec(900, 1, "ttys009", "/home/user/.grok/bin/grok")}, now=NOW)
+assert forest["roots"][0].get("model") is None, forest["roots"][0].get("model")
+print("PASS_UNIT T35b no config => model None (not grok-4.5)")
+
+# T35c: stray top-level default ignored; [models].default wins
+open(cfg, "w").write('default = "nope"\n[ui]\ndefault = "also-nope"\n[models]\ndefault = "grok-4.6"\n')
+sb.reset_model_defaults()
+forest = sb.build_cli_forest({900: rec(900, 1, "ttys009", "/home/user/.grok/bin/grok")}, now=NOW)
+assert forest["roots"][0]["model"] == "grok-4.6"
+print("PASS_UNIT T35c table-aware toml")
+
+# T35d: -m= parsed
+forest = sb.build_cli_forest({1: rec(1, 0, "??", "/home/user/.grok/bin/grok -m=grok-4.6 -p hi")}, now=NOW)
+assert find(forest["roots"], lambda n: n["pid"]==1)["model"] == "grok-4.6"
+print("PASS_UNIT T35d -m= parsed")
+
+# T35e: summary.json current_model_id beats config
+open(cfg, "w").write('[models]\ndefault = "grok-4.5"\n')
+sb.reset_model_defaults()
+cwd = "/tmp/lane-model"
+enc = __import__("urllib.parse").parse.quote(cwd, safe="")
+sid = "019ff000-0000-0000-0000-000000000001"
+sdir = os.path.join(sess, enc, sid)
+os.makedirs(sdir)
+json.dump({
+    "current_model_id": "grok-4.6",
+    "created_at": "2024-08-09T16:00:00Z",
+    "session_kind": "session",
+}, open(os.path.join(sdir, "summary.json"), "w"))
+cmd = "/home/user/.grok/bin/grok --cwd /tmp/lane-model"
+# lstart Fri Aug 9 12:00:00 2024 == 1723226400 local? _lstart_ts uses naive local.
+# Window is started_ts ± 180s. Use created_at matching parsed lstart.
+started = sb._lstart_ts(LSTART)
+created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))
+json.dump({
+    "current_model_id": "grok-4.6",
+    "created_at": created,
+}, open(os.path.join(sdir, "summary.json"), "w"))
+forest = sb.build_cli_forest({2: rec(2, 1, "??", "/home/user/.grok/bin/grok --cwd /tmp/lane-model")}, now=NOW)
+node = find(forest["roots"], lambda n: n["pid"]==2)
+assert node and node["model"] == "grok-4.6", node
+print("PASS_UNIT T35e summary.json current_model_id beats config")
+
+# T35f: --resume sid + virtual children; missing effective_model_id inherits parent
+sub = os.path.join(sess, enc, sid, "subagents", "sub-aaa")
+os.makedirs(sub)
+json.dump({
+    "subagent_id": "sub-aaa",
+    "parent_session_id": sid,
+    "status": "running",
+    "started_at": created,
+    "description": "child-a",
+    "effective_model_id": "grok-4.6",
+}, open(os.path.join(sub, "meta.json"), "w"))
+sub2 = os.path.join(sess, enc, sid, "subagents", "sub-bbb")
+os.makedirs(sub2)
+json.dump({
+    "subagent_id": "sub-bbb",
+    "parent_session_id": sid,
+    "status": "running",
+    "started_at": created,
+    "description": "child-b",
+}, open(os.path.join(sub2, "meta.json"), "w"))
+cmd = "/home/user/.grok/bin/grok --resume %s --cwd /tmp/lane-model" % sid
+forest = sb.build_cli_forest({3: rec(3, 1, "??", cmd)}, now=NOW)
+node = find(forest["roots"], lambda n: n["pid"]==3)
+subs = [c for c in node["children"] if c.get("kind")=="grok-sub"]
+assert len(subs) == 2, [c.get("label") for c in node["children"]]
+assert forest["counts"]["grok_subagents"] == 2
+assert all(s.get("virtual") for s in subs)
+assert all(s.get("model") == "grok-4.6" for s in subs), [s.get("model") for s in subs]
+assert all(s.get("children") == [] for s in subs)
+print("PASS_UNIT T35f sid graft + inherit model, never 4.5")
+
+# T35g: grok leader is not a forest node
+forest = sb.build_cli_forest({
+    10: rec(10, 1, "??", "/home/user/.grok/bin/grok leader"),
+    11: rec(11, 1, "ttys001", "claude"),
+}, now=NOW)
+assert all(n["kind"] != "grok" for n in forest["roots"])
+assert len(forest["roots"]) == 1 and forest["roots"][0]["kind"] == "claude"
+print("PASS_UNIT T35g grok leader excluded")
+
+# T35h: toml helper
+assert sb._toml_models_default('[models]\ndefault = "grok-4.6"\n') == "grok-4.6"
+assert sb._toml_models_default('[ui]\nfork_secondary_model = "x"\n') is None
+print("PASS_UNIT T35h _toml_models_default")
+
+# T35i: reattach agent_dispatch via launcher_cli_pid
+sb.ROOT = tmp
+os.makedirs(os.path.join(tmp, "demo"), exist_ok=True)
+json.dump({
+    "task": "demo", "lane": "bee", "status": "running",
+    "launcher_cli_pid": 100, "launcher_cli_kind": "claude",
+}, open(os.path.join(tmp, "demo", "slot-bee.json"), "w"))
+snap = {
+    100: rec(100, 1, "ttys001", "claude"),
+    300: rec(300, 1, "??",
+             "/usr/bin/Python /usr/local/bin/agent-dispatch --task demo --lane bee -- grok-ask -w"),
+    500: rec(500, 300, "??", "/home/user/.grok/bin/grok -p hi"),
+}
+forest = sb.build_cli_forest(snap, now=NOW)
+assert len(forest["roots"]) == 1 and forest["roots"][0]["kind"] == "claude"
+td = forest["roots"][0]["children"]
+assert len(td) == 1 and td[0]["kind"] == "agent_dispatch"
+print("PASS_UNIT T35i launcher_cli_pid reattaches orphan agent_dispatch")
+
+# T35j: stale launcher pid (not in snap) stays a root
+json.dump({
+    "task": "demo", "lane": "bee", "status": "running",
+    "launcher_cli_pid": 99999, "launcher_cli_kind": "claude",
+}, open(os.path.join(tmp, "demo", "slot-bee.json"), "w"))
+forest = sb.build_cli_forest(snap, now=NOW)
+kinds = [n["kind"] for n in forest["roots"]]
+assert "agent_dispatch" in kinds and "claude" in kinds
+print("PASS_UNIT T35j stale launcher stays root")
+
+# T35k: long-lived TUI — created_at does not match lstart; last_active does
+cwd2 = "/tmp/lane-hot"
+enc2 = __import__("urllib.parse").parse.quote(cwd2, safe="")
+sid_hot = "019ffhot-0000-0000-0000-000000000099"
+sdir2 = os.path.join(sess, enc2, sid_hot)
+os.makedirs(sdir2)
+now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+json.dump({
+    "current_model_id": "grok-4.6",
+    "created_at": "2020-01-01T00:00:00Z",
+    "last_active_at": now_iso,
+}, open(os.path.join(sdir2, "summary.json"), "w"))
+# a stale sibling in the same cwd must not win
+sid_old = "019ffold-0000-0000-0000-000000000088"
+os.makedirs(os.path.join(sess, enc2, sid_old))
+json.dump({
+    "current_model_id": "grok-4.5",
+    "created_at": "2020-01-01T00:00:00Z",
+    "last_active_at": "2020-01-02T00:00:00Z",
+}, open(os.path.join(sess, enc2, sid_old, "summary.json"), "w"))
+sb.reset_model_defaults()
+forest = sb.build_cli_forest(
+    {8: rec(8, 1, "ttys001", "/home/user/.grok/bin/grok --cwd /tmp/lane-hot")},
+    now=time.time(),
+)
+node = find(forest["roots"], lambda n: n["pid"] == 8)
+assert node and node["model"] == "grok-4.6", node
+print("PASS_UNIT T35k last_active sid match for long-lived TUI")
+
+shutil.rmtree(tmp, ignore_errors=True)
+print("ALL_T35_OK")
+EOF
+if [ $? -eq 0 ]; then
+  ck ok ok "T35a [models].default parsed"
+  ck ok ok "T35b missing config => model None (not grok-4.5)"
+  ck ok ok "T35c table-aware toml"
+  ck ok ok "T35d -m= parsed"
+  ck ok ok "T35e summary.json beats config"
+  ck ok ok "T35f virtual children + inherit model"
+  ck ok ok "T35g grok leader excluded"
+  ck ok ok "T35h toml helper"
+  ck ok ok "T35i launcher reattach"
+  ck ok ok "T35j stale launcher stays root"
+  ck ok ok "T35k last_active sid match for long-lived TUI"
+else
+  ck fail ok "T35 v1.3.0 unit block"
+fi
+
+# T36: refuse event is written
+$TD --task t36 --lane cap1 --exec /bin/bash -- -c 'sleep 8' >/dev/null 2>&1 &
+sleep 0.4
+$TD --task t36 --lane cap2 --max 1 --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+ck "$?" "2" "T36a capacity refuse exit 2"
+REF=$(python3 -c '
+import json,os
+p=os.environ["AGENT_SWITCHBOARD_ROOT"]+"/t36/events.jsonl"
+hits=0
+for line in open(p):
+    e=json.loads(line)
+    if e.get("event")=="refuse" and e.get("reason")=="capacity":
+        hits+=1
+print(hits)
+')
+ck "$REF" "1" "T36b refuse event in events.jsonl"
+wait 2>/dev/null
+
+# T37: stall + wait --json + advise
+# Keep bash in the process (a lone `sleep 20` is exec'd; prog_base
+# identity would then treat the worker as gone and derive RUNNING).
+$TD --task t37 --lane hang --exec /bin/bash -- -c 'sleep 20; exit 0' >/dev/null 2>&1 &
+sleep 2.2
+ST=$($SB status --task t37 --stall-after 1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["slots"][0]["state"])')
+ck "$ST" "STALLED" "T37a headless silence past stall budget -> STALLED"
+ADV=$($SB wait --task t37 --lane hang --stall-after 1 --timeout 2 --interval 0.4 --json)
+ADV_RC=$?
+ck "$ADV_RC" "0" "T37b wait returns 0 on STALLED"
+NEXT=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("inspect_stalled:hang" in d.get("next",[]), d.get("severity"))' "$ADV")
+ck "$NEXT" "True inspect" "T37c advise next=inspect_stalled"
+[ -f "$AGENT_SWITCHBOARD_ROOT/t37/advise.json" ] && ck ok ok "T37d advise.json written" || ck missing present "T37d advise.json written"
+# already-ORPHAN wait still times out (T16 regression via --json)
+# kill hang
+if [ -f "$AGENT_SWITCHBOARD_ROOT/t37/slot-hang.json" ]; then
+  kill -9 $(python3 -c "import json;print(json.load(open('$AGENT_SWITCHBOARD_ROOT/t37/slot-hang.json')).get('pid',0))") 2>/dev/null
+  kill -9 $(python3 -c "import json;print(json.load(open('$AGENT_SWITCHBOARD_ROOT/t37/slot-hang.json')).get('wrapper_pid',0))") 2>/dev/null
+fi
+wait 2>/dev/null
+
+# T38: WAITING_INPUT from grok events.jsonl
+python3 - "$AGENT_SWITCHBOARD_ROOT" <<'EOF'
+import json,os,sys,time
+root=sys.argv[1]
+# fake a running slot pointing at a grok session with permission_prompt
+cwd="/tmp/sb-t38-cwd"
+os.makedirs(cwd, exist_ok=True)
+sess_root=os.environ.get("AGENT_SWITCHBOARD_GROK_SESSIONS")  # may be unset; write under default? 
+# Put session next to slot via session_id + cwd under the test's grok root.
+# derive uses GROK_SESS_ROOT from the binary (real ~/.grok unless env).
+# Use a unique cwd + session_id; do not write into the real session tree.
+# Instead craft slot and invoke derive via imported sb with patched GROK_SESS_ROOT
+# — done in the next python - "$SB" block.
+open(os.path.join(root,"t38-marker"),"w").write("ok")
+EOF
+
+python3 - "$SB" "$AGENT_SWITCHBOARD_ROOT" <<'EOF'
+import importlib.machinery, importlib.util, sys, os, json, time, tempfile, shutil
+loader = importlib.machinery.SourceFileLoader("sb", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+sb = importlib.util.module_from_spec(spec)
+loader.exec_module(sb)
+tmp = tempfile.mkdtemp(prefix="sb-t38-")
+sb.GROK_SESS_ROOT = os.path.join(tmp, "gs")
+sb.ROOT = tmp
+cwd = "/tmp/sb-t38-lane"
+enc = __import__("urllib.parse").parse.quote(cwd, safe="")
+sid = "sid-t38"
+sdir = os.path.join(sb.GROK_SESS_ROOT, enc, sid)
+os.makedirs(sdir)
+with open(os.path.join(sdir, "events.jsonl"), "w") as f:
+    f.write(json.dumps({"ts": "2026-01-01T00:00:00Z", "type": "phase_changed", "phase": "permission_prompt"})+"\n")
+slot = {
+    "task": "t38", "lane": "ask", "status": "running",
+    "pid": os.getpid(), "wrapper_pid": os.getpid(),
+    "prog": "python3", "prog_base": "python3",
+    "cwd": cwd, "session_id": sid, "started": time.time(),
+}
+# wrapper_pid is this python — proc_alive will see it; prog_base python3 is in cmdline.
+state, _ = sb.derive(slot, quiet_after=300)
+print("STATE", state)
+ok = state == "WAITING_INPUT"
+# stalled: old events, no permission
+with open(os.path.join(sdir, "events.jsonl"), "w") as f:
+    f.write(json.dumps({"ts": "2020-01-01T00:00:00Z", "type": "turn_started"})+"\n")
+os.utime(os.path.join(sdir, "events.jsonl"), (time.time()-400, time.time()-400))
+state2, _ = sb.derive(slot, quiet_after=300, stall_after=1)
+print("STATE2", state2)
+ok = ok and state2 == "STALLED"
+shutil.rmtree(tmp, ignore_errors=True)
+sys.exit(0 if ok else 1)
+EOF
+if [ $? -eq 0 ]; then
+  ck ok ok "T38a permission_prompt -> WAITING_INPUT"
+  ck ok ok "T38b aged events -> STALLED"
+else
+  ck fail ok "T38 heartbeat states"
+fi
+
+# T39: exec-master stop hook fail-open + block when exec-master + live slot
+export SCRIPT_DIR
+python3 - <<'EOF'
+import json,os,subprocess,sys,tempfile,time
+hook=os.path.join(os.environ["SCRIPT_DIR"], "../bin/exec-master-stop-hook.py")
+# allow: no needles, no slots needed
+p=subprocess.run([sys.executable, hook], input=json.dumps({"cwd":"/tmp","prompt":"hello"}),
+                 text=True, capture_output=True)
+ok = p.returncode==0 and not p.stdout.strip()
+print("ALLOW", ok, p.stdout[:80])
+sys.exit(0 if ok else 1)
+EOF
+if [ $? -eq 0 ]; then ck ok ok "T39a stop hook allows non-exec-master"; else ck fail ok "T39a stop hook allows non-exec-master"; fi
 
 echo; echo "RESULT: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

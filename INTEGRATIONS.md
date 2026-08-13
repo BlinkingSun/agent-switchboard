@@ -11,7 +11,7 @@ subagent, a Grok Build run, a Codex exec, a plain script.
 |---|---|---|
 | dispatch | `agent-dispatch --task T --lane L -- <worker cmd...>` | registers a slot, runs the worker, records its exit code |
 | observe | `switchboard status [--task T] [--json]` | derived state of every lane, instantly |
-| wait | `switchboard wait --task T [--lane L] [--watch-file F] --timeout 570` | blocks until a lane finishes/dies or a file changes (exit 0) or timeout (exit 3) |
+| wait | `switchboard wait --task T [--lane L] [--watch-file F] --timeout 570 [--json]` | blocks until a lane finishes/dies/stalls/needs input, a refuse is logged, or a file changes (exit 0) or timeout (exit 3). `--json` prints the advise payload. |
 
 Plus an HTTP API for tools/UIs on `127.0.0.1:17920` (`switchboard serve`):
 
@@ -21,26 +21,36 @@ Plus an HTTP API for tools/UIs on `127.0.0.1:17920` (`switchboard serve`):
 | `GET /v1/tasks` | task list |
 | `GET /v1/status[?task=T]` | lanes with derived `state`; terminal rows include `ended_s` |
 | `GET /v1/events?task=T` | observation log tail |
-| `GET /v1/cli` | spawn-tree forest (`kind`: `claude` \| `grok` \| `agent_dispatch`, plus pid-less virtual `grok-sub` children on resumed grok nodes; optional `model`) |
+| `GET /v1/cli` | spawn-tree forest (`kind`: `claude` \| `grok` \| `agent_dispatch`, plus pid-less virtual `grok-sub` children on grok nodes; optional `model`) |
+| `GET /v1/advise?task=T` | current advise payload (closed `next` verbs) |
 | `GET /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55]` | long-poll; `gap:true` if cursor behind ring; HTTP 503 + `Retry-After` when wait capacity is full |
 
 Everything is **observe-only**: the switchboard never kills, restarts, or
 re-dispatches — your orchestrator reads the alerts and decides. (The viewer
 **START DAEMON** button and CLI `--ensure` only kickstart the launchd job for
-the daemon itself.)
+the daemon itself.) `state/<task>/advise.json` is rewritten on every wait
+return and on lane transitions. A sample Claude `SubagentStop` hook at
+`bin/exec-master-stop-hook.py` can block an execution-master from ending its
+turn while lanes are still ACTIVE.
 
 ## The pattern for ANY orchestrating agent
 
 1. Wrap every spawned worker in `agent-dispatch` instead of launching it bare.
    Output redirection, arguments, and the exit code pass straight through.
-2. Replace every `sleep`-and-check loop with ONE `switchboard wait` call —
-   it returns the moment something actually happens.
-3. On wake, read `switchboard status --json` and act on transitions:
-   `DONE` → review the lane's report now (don't wait for the others).
-   `FAILED` → read its log; rework or re-dispatch (your call).
-   `DIED` → the process was killed without finishing (crash, OOM, harness
-   kill). Investigate, then usually re-dispatch on the same channel/session.
-   `QUIET` → warning only: alive but silent (long local builds do this).
+2. Replace every `sleep`-and-check loop with ONE `switchboard wait --json`
+   call — it returns the moment something actually happens and writes
+   `state/<task>/advise.json` with a closed `next` verb list. Read that
+   payload (or `switchboard advise --task T`) on every wake. Timeout (exit
+   3) is a rescan, not an abort.
+3. On wake, execute `advise.next` then wait again:
+   `review_done:<lane>` → read the lane report now (don't wait for the others).
+   `investigate_died:<lane>` → process was killed without finishing.
+   `inspect_stalled:<lane>` → alive but silent past the stall budget; inspect,
+   do not treat as dead and do not auto-re-dispatch.
+   `waiting_input:<lane>` → permission/input prompt.
+   `investigate_orphan:<lane>` → wrapper died; worker may still be progressing.
+   `retry_refuse:<lane>` → capacity or same-lane refuse (exit 2); try later.
+   `QUIET` is not a wake (long compiles). `--alert-quiet` is human-only.
 
 Optional: `switchboard status --ensure` / `wait --ensure` (or
 `AGENT_SWITCHBOARD_ENSURE=1`) best-effort starts the daemon before observing
@@ -67,9 +77,11 @@ dispatches, so lane state is visible in-transcript.
 A subagent that ends its turn is DONE — it is **not** re-woken by
 background-task notifications the way the primary session is. A supervising
 subagent (e.g. an execution-master) must therefore stay in its loop and
-**block** on `switchboard wait` between reviews, and only return once every
-watched lane is terminal. Ending its turn with lanes still RUNNING silently
-abandons supervision.
+**block** on `switchboard wait --json` between reviews, and only return once
+every watched lane is terminal. Ending its turn with lanes still RUNNING
+silently abandons supervision. Optionally register `bin/exec-master-stop-hook.py`
+as a Claude `SubagentStop` hook (set `AGENT_SWITCHBOARD_BIN` if `switchboard`
+is not next to the hook or on `PATH`).
 
 ### Grok Build
 Headless Grok runs (`grok -p ... --output-format json`) are just processes:
@@ -125,6 +137,10 @@ viewer's CLI SESSIONS panel.
 - Lifecycle: idle self-exit after `AGENT_SWITCHBOARD_IDLE_GRACE` when no CLI,
   viewer, or active slot is present; `/v1/wait` returns 503 past
   `AGENT_SWITCHBOARD_WAIT_CAP` concurrent waiters.
+- Stall: headless silence past `AGENT_SWITCHBOARD_STALL_AFTER` (default 90s)
+  becomes `STALLED` and wakes `wait`. Already-`STALLED` / `WAITING_INPUT` at
+  wait start returns immediately. `QUIET` still does not wake unless
+  `--alert-quiet`.
 - Windows: fully supported; liveness uses `OpenProcess`, never `os.kill`
   (which would terminate the probed process on Windows).
 - Subscription/billing: pick your worker deliberately — e.g. for grok,

@@ -14,7 +14,7 @@ event-driven waits.
 
 ![Dashboard with 123 lanes across 5 tasks](assets/dashboard-123-lanes.png)
 
-![Grid view: busy multi-task board — CLI spawn tree plus remote-largefile and studio-pro lanes (Claude + Grok headless workers)](assets/grid-cli-sessions.png)
+![Grid view: busy multi-task board — CLI spawn tree plus concurrent task lanes (Claude + Grok headless workers)](assets/grid-cli-sessions.png)
 
 ## How it works
 
@@ -25,7 +25,10 @@ from what the OS already knows:
 | State | Meaning |
 |---|---|
 | `RUNNING` | worker alive, activity fresh (or unknown) |
+| `WORKING_TOOL` | headless/tool-loop still making progress (open tool + log growth) |
+| `WAITING_INPUT` | alive, last event is a permission/input prompt |
 | `QUIET` | worker alive but silent past a threshold — warning, not failure |
+| `STALLED` | headless silence past the stall budget — inspect, do not treat as dead |
 | `ORPHAN` | worker alive but its wrapper died; exit will never be auto-recorded |
 | `DONE` / `FAILED` | wrapper recorded exit 0 / non-zero |
 | `DIED` | worker **and** wrapper gone without finalizing — the silent kill |
@@ -43,17 +46,22 @@ agent-dispatch --task mytask --lane worker-1 --exec <prog> -- <args...> > lane1.
 # observe — derived state of every lane, instantly
 switchboard status [--task mytask] [--json]
 
-# wait — block until a lane finishes/dies or a file changes (exit 0), or timeout (exit 3)
-switchboard wait --task mytask [--lane worker-1] [--watch-file PHASE.txt] --timeout 570
+# wait — block until a lane finishes/dies/stalls/needs input, a refuse is
+# logged, or a file changes (exit 0), or timeout (exit 3). --json prints the
+# advise payload and always writes state/<task>/advise.json
+switchboard wait --task mytask [--lane worker-1] [--watch-file PHASE.txt] --timeout 570 --json
+switchboard advise --task mytask
 ```
 
 `agent-dispatch` also enforces a per-task capacity cap (refusal = exit 2,
-nothing starts) and refuses to double-dispatch a lane whose worker is still
-alive. Dispatch decisions are lock-serialized, finalization is
-ownership-checked (`run_id`), and pid liveness is identity-checked against
-the process table so a recycled pid can't fake a live lane. Re-dispatch of
-an inactive lane archives the prior slot with a `run_id` suffix and keeps
-the live path populated until the new slot is written (no visibility gap).
+nothing starts, a `refuse` event is logged) and refuses to double-dispatch a
+lane whose worker is still alive. Dispatch decisions are lock-serialized,
+finalization is ownership-checked (`run_id`), and pid liveness is
+identity-checked against the process table so a recycled pid can't fake a
+live lane. Re-dispatch of an inactive lane archives the prior slot with a
+`run_id` suffix and keeps the live path populated until the new slot is
+written (no visibility gap). A backgrounded wrapper records `launcher_cli_pid`
+while the parent CLI is still alive so the forest can reattach it.
 
 ## Background service + HTTP API
 
@@ -67,7 +75,8 @@ switchboard serve            # 127.0.0.1:17920, read-only
 | `GET /v1/tasks` | known task names |
 | `GET /v1/status[?task=T]` | derived lanes (includes `ended_s` for terminal rows) |
 | `GET /v1/events?task=T` | recent observation log (tail-read; rotates under size cap) |
-| `GET /v1/cli` | spawn-tree forest of live CLI sessions (claude / grok / agent_dispatch), including **virtual `grok-sub` rows** for a resumed grok session's active in-process native subagents (pid-less, `virtual: true`, counted in `counts.grok_subagents`) |
+| `GET /v1/cli` | spawn-tree forest of live CLI sessions (claude / grok / agent_dispatch), including **virtual `grok-sub` rows** for a grok session's active in-process native subagents (pid-less, `virtual: true`, counted in `counts.grok_subagents`). Model is argv `-m` → session `current_model_id` → `[models].default` → `null` — never a hardcoded version. |
+| `GET /v1/advise?task=T` | current advise payload (closed `next` verb list) |
 | `GET /v1/wait?cursor=N[&task=T][&timeout=55]` | long-poll; returns within ~1s of a transition; `gap:true` if the cursor fell behind the ring |
 
 CLI and status also support best-effort daemon wake-up via `--ensure` or
@@ -129,6 +138,14 @@ launch from a shell.
 | `AGENT_SWITCHBOARD_ENSURE` | *(unset)* | `1` = best-effort ensure_daemon on CLI |
 | `AGENT_SWITCHBOARD_ENSURE_DISABLE` | *(unset)* | `1` = no-op ensure (tests) |
 | `AGENT_SWITCHBOARD_ENSURE_NO_KICKSTART` | *(unset)* | `1` = probe only, no launchctl |
+| `AGENT_SWITCHBOARD_STALL_AFTER` | `90` | headless silence budget (seconds) before `STALLED` |
+| `AGENT_SWITCHBOARD_STALL_INTERACTIVE` | `900` | reserved interactive stall budget |
+| `AGENT_SWITCHBOARD_GROK_SESSIONS` | `~/.grok/sessions` | grok session-dir root |
+| `AGENT_SWITCHBOARD_GROK_CONFIG` | `~/.grok/config.toml` | grok `[models].default` source |
+| `AGENT_SWITCHBOARD_CLAUDE_SETTINGS` | `~/.claude/settings.json` | claude default model |
+| `AGENT_SWITCHBOARD_CLAUDE_PROJECTS` | `~/.claude/projects` | claude transcript root |
+| `AGENT_SWITCHBOARD_BIN` | *(unset)* | switchboard binary for `exec-master-stop-hook.py` |
+| `AGENT_SWITCHBOARD_EXEC_MASTER` | *(unset)* | `1` = treat hook caller as an exec-master |
 
 Python 3.9+ stdlib only — no dependencies. macOS / Linux / Windows.
 (Windows liveness uses `OpenProcess` via ctypes; `os.kill(pid, 0)` there
@@ -137,14 +154,16 @@ would *terminate* the probed process — don't roll your own with it.)
 ## Tests
 
 ```bash
-bash tests/sb_test.sh    # ~70 checks in an isolated temp state root
+bash tests/sb_test.sh    # 90 checks in an isolated temp state root
 ```
 
 Covers happy paths and the dangerous ones: silent kills, the finalize-window
 DIED false alarm, stale-wrapper clobbering, parallel capacity races, corrupt
 slots, orphan lanes, path-escape names, first-sight publish, flocked events
 rotation, re-dispatch visibility, boot_id/gap, cold-archive, idle self-exit,
-SIGTERM drain, wait capacity 503, and `/v1/cli` forest unit + live checks.
+SIGTERM drain, wait capacity 503, `/v1/cli` forest unit + live checks, model
+truth (no hardcoded fallback), launcher reattach, stall/advise/refuse, and
+the sample `SubagentStop` hook.
 
 ## License
 

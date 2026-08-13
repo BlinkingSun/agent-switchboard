@@ -46,7 +46,11 @@
    * pids churn / reuse; started anchors the process identity.
    */
   function cliNodeCollapseKey(node) {
-    if (!node || node.pid == null) return "";
+    if (!node) return "";
+    if (node.pid == null) {
+      if (node.subagent_id) return "sub:" + String(node.subagent_id);
+      return "";
+    }
     var started =
       node.started != null && node.started !== ""
         ? String(node.started)
@@ -75,7 +79,7 @@
   }
 
   /**
-   * Display label for node.model (family truncation for known prefixes).
+   * display label for node.model.
    * Truncate long ids to family name: claude-fable-5 -> fable.
    * Short names (opus, sonnet, grok-4.5, default) pass through.
    * @returns {string|null} null when nothing to show
@@ -170,6 +174,7 @@
     check("model opus passthrough", formatModelLabel("opus") === "opus");
     check("model sonnet passthrough", formatModelLabel("sonnet") === "sonnet");
     check("model grok-4.5 passthrough", formatModelLabel("grok-4.5") === "grok-4.5");
+    check("model grok-4.6 passthrough", formatModelLabel("grok-4.6") === "grok-4.6");
     check("model default passthrough", formatModelLabel("default") === "default");
 
     var failed = [];
@@ -223,12 +228,12 @@
    * ════════════════════════════════════════════════════ */
 
   var BASE = "http://127.0.0.1:17920";
-  var STATES = ["RUNNING", "QUIET", "ORPHAN", "DONE", "FAILED", "DIED"];
-  var TILE_STATES = ["RUNNING", "QUIET", "DIED", "FAILED", "DONE"];
+  var STATES = ["RUNNING", "WORKING_TOOL", "WAITING_INPUT", "QUIET", "STALLED", "ORPHAN", "DONE", "FAILED", "DIED"];
+  var TILE_STATES = ["RUNNING", "WORKING_TOOL", "WAITING_INPUT", "QUIET", "STALLED", "DIED", "FAILED", "DONE"];
   var MAX_EVENTS = 40;
   var STATUS_INTERVAL_MS = 30000;
   var RETENTION_S = 1800; // finished lanes drop off the board after 30 min
-  var LIVE_STATES = { RUNNING: 1, QUIET: 1, ORPHAN: 1, CORRUPT: 1 };
+  var LIVE_STATES = { RUNNING: 1, WORKING_TOOL: 1, WAITING_INPUT: 1, QUIET: 1, STALLED: 1, ORPHAN: 1, CORRUPT: 1 };
   var BACKOFF_MIN = 2000;
   var BACKOFF_MAX = 10000;
 
@@ -392,7 +397,7 @@
   /* ── counting / sorting ───────────────────────────── */
 
   function emptyCounts() {
-    return { RUNNING: 0, QUIET: 0, ORPHAN: 0, DONE: 0, FAILED: 0, DIED: 0 };
+    return { RUNNING: 0, WORKING_TOOL: 0, WAITING_INPUT: 0, QUIET: 0, STALLED: 0, ORPHAN: 0, DONE: 0, FAILED: 0, DIED: 0 };
   }
 
   function countSlots(slots) {
@@ -460,7 +465,7 @@
     return laneCount > 15 ? "GRID" : "PANEL";
   }
 
-  /* ── PLAN REV 2 /v1/cli fixture (matches cli-tree-v2 mockup) ── */
+  /* ── /v1/cli mock fixture ── */
 
   function buildMockCliForest() {
     // Forest shape: {counts:{claude,grok}, roots:[node…]}
@@ -725,7 +730,7 @@
     return kind || "?";
   }
 
-  /** Muted model chip markup (empty if no model). */
+  /** muted model chip markup (empty if no model). */
   function renderModelChip(model) {
     var label = formatModelLabel(model);
     if (!label) return "";
@@ -790,7 +795,7 @@
         html +=
           '<span class="meta">' + escapeHtml(String(node.label)) + "</span>";
       }
-      // model chip on every row when present (bridge has no mode badge)
+      //  model chip on every row when present (bridge has no mode badge)
       html += renderModelChip(node.model);
     } else {
       html +=
@@ -799,7 +804,7 @@
         '">' +
         (mode === "interactive" ? "INTERACTIVE" : "HEADLESS") +
         "</span>";
-      // muted model chip immediately after INTERACTIVE/HEADLESS
+      //  muted model chip immediately after INTERACTIVE/HEADLESS
       html += renderModelChip(node.model);
       if (node.mode === "interactive" && node.tty) {
         html +=
@@ -959,7 +964,7 @@
 
   function renderTotals() {
     var c = totalCounts(state.status || []);
-    var order = ["RUNNING", "QUIET", "DIED", "FAILED", "DONE", "ORPHAN"];
+    var order = ["RUNNING", "WORKING_TOOL", "WAITING_INPUT", "QUIET", "STALLED", "DIED", "FAILED", "DONE", "ORPHAN"];
     var html = "";
     for (var i = 0; i < order.length; i++) {
       var s = order[i];
@@ -1450,7 +1455,7 @@
   /* ── live loop (ordering guard + cli piggyback) ───── */
 
   /**
-   * Single status+cli refresh with monotonic apply seq (drop stale replies).
+   * Single status+cli refresh with monotonic apply seq.
    * /v1/cli piggybacks this path — no extra long-poll (T4).
    */
   async function refreshStatus() {
@@ -1637,7 +1642,7 @@
       state.status = [];
       setOffline(true);
     }
-    // Always apply CLI fixture for UI work when ?mock=1 or daemon has no /v1/cli
+    // Always apply CLI fixture for UI work while B2 is not deployed
     applyCli(buildMockCliForest());
     if (!state.offline) setOffline(false);
     renderAll();

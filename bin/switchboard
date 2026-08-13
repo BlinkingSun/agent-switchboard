@@ -16,31 +16,40 @@ State layout ($AGENT_SWITCHBOARD_ROOT, default ~/.agent-switchboard/state):
   <task>/history/           archived slots from finished/replaced lanes
 
 Derived states:
-  RUNNING  worker pid alive with recent/unknown activity — ALSO shown briefly
-           when the worker just exited and its wrapper is still finalizing
-  QUIET    worker pid alive but no session activity for --quiet-after secs
-  ORPHAN   worker alive but its wrapper died: exit will never be auto-
-           recorded. Alert-worthy, but the worker may still be progressing —
-           do NOT treat as dead.
-  DONE     wrapper finalized, exit code 0
-  FAILED   wrapper finalized, exit code != 0
-  DIED     worker AND wrapper both gone without finalization (silent kill)
-  CORRUPT  slot file unreadable — surfaced, never silently dropped
+  RUNNING        worker pid alive with recent/unknown activity — ALSO shown
+                 briefly when the worker just exited and its wrapper is still
+                 finalizing
+  WORKING_TOOL   headless/tool-loop still making progress (open tool + log
+                 growth) even if session jsonl is idle
+  WAITING_INPUT  alive, last event is a permission/input prompt
+  QUIET          worker pid alive but no session activity for --quiet-after
+  STALLED        headless (or long-silent) worker with no heartbeat past the
+                 stall budget — inspect, do not treat as dead
+  ORPHAN         worker alive but its wrapper died: exit will never be auto-
+                 recorded. Alert-worthy, but the worker may still be
+                 progressing — do NOT treat as dead.
+  DONE           wrapper finalized, exit code 0
+  FAILED         wrapper finalized, exit code != 0
+  DIED           worker AND wrapper both gone without finalization
+  CORRUPT        slot file unreadable — surfaced, never silently dropped
 
 Commands:
   switchboard status [--task T] [--json] [--quiet-after S]
   switchboard wait   --task T [--timeout S] [--interval S] [--lane L ...]
                      [--watch-file P ...] [--alert-quiet] [--quiet-after S]
+                     [--json] [--stay] [--advise PATH]
+  switchboard advise --task T
   switchboard events --task T [-n N]
   switchboard serve  [--host 127.0.0.1] [--port 17920]
 
 wait exit codes: 0 = event occurred (or all watched lanes already terminal),
 3 = timeout with no event. wait returns on transitions to DONE/FAILED/DIED/
-ORPHAN/CORRUPT, on --watch-file changes, and (with --alert-quiet) on QUIET.
+ORPHAN/CORRUPT/STALLED/WAITING_INPUT, on refuse events, on --watch-file
+changes, and (with --alert-quiet) on QUIET. QUIET alone is not a wake.
 
 serve HTTP API (read-only): GET /v1/health /v1/tasks /v1/status /v1/events
-/v1/cli (spawn-tree forest of claude/grok/agent_dispatch nodes) and long-poll
-/v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55].
+/v1/cli (spawn-tree forest of claude/grok/agent_dispatch nodes), GET /v1/advise?task=T,
+and long-poll /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55].
 
 Status rows carry ended_s for terminal lanes (seconds since finish; source:
 slot 'ended', else last terminal transition in events.jsonl, else slot file
@@ -70,15 +79,30 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 ROOT = os.environ.get(
     "AGENT_SWITCHBOARD_ROOT",
     os.path.expanduser("~/.agent-switchboard/state"),
 )
-GROK_SESS_ROOT = os.path.expanduser("~/.grok/sessions")
+GROK_SESS_ROOT = os.environ.get(
+    "AGENT_SWITCHBOARD_GROK_SESSIONS", os.path.expanduser("~/.grok/sessions")
+)
+GROK_CONFIG_PATH = os.environ.get(
+    "AGENT_SWITCHBOARD_GROK_CONFIG", os.path.expanduser("~/.grok/config.toml")
+)
+CLAUDE_SETTINGS_PATH = os.environ.get(
+    "AGENT_SWITCHBOARD_CLAUDE_SETTINGS", os.path.expanduser("~/.claude/settings.json")
+)
+CLAUDE_PROJECTS_ROOT = os.environ.get(
+    "AGENT_SWITCHBOARD_CLAUDE_PROJECTS", os.path.expanduser("~/.claude/projects")
+)
 TERMINAL = {"DONE", "FAILED", "DIED", "ORPHAN"}
-ALERTING = TERMINAL | {"CORRUPT"}
+# Default wait wake set. QUIET is opt-in (--alert-quiet). STALLED and
+# WAITING_INPUT are action/inspect wakes so a master cannot sit on silence.
+ALERTING = TERMINAL | {"CORRUPT", "STALLED", "WAITING_INPUT"}
 DEFAULT_QUIET_AFTER = 300
+DEFAULT_STALL_AFTER = float(os.environ.get("AGENT_SWITCHBOARD_STALL_AFTER", 90))
+DEFAULT_STALL_INTERACTIVE = float(os.environ.get("AGENT_SWITCHBOARD_STALL_INTERACTIVE", 900))
 DEFAULT_PORT = 17920
 EVENTS_MAX_BYTES = int(os.environ.get("AGENT_SWITCHBOARD_EVENTS_MAX_BYTES", 1_000_000))
 COLD_AFTER = float(os.environ.get("AGENT_SWITCHBOARD_COLD_AFTER", 86400))
@@ -337,6 +361,13 @@ def kind_from_command(command):
     ):
         return "claude_cli"
     if b0 in ("grok", "agent"):
+        # Cache daemons, not agent sessions — never emit as forest nodes.
+        if len(toks) >= 2 and toks[1] == "leader":
+            return None
+        if b0 == "agent" and len(toks) >= 2 and toks[1] == "serve":
+            return None
+        if len(toks) >= 3 and toks[1] == "agent" and toks[2] == "serve":
+            return None
         return "grok_cli"
     if re.match(r"^grok-[\d.]+-macos-", b0) or re.match(r"^grok-macos-", b0):
         return "grok_cli"
@@ -430,11 +461,20 @@ def _parse_wrapper_flags(command, kind):
     if kind == "grok_cli":
         if len(toks) >= 2 and toks[1] == "-p":
             meta["headless_flag"] = True
-        for j, t in enumerate(toks):
+        # End-scan so a real flag after `-p <prompt>` wins over lookalikes
+        # inside the prompt blob (same class as the Claude --model fix).
+        for j in range(len(toks) - 1, 0, -1):
+            t = toks[j]
+            if t.startswith("--model="):
+                meta["model"] = t.split("=", 1)[1]
+                break
+            if t.startswith("-m=") and len(t) > 3:
+                meta["model"] = t.split("=", 1)[1]
+                break
             if t in ("-m", "--model") and j + 1 < len(toks):
                 meta["model"] = toks[j + 1]
-            elif t.startswith("--model="):
-                meta["model"] = t.split("=", 1)[1]
+                break
+        for j, t in enumerate(toks):
             if t == "--cwd" and j + 1 < len(toks) and toks[j + 1][:1] in "/~":
                 meta["cwd_arg"] = toks[j + 1]
             elif t.startswith("--cwd=") and t.split("=", 1)[1][:1] in "/~":
@@ -473,39 +513,64 @@ def _parse_wrapper_flags(command, kind):
     return meta
 
 
+def _toml_models_default(text):
+    """Parse [models] default (also model/default_model) from a TOML blob.
+
+    Table-aware: ignores [ui] fork_secondary_model and a stray top-level
+    default =. Never invents a version string.
+    """
+    if not text:
+        return None
+    section = None
+    found = None
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            section = s[1:-1].strip().strip('"').strip("'")
+            continue
+        if "=" not in s:
+            continue
+        key, _, val = s.partition("=")
+        key = key.strip()
+        val = val.split("#", 1)[0].strip().strip('"').strip("'")
+        if section == "models" and key in (
+            "default",
+            "model",
+            "default_model",
+            "defaultModel",
+        ):
+            if val:
+                if key == "default":
+                    return val
+                if found is None:
+                    found = val
+    return found
+
+
 def _load_model_defaults(now=None):
-    """Read claude/grok default models once per short window (cached with sweep)."""
+    """Read claude/grok default models once per short window (cached with sweep).
+
+    Grok default is [models].default or None — never a hardcoded version.
+    """
     now = now if now is not None else time.time()
     if _MODEL_DEFAULTS["loaded_at"] and (now - _MODEL_DEFAULTS["loaded_at"]) < 60:
         return _MODEL_DEFAULTS["claude"], _MODEL_DEFAULTS["grok"]
 
     claude_default = "default"
     try:
-        path = os.path.expanduser("~/.claude/settings.json")
-        data = read_json(path) or {}
+        data = read_json(CLAUDE_SETTINGS_PATH) or {}
         claude_default = (
             data.get("defaultModel") or data.get("model") or "default"
         )
     except Exception:
         pass
 
-    grok_default = "grok-4.5"
+    grok_default = None
     try:
-        path = os.path.expanduser("~/.grok/config.toml")
-        with open(path) as f:
-            text = f.read()
-        # Prefer a plain model = "..." key; ignore fork_secondary_model.
-        for line in text.splitlines():
-            s = line.strip()
-            if s.startswith("#") or "=" not in s:
-                continue
-            key, _, val = s.partition("=")
-            key = key.strip()
-            if key in ("model", "default_model", "defaultModel"):
-                val = val.strip().strip('"').strip("'")
-                if val:
-                    grok_default = val
-                    break
+        with open(GROK_CONFIG_PATH) as f:
+            grok_default = _toml_models_default(f.read())
     except Exception:
         pass
 
@@ -513,6 +578,13 @@ def _load_model_defaults(now=None):
     _MODEL_DEFAULTS["grok"] = grok_default
     _MODEL_DEFAULTS["loaded_at"] = now
     return claude_default, grok_default
+
+
+def reset_model_defaults():
+    """Test helper: drop the 60s config cache."""
+    _MODEL_DEFAULTS["claude"] = None
+    _MODEL_DEFAULTS["grok"] = None
+    _MODEL_DEFAULTS["loaded_at"] = 0.0
 
 
 def _lstart_ts(lstart):
@@ -533,17 +605,154 @@ def _grok_resume_sid(command):
     return None
 
 
-def grok_active_subagents(sid, proc_started_ts, now):
+def _parse_iso_ts(s):
+    """Parse a grok/claude ISO timestamp to epoch seconds (UTC). None on fail."""
+    if not s or not isinstance(s, str):
+        return None
+    raw = s.strip()
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(raw[:32])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        try:
+            return (
+                datetime.datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+                .replace(tzinfo=datetime.timezone.utc)
+                .timestamp()
+            )
+        except ValueError:
+            return None
+
+
+def _proc_cwd(pid):
+    """Best-effort cwd of a live pid. Never raises. Tests with fake pids → None."""
+    if not pid:
+        return None
+    if os.name != "nt":
+        try:
+            return os.readlink("/proc/%d/cwd" % int(pid))
+        except Exception:
+            pass
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-a", "-p", str(int(pid)), "-d", "cwd", "-Fn"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=0.4,
+            )
+            for line in out.splitlines():
+                if line.startswith("n"):
+                    return line[1:]
+        except Exception:
+            pass
+    return None
+
+
+def _grok_cwd_root(cwd):
+    if not cwd:
+        return None
+    cwd = os.path.expanduser(cwd)
+    return os.path.join(GROK_SESS_ROOT, urllib.parse.quote(cwd, safe=""))
+
+
+def grok_session_model(cwd, sid):
+    """current_model_id from summary.json, or None. Never invents a version."""
+    if not sid or not cwd:
+        return None
+    path = os.path.join(_grok_cwd_root(cwd), sid, "summary.json")
+    data = read_json(path) or {}
+    mid = data.get("current_model_id")
+    return mid if mid else None
+
+
+def resolve_grok_sid(command, rec, cwd_arg, started_ts):
+    """Sid for a grok process: --resume, else unique cwd+created_at match.
+
+    Ambiguous (several sessions in the start window, or none) → (None, cwd).
+    Never guesses the newest session in a shared cwd.
+    """
+    sid = _grok_resume_sid(command)
+    cwd = cwd_arg
+    if not cwd and rec:
+        cwd = _proc_cwd(rec.get("pid"))
+    if sid:
+        return sid, cwd
+    if not cwd:
+        return None, None
+    root = _grok_cwd_root(cwd)
+    if not root or not os.path.isdir(root):
+        return None, cwd
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None, cwd
+
+    def _summaries():
+        for name in names:
+            summary = read_json(os.path.join(root, name, "summary.json"))
+            if not summary or summary.get("session_kind") == "subagent":
+                continue
+            yield name, summary
+
+    # 1. created_at within the process start window (first session of a process).
+    window = []
+    if started_ts is not None:
+        for name, summary in _summaries():
+            created = _parse_iso_ts(summary.get("created_at"))
+            if created is None:
+                continue
+            if started_ts - 60 <= created <= started_ts + 180:
+                window.append(name)
+        if len(window) == 1:
+            return window[0], cwd
+
+    # 2. Unique session holding a lock file (interactive TUI writes these).
+    locked = []
+    for name, _summary in _summaries():
+        sdir = os.path.join(root, name)
+        if any(
+            os.path.exists(os.path.join(sdir, lf))
+            for lf in (
+                "summary.json.lock",
+                "chat_history.jsonl.lock",
+                "updates.jsonl.lock",
+            )
+        ):
+            locked.append(name)
+    if len(locked) == 1:
+        return locked[0], cwd
+
+    # 3. Unique recently-active session (covers /clear in a long-lived TUI:
+    #    process lstart no longer matches created_at).
+    now = time.time()
+    hot = []
+    for name, summary in _summaries():
+        la = _parse_iso_ts(
+            summary.get("last_active_at") or summary.get("updated_at")
+        )
+        if la is not None and now - la < 90:
+            hot.append(name)
+    if len(hot) == 1:
+        return hot[0], cwd
+    return None, cwd
+
+
+def grok_active_subagents(sid, proc_started_ts, now, parent_model=None):
     """Virtual tree nodes for a grok session's ACTIVE in-process subagents.
 
-    Native grok subagents (spawn_subagent) run inside the parent's OS process,
-    so the ps forest can never show them spreading. Their ground truth lives in
+    Native grok subagents (spawn_subagent) run inside the parent's OS process, so
+    the ps forest can never show them spreading. Their ground truth lives in
     the session dir: subagents/<id>/meta.json carries status/started_at/
-    description. Active = status not "completed" AND started at/after this
-    grok process (a resumed session keeps stale entries from earlier runs,
-    e.g. crashed subagents that never completed — the start bound filters
-    them). Only sessions launched with --resume are resolvable from ps; a
-    channel's first-open (no --resume yet) shows no virtual children.
+    description. Active = status not "completed"/"cancelled" AND started
+    at/after this grok process (a resumed session keeps stale entries from
+    earlier runs). Sid may come from --resume OR resolve_grok_sid().
+    Children stay flat (Grok forbids nest depth > 1). Model is
+    effective_model_id, else the parent process model, else null — never a
+    hardcoded version.
     """
     if not sid or not name_ok(sid):
         return []
@@ -553,19 +762,9 @@ def grok_active_subagents(sid, proc_started_ts, now):
     )
     for meta_path in glob.glob(pattern):
         m = read_json(meta_path)
-        if not m or m.get("status") == "completed":
+        if not m or m.get("status") in ("completed", "cancelled"):
             continue
-        ts = None
-        st = m.get("started_at")
-        if isinstance(st, str):
-            try:
-                ts = (
-                    datetime.datetime.strptime(st[:19], "%Y-%m-%dT%H:%M:%S")
-                    .replace(tzinfo=datetime.timezone.utc)
-                    .timestamp()
-                )
-            except ValueError:
-                ts = None
+        ts = _parse_iso_ts(m.get("started_at"))
         if (
             proc_started_ts is not None
             and ts is not None
@@ -573,6 +772,7 @@ def grok_active_subagents(sid, proc_started_ts, now):
         ):
             continue
         started_iso = iso(ts) if ts is not None else None
+        model = m.get("effective_model_id") or parent_model
         out.append({
             "pid": None,
             "kind": "grok-sub",
@@ -582,13 +782,73 @@ def grok_active_subagents(sid, proc_started_ts, now):
             "started_iso": started_iso,
             "uptime_s": max(0, int(round(now - ts))) if ts is not None else None,
             "label": m.get("description") or m.get("subagent_type") or "subagent",
-            "model": m.get("effective_model_id") or "grok-4.5",
+            "model": model,
             "children": [],
             "virtual": True,
             "subagent_id": m.get("subagent_id"),
+            "status": m.get("status"),
         })
     out.sort(key=lambda n: n.get("started") or "")
     return out
+
+
+def _reattach_dispatch_orphans(nodes, roots):
+    """Move agent_dispatch roots under their recorded launcher keep-node.
+
+    Only attaches when launcher_cli_pid is a live keep-node of matching
+    kind. Ambiguous / stale / missing → leave as root (honest forest).
+    """
+    if not roots:
+        return roots
+    kept = []
+    for r in roots:
+        if r.get("kind") != "agent_dispatch":
+            kept.append(r)
+            continue
+        task, lane = r.get("task"), r.get("lane")
+        if not task or not lane or not name_ok(task) or not name_ok(lane):
+            kept.append(r)
+            continue
+        slot = read_json(os.path.join(task_dir(task), "slot-%s.json" % lane)) or {}
+        lp = slot.get("launcher_cli_pid")
+        lk = slot.get("launcher_cli_kind")
+        try:
+            lp = int(lp) if lp is not None else None
+        except (TypeError, ValueError):
+            lp = None
+        parent = nodes.get(lp) if lp is not None else None
+        if parent is None:
+            kept.append(r)
+            continue
+        want = {
+            "claude": "claude",
+            "claude_cli": "claude",
+            "grok": "grok",
+            "grok_cli": "grok",
+        }.get(lk, lk)
+        if want and parent.get("kind") != want:
+            kept.append(r)
+            continue
+        # Refuse cycles (should be impossible; belt and braces).
+        walk = parent
+        cyclic = False
+        seen = set()
+        while walk is not None:
+            wid = walk.get("pid")
+            if wid in seen:
+                cyclic = True
+                break
+            seen.add(wid)
+            if walk is r:
+                cyclic = True
+                break
+            # parent pointer is not stored; only check identity
+            break
+        if cyclic or parent is r:
+            kept.append(r)
+            continue
+        parent.setdefault("children", []).append(r)
+    return kept
 
 
 def build_cli_forest(snap, now=None):
@@ -665,7 +925,7 @@ def build_cli_forest(snap, now=None):
         if meta.get("headless_flag"):
             mode = "headless"
 
-        # Labels + inheritance from nearest keep-node ancestors
+        # Labels + inheritance
         label = None
         channel = None
         task = meta.get("task")
@@ -701,10 +961,10 @@ def build_cli_forest(snap, now=None):
         elif ikind == "claude_cli":
             if mode == "headless" or meta.get("headless_flag"):
                 # A dispatched Claude lane carries its identity on the
-                # agent_dispatch ancestor, exactly like a grok lane does.
-                # Recover it instead of guessing — otherwise every headless
-                # claude reads "(exec-master)" and dispatched Claude lanes
-                # lose their task/lane in the viewer.
+                # agent_dispatch ancestor, exactly like a grok lane does. Recover
+                # it instead of guessing. A headless claude with no dispatch
+                # ancestor is an exec-master (or ad-hoc claude -p), not a
+                # dispatched lane executor.
                 td = nearest_kind_ancestor(pid, "agent_dispatch")
                 if td is not None:
                     tm = _parse_wrapper_flags(
@@ -720,18 +980,10 @@ def build_cli_forest(snap, now=None):
                     label = f"{task}/{lane}" if task else lane
                 else:
                     # Headless claude with no dispatch ancestor: a real
-                    # exec-master (subagent) or an ad-hoc claude -p.
+                    # exec-master (Agent-tool subagent) or an ad-hoc claude -p.
                     label = "(exec-master)"
             else:
                 label = None  # viewer shows tty from node.tty
-
-        if not model:
-            if ikind == "claude_cli":
-                model = claude_def
-            elif ikind == "grok_cli":
-                model = grok_def
-            else:
-                model = None
 
         started_ts = _lstart_ts(rec.get("lstart"))
         if started_ts is not None:
@@ -740,6 +992,25 @@ def build_cli_forest(snap, now=None):
         else:
             started_iso = None
             uptime_s = None
+
+        # Grok model: argv → grok-ask inherit → session summary → config.
+        # Never invent a version string.
+        if ikind == "grok_cli":
+            sid, sess_cwd = resolve_grok_sid(
+                cmd, rec, meta.get("cwd_arg"), started_ts
+            )
+            if sid:
+                grok_sess[pid] = (sid, started_ts)
+            if not model and sid:
+                model = grok_session_model(sess_cwd, sid)
+
+        if not model:
+            if ikind == "claude_cli":
+                model = claude_def
+            elif ikind == "grok_cli":
+                model = grok_def
+            else:
+                model = None
 
         tty = rec.get("tty")
         if mode == "headless" or not tty or tty in ("??", "?"):
@@ -765,10 +1036,6 @@ def build_cli_forest(snap, now=None):
             nodes[pid]["task"] = task
         if lane:
             nodes[pid]["lane"] = lane
-        if ikind == "grok_cli":
-            sid = _grok_resume_sid(cmd)
-            if sid:
-                grok_sess[pid] = (sid, started_ts)
 
     # Re-parent: attach each keep-node under first keep-ancestor (≤10 walk).
     roots = []
@@ -779,15 +1046,20 @@ def build_cli_forest(snap, now=None):
         else:
             roots.append(nodes[pid])
 
+    # Logical reattach: a backgrounded agent-dispatch is reparented to pid 1.
+    # Slot launcher_cli_pid (written at dispatch while the parent was live)
+    # is the only safe pointer — refuse on dead/mismatched/ambiguous.
+    roots = _reattach_dispatch_orphans(nodes, roots)
+
     # Stable child order by pid.
     def sort_tree(node):
-        node["children"].sort(key=lambda c: c["pid"])
+        node["children"].sort(key=lambda c: (c["pid"] is None, c["pid"] or 0))
         for c in node["children"]:
             sort_tree(c)
 
     for r in roots:
         sort_tree(r)
-    roots.sort(key=lambda n: n["pid"])
+    roots.sort(key=lambda n: n["pid"] if n.get("pid") is not None else 0)
 
     # Graft virtual grok-sub children AFTER sort_tree (their pid is None,
     # which the pid sort key cannot order).
@@ -796,7 +1068,7 @@ def build_cli_forest(snap, now=None):
         node = nodes.get(pid)
         if not node:
             continue
-        subs = grok_active_subagents(sid, sts, now)
+        subs = grok_active_subagents(sid, sts, now, parent_model=node.get("model"))
         node["children"].extend(subs)
         sub_total += len(subs)
 
@@ -821,7 +1093,7 @@ def build_cli_forest(snap, now=None):
 
 
 def cli_busy(snap=None):
-    """True if any claude_cli or grok_cli process is present (idle busy source).
+    """True if any claude_cli or grok_cli process is present (idle source).
 
     Viewer / agent_dispatch / grok_ask / switchboard are NOT CLI instances.
     """
@@ -838,7 +1110,7 @@ def cli_busy(snap=None):
 
 
 def viewer_running(snap=None):
-    """True if Agent Switchboard GUI is running (argv0/path identity only).
+    """True if Agent Switchboard GUI is running (argv0/path rule).
 
     Never uses pgrep -f on display name (prompt-pollution bug class).
     Viewer is NOT counted as a CLI instance.
@@ -928,36 +1200,211 @@ def session_dir_for(slot):
         if os.path.isdir(d):
             return d
     best = None
+    candidates = 0
     try:
         for name in os.listdir(root):
             d = os.path.join(root, name)
             if not os.path.isdir(d):
                 continue
+            summary = read_json(os.path.join(d, "summary.json")) or {}
+            if summary.get("session_kind") == "subagent":
+                continue
             st = os.stat(d)
             birth = getattr(st, "st_birthtime", st.st_mtime)
             if birth >= slot.get("started", 0) - 5:
+                candidates += 1
                 if best is None or birth < best[0]:
                     best = (birth, d)
     except FileNotFoundError:
         return None
+    # Shared cwd with several matching sessions: refuse rather than steal.
+    if candidates > 1:
+        return None
     return best[1] if best else None
 
 
-def activity_age(slot):
-    d = session_dir_for(slot)
-    if not d:
+def claude_project_dir(cwd):
+    """Claude encodes /Users/foo → -Users-foo under ~/.claude/projects."""
+    if not cwd:
         return None
-    newest = 0.0
-    for name in ("updates.jsonl", "events.jsonl", "chat_history.jsonl"):
+    cwd = os.path.abspath(os.path.expanduser(cwd))
+    enc = cwd.replace("/", "-")
+    return os.path.join(CLAUDE_PROJECTS_ROOT, enc)
+
+
+def claude_transcript_for(slot):
+    """Best-effort Claude jsonl path for a lane. None if missing/ambiguous."""
+    d = claude_project_dir(slot.get("cwd"))
+    if not d or not os.path.isdir(d):
+        return None
+    sid = slot.get("claude_session_id")
+    if sid:
+        p = os.path.join(d, "%s.jsonl" % sid)
+        if os.path.isfile(p):
+            return p
+    newest = None
+    count = 0
+    try:
+        for name in os.listdir(d):
+            if not name.endswith(".jsonl"):
+                continue
+            p = os.path.join(d, name)
+            if not os.path.isfile(p):
+                continue
+            try:
+                mtime = os.path.getmtime(p)
+            except OSError:
+                continue
+            if mtime < slot.get("started", 0) - 5:
+                continue
+            count += 1
+            if newest is None or mtime > newest[0]:
+                newest = (mtime, p)
+    except OSError:
+        return None
+    if count != 1:
+        return None
+    return newest[1]
+
+
+def _file_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def _tail_last_json(path, max_bytes=8192):
+    """Last JSON object in a jsonl file, reading only the tail. None on fail."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    last = None
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
-            newest = max(newest, os.stat(os.path.join(d, name)).st_mtime)
-        except FileNotFoundError:
+            last = json.loads(line)
+        except ValueError:
+            continue
+    return last
+
+
+def _newest_under(dirpath, suffix=None):
+    newest = 0.0
+    if not dirpath or not os.path.isdir(dirpath):
+        return 0.0
+    try:
+        for name in os.listdir(dirpath):
+            if suffix and not name.endswith(suffix):
+                continue
+            try:
+                newest = max(newest, os.path.getmtime(os.path.join(dirpath, name)))
+            except OSError:
+                pass
+    except OSError:
+        return 0.0
+    return newest
+
+
+def heartbeat(slot):
+    """Derived activity for a live slot. Never raises.
+
+    Returns dict: age (seconds or None), phase, event, tool, growing,
+    waiting_input, open_tool.
+    """
+    now = time.time()
+    newest = 0.0
+    last = None
+    waiting_input = False
+    open_tool = False
+    growing = False
+
+    d = session_dir_for(slot)
+    if d:
+        for name in ("updates.jsonl", "events.jsonl", "chat_history.jsonl"):
+            mt = _file_mtime(os.path.join(d, name))
+            if mt:
+                newest = max(newest, mt)
+        ev = _tail_last_json(os.path.join(d, "events.jsonl"))
+        if isinstance(ev, dict):
+            last = ev
+            et = ev.get("type") or ""
+            phase = ev.get("phase") or ""
+            if et in ("permission_requested",) or phase == "permission_prompt":
+                waiting_input = True
+            if et == "tool_started" or phase == "tool_execution":
+                open_tool = True
+        term_mt = _newest_under(os.path.join(d, "terminal"))
+        if term_mt:
+            newest = max(newest, term_mt)
+            if now - term_mt < 30:
+                growing = True
+
+    claude_p = claude_transcript_for(slot)
+    if claude_p:
+        mt = _file_mtime(claude_p)
+        if mt:
+            newest = max(newest, mt)
+        ev = _tail_last_json(claude_p)
+        if isinstance(ev, dict) and last is None:
+            last = ev
+            t = ev.get("type") or ""
+            if t in ("assistant", "tool_use", "tool_result"):
+                if now - (mt or 0) < 30:
+                    growing = True
+
+    report = slot.get("report")
+    if report:
+        mt = _file_mtime(report)
+        if mt:
+            newest = max(newest, mt)
+            if now - mt < 30:
+                growing = True
+
+    age = (now - newest) if newest else None
+    return {
+        "age": age,
+        "phase": (last or {}).get("phase"),
+        "event": (last or {}).get("type"),
+        "tool": (last or {}).get("tool_name"),
+        "growing": growing,
+        "waiting_input": waiting_input,
+        "open_tool": open_tool,
+    }
+
+
+def activity_age(slot):
+    hb = heartbeat(slot)
+    return hb.get("age")
+
+
+def _stall_budget(explicit=None):
+    """Stall budget: explicit arg, else current env, else the import default.
+
+    Read env on every call so `AGENT_SWITCHBOARD_STALL_AFTER=1 switchboard status`
+    works (import-time DEFAULT_STALL_AFTER is only the fallback).
+    """
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get("AGENT_SWITCHBOARD_STALL_AFTER")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
             pass
-    return (time.time() - newest) if newest else None
+    return DEFAULT_STALL_AFTER
 
 
-def derive(slot, quiet_after=DEFAULT_QUIET_AFTER, snap=None):
+def derive(slot, quiet_after=DEFAULT_QUIET_AFTER, snap=None, stall_after=None):
     """-> (STATE, activity_age_or_None)"""
+    stall_after = _stall_budget(stall_after)
     if slot.get("corrupt"):
         return ("CORRUPT", None)
     if slot.get("status") == "exited":
@@ -971,7 +1418,17 @@ def derive(slot, quiet_after=DEFAULT_QUIET_AFTER, snap=None):
     if not child_ok and wrapper_ok:
         # worker just exited; wrapper is finalizing — NOT a death (audit #1)
         return ("RUNNING", None)
-    age = activity_age(slot)
+    hb = heartbeat(slot)
+    age = hb.get("age")
+    if hb.get("waiting_input"):
+        return ("WAITING_INPUT", age)
+    if hb.get("open_tool") and hb.get("growing"):
+        return ("WORKING_TOOL", age)
+    started = slot.get("started") or 0
+    silence = age if age is not None else (time.time() - started if started else None)
+    # dispatched lanes are headless; use the short stall budget.
+    if silence is not None and silence > stall_after:
+        return ("STALLED", age if age is not None else silence)
     if age is not None and age > quiet_after:
         return ("QUIET", age)
     return ("RUNNING", age)
@@ -994,9 +1451,17 @@ def load_slots(task):
 
 
 TERMINAL_STATES = ("DONE", "FAILED", "DIED")
-# Idle busy predicate third OR-term: any slot in one of these states, across
+# Busy predicate third OR-term: any slot in one of these states, across
 # ALL tasks, counts as active (not just the CLI/viewer process checks).
-ACTIVE_SLOT_STATES = {"RUNNING", "QUIET", "ORPHAN", "CORRUPT"}
+ACTIVE_SLOT_STATES = {
+    "RUNNING",
+    "WORKING_TOOL",
+    "WAITING_INPUT",
+    "QUIET",
+    "STALLED",
+    "ORPHAN",
+    "CORRUPT",
+}
 
 
 def terminal_endings(task):
@@ -1121,18 +1586,19 @@ def list_tasks():
     return sorted(d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d)))
 
 
-def task_status(task, quiet_after=DEFAULT_QUIET_AFTER, snap=None):
+def task_status(task, quiet_after=DEFAULT_QUIET_AFTER, snap=None, stall_after=None):
     if snap is None:
         snap = ps_snapshot()
     rows = []
     endings = None  # events.jsonl read lazily, only if a terminal lane needs it
     for lane, slot in sorted(load_slots(task).items()):
-        state, age = derive(slot, quiet_after, snap)
+        state, age = derive(slot, quiet_after, snap, stall_after=stall_after)
         ended = slot.get("ended")
         if ended is None and state in TERMINAL_STATES:
             if endings is None:
                 endings = terminal_endings(task)
             ended = endings.get(lane) or slot.get("_mtime")
+        hb = {} if slot.get("corrupt") or slot.get("status") == "exited" else heartbeat(slot)
         rows.append(
             {
                 "lane": lane,
@@ -1146,6 +1612,9 @@ def task_status(task, quiet_after=DEFAULT_QUIET_AFTER, snap=None):
                 "ended_s": round(time.time() - ended) if ended is not None else None,
                 "channel": slot.get("channel"),
                 "report": slot.get("report"),
+                "last_event": hb.get("event"),
+                "phase": hb.get("phase"),
+                "last_tool": hb.get("tool"),
             }
         )
     return {"task": task, "slots": rows}
@@ -1164,20 +1633,20 @@ def fmt_age(secs):
     return f"{secs / 3600:.1f}h"
 
 
-def print_status(task, quiet_after, snap=None):
-    st = task_status(task, quiet_after, snap)
+def print_status(task, quiet_after, snap=None, stall_after=None):
+    st = task_status(task, quiet_after, snap, stall_after=stall_after)
     print(f"TASK {task}  ({task_dir(task)})")
     if not st["slots"]:
         print("  (no slots)")
         return
     print(
-        f"  {'LANE':22} {'STATE':8} {'PID':>7} {'UP':>6} {'ACTIVITY':>9} {'EXIT':>4}  CHANNEL"
+        f"  {'LANE':22} {'STATE':14} {'PID':>7} {'UP':>6} {'ACTIVITY':>9} {'EXIT':>4}  CHANNEL"
     )
     for r in st["slots"]:
         act = fmt_age(r["activity_s"]) + " ago" if r["activity_s"] is not None else "-"
         ec = "-" if r["exit_code"] is None else str(r["exit_code"])
         print(
-            f"  {r['lane']:22} {r['state']:8} {str(r['pid'] or '-'):>7} "
+            f"  {r['lane']:22} {r['state']:14} {str(r['pid'] or '-'):>7} "
             f"{fmt_age(r['age_s']):>6} {act:>9} {ec:>4}  {r['channel'] or '-'}"
         )
 
@@ -1186,7 +1655,7 @@ def _maybe_ensure(args):
     """Opt-in soft ensure (--ensure flag or AGENT_SWITCHBOARD_ENSURE=1 env) so the
     HTTP/viewer tier is warmed back up after an idle park. Best-effort and
     silent: these CLI commands read state from disk directly and must keep
-    working even if the daemon never comes up (spike 4.6.C)."""
+    working even if the daemon never comes up."""
     if getattr(args, "ensure", False) or os.environ.get("AGENT_SWITCHBOARD_ENSURE") == "1":
         try:
             ensure_daemon()
@@ -1202,10 +1671,13 @@ def cmd_status(args):
         return 0
     snap = ps_snapshot()
     if args.json:
-        print(json.dumps([task_status(t, args.quiet_after, snap) for t in tasks], indent=2))
+        print(json.dumps([task_status(t, args.quiet_after, snap,
+                                       stall_after=getattr(args, "stall_after", None))
+                          for t in tasks], indent=2))
     else:
         for t in tasks:
-            print_status(t, args.quiet_after, snap)
+            print_status(t, args.quiet_after, snap,
+                         stall_after=getattr(args, "stall_after", None))
     return 0
 
 
@@ -1220,29 +1692,223 @@ def file_sig(path):
         return None
 
 
+def _refuse_keys(task):
+    """Set of (ts, lane, reason) refuse events currently in the log."""
+    out = set()
+    for e in tail_events(task, 80):
+        if e.get("event") == "refuse":
+            out.add((e.get("ts"), e.get("lane"), e.get("reason")))
+    return out
+
+
+def write_json_atomic(path, obj):
+    tmp = "%s.tmp%d" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
+
+
+def write_advise(task, payload, extra_path=None):
+    tdir = task_dir(task)
+    os.makedirs(tdir, exist_ok=True)
+    write_json_atomic(os.path.join(tdir, "advise.json"), payload)
+    if extra_path:
+        try:
+            dest_dir = os.path.dirname(extra_path)
+            if dest_dir:
+                os.makedirs(dest_dir, exist_ok=True)
+            write_json_atomic(extra_path, payload)
+        except OSError:
+            pass
+    return payload
+
+
+def _tree_orphan_lanes(task, rows, snap):
+    """Active lanes whose recorded launcher pid is gone (supervisor vanished)."""
+    by_lane = {r["lane"]: r for r in rows}
+    out = []
+    for lane, slot in load_slots(task).items():
+        row = by_lane.get(lane)
+        if not row or row["state"] not in ACTIVE_SLOT_STATES:
+            continue
+        lp = slot.get("launcher_cli_pid")
+        if not lp:
+            continue
+        if snap is not None and not proc_alive(lp, None, snap):
+            out.append(lane)
+    return out
+
+
+def build_advise(task, events, wait_exit, quiet_after=DEFAULT_QUIET_AFTER, snap=None):
+    """Closed-verb advice object a master must read on every wake."""
+    if snap is None:
+        snap = ps_snapshot()
+    st = task_status(task, quiet_after, snap)
+    rows = st.get("slots") or []
+    counts = {
+        "running": 0,
+        "working_tool": 0,
+        "waiting_input": 0,
+        "quiet": 0,
+        "stalled": 0,
+        "orphan": 0,
+        "died": 0,
+        "failed": 0,
+        "done": 0,
+        "corrupt": 0,
+    }
+    key_map = {
+        "RUNNING": "running",
+        "WORKING_TOOL": "working_tool",
+        "WAITING_INPUT": "waiting_input",
+        "QUIET": "quiet",
+        "STALLED": "stalled",
+        "ORPHAN": "orphan",
+        "DIED": "died",
+        "FAILED": "failed",
+        "DONE": "done",
+        "CORRUPT": "corrupt",
+    }
+    active = []
+    for r in rows:
+        k = key_map.get(r["state"])
+        if k:
+            counts[k] += 1
+        if r["state"] in ACTIVE_SLOT_STATES:
+            active.append(r["lane"])
+
+    next_verbs = []
+    newly = []
+    refused = []
+    for e in events or []:
+        if e.get("event") == "lane":
+            to = e.get("to")
+            lane = e.get("lane")
+            newly.append({"lane": lane, "state": to})
+            if to == "DONE":
+                next_verbs.append("review_done:%s" % lane)
+            elif to == "FAILED":
+                next_verbs.append("review_done:%s" % lane)
+            elif to == "DIED":
+                next_verbs.append("investigate_died:%s" % lane)
+            elif to == "ORPHAN":
+                next_verbs.append("investigate_orphan:%s" % lane)
+            elif to == "STALLED":
+                next_verbs.append("inspect_stalled:%s" % lane)
+            elif to == "WAITING_INPUT":
+                next_verbs.append("waiting_input:%s" % lane)
+            elif to == "CORRUPT":
+                next_verbs.append("escalate_corrupt:%s" % lane)
+        elif e.get("event") == "refuse":
+            refused.append(e)
+            next_verbs.append("retry_refuse:%s" % (e.get("lane") or "?"))
+        elif e.get("event") == "file":
+            next_verbs.append("rescan")
+
+    if wait_exit == 3 and not next_verbs:
+        next_verbs.append("rescan")
+
+    severity = "timeout" if wait_exit == 3 else "action"
+    if any((e.get("to") if e.get("event") == "lane" else None) in
+           ("ORPHAN", "STALLED", "WAITING_INPUT") for e in (events or [])):
+        if wait_exit != 3:
+            severity = "inspect"
+    if any((e.get("to") if e.get("event") == "lane" else None) in
+           ("DONE", "FAILED", "DIED", "CORRUPT") for e in (events or [])):
+        severity = "action"
+    if refused:
+        severity = "action"
+
+    payload = {
+        "v": 1,
+        "ts": iso(),
+        "task": task,
+        "severity": severity,
+        "reason": ((events or [{}])[0].get("event") if events else "none"),
+        "wait_exit": wait_exit,
+        "events": events or [],
+        "counts": counts,
+        "active": active,
+        "newly_terminal": [n for n in newly if n.get("state") in ("DONE", "FAILED", "DIED")],
+        "refused": refused,
+        "stalls": [r["lane"] for r in rows if r["state"] == "STALLED"],
+        "tree_orphans": _tree_orphan_lanes(task, rows, snap),
+        "next": next_verbs,
+        "do_not": [
+            "treat this as abort",
+            "re-dispatch an ACTIVE or ORPHAN lane",
+            "end the exec-master turn",
+        ],
+        "all_terminal": not active,
+    }
+    return payload
+
+
+def _emit_wait_result(args, events, wait_exit):
+    extra = getattr(args, "advise", None)
+    payload = build_advise(args.task, events, wait_exit, args.quiet_after)
+    write_advise(args.task, payload, extra)
+    as_json = getattr(args, "json", False)
+    if as_json:
+        print(json.dumps(payload, indent=2))
+        return wait_exit
+    for e in events or []:
+        if e.get("event") == "lane":
+            print("EVENT lane %s: %s -> %s" % (e.get("lane"), e.get("from"), e.get("to")))
+        elif e.get("event") == "file":
+            print("EVENT file changed: %s" % e.get("path"))
+        elif e.get("event") == "refuse":
+            print("EVENT refuse %s: %s" % (e.get("lane"), e.get("reason")))
+    if wait_exit == 0 and not events:
+        print("all watched lanes already terminal:")
+    if wait_exit == 3:
+        print("TIMEOUT after %ss, no event" % getattr(args, "timeout", "?"))
+    print("SEVERITY %s  next=%s" % (
+        payload["severity"],
+        ",".join(payload["next"]) if payload["next"] else "-",
+    ))
+    print_status(args.task, args.quiet_after)
+    return wait_exit
+
+
 def cmd_wait(args):
     _maybe_ensure(args)
     lanes_filter = set(args.lane or [])
+    stay = getattr(args, "stay", False)
+    alerting = set(ALERTING)
+    if args.alert_quiet:
+        alerting.add("QUIET")
 
     def snapshot():
         snap = ps_snapshot()
         slots = load_slots(args.task)
         if lanes_filter:
             slots = {k: v for k, v in slots.items() if k in lanes_filter}
-        return {k: derive(v, args.quiet_after, snap)[0] for k, v in slots.items()}
+        return {k: derive(v, args.quiet_after, snap,
+                           stall_after=getattr(args, "stall_after", None))[0]
+                for k, v in slots.items()}
 
     base_states = snapshot()
     base_files = {p: file_sig(p) for p in (args.watch_file or [])}
+    seen_refuse = _refuse_keys(args.task)
 
     # ORPHAN alerts on transition but does NOT count as settled here — its
     # worker is still alive, and early-returning on it would let a caller
     # spin no-op waits (audit residual #1).
     settled = {"DONE", "FAILED", "DIED"}
     live = [l for l, s in base_states.items() if s not in settled]
-    if base_states and not live and not base_files:
-        print("all watched lanes already terminal:")
-        print_status(args.task, args.quiet_after)
-        return 0
+    if base_states and not live and not base_files and not stay:
+        return _emit_wait_result(args, [], 0)
+    # Already-STALLED / WAITING_INPUT / CORRUPT at start is itself the
+    # signal — do not sit the full timeout waiting for a transition that
+    # will not come. ORPHAN stays blocking (T16): the worker is still alive.
+    already = [
+        (l, s) for l, s in base_states.items()
+        if s in ("STALLED", "WAITING_INPUT", "CORRUPT")
+    ]
+    if already and not stay:
+        evs = [{"event": "lane", "lane": l, "from": s, "to": s} for l, s in already]
+        return _emit_wait_result(args, evs, 0)
 
     deadline = time.time() + args.timeout
     while time.time() < deadline:
@@ -1253,26 +1919,34 @@ def cmd_wait(args):
             old = base_states.get(lane)
             if state == old:
                 continue
-            if state in ALERTING or (args.alert_quiet and state == "QUIET"):
+            if state in alerting:
                 events.append({"event": "lane", "lane": lane, "from": old, "to": state})
             base_states[lane] = state
-        for path, sig in base_files.items():
+        for path, sig in list(base_files.items()):
             new = file_sig(path)
             if new != sig:
                 events.append({"event": "file", "path": path})
                 base_files[path] = new
+        now_refuse = _refuse_keys(args.task)
+        for key in now_refuse - seen_refuse:
+            ts, lane, reason = key
+            events.append({"event": "refuse", "lane": lane, "reason": reason, "ts": ts})
+        seen_refuse = now_refuse
         if events:
             for e in events:
-                append_event(args.task, e)
-                if e["event"] == "lane":
-                    print(f"EVENT lane {e['lane']}: {e['from']} -> {e['to']}")
-                else:
-                    print(f"EVENT file changed: {e['path']}")
-            print_status(args.task, args.quiet_after)
-            return 0
-    print(f"TIMEOUT after {args.timeout}s, no event")
-    print_status(args.task, args.quiet_after)
-    return 3
+                if e.get("event") in ("lane", "file"):
+                    append_event(args.task, e)
+            return _emit_wait_result(args, events, 0)
+    return _emit_wait_result(args, [], 3)
+
+
+def cmd_advise(args):
+    _maybe_ensure(args)
+    extra = getattr(args, "advise", None)
+    payload = build_advise(args.task, [], None, args.quiet_after)
+    write_advise(args.task, payload, extra)
+    print(json.dumps(payload, indent=2))
+    return 0
 
 
 def cmd_events(args):
@@ -1317,7 +1991,7 @@ class EventBus:
         self.floor = 0
         # Set on graceful drain (SIGTERM/SIGINT/idle-exit) to wake every
         # blocked wait_for() immediately instead of leaving it to time out
-        # on its own (H2/H5 — a wait that cannot be woken is a lane failure).
+        # on its own (a wait that cannot be woken is a lane failure).
         self.stopping = False
 
     def publish(self, task, event):
@@ -1394,9 +2068,10 @@ def cold_archive(tdir, lane, slot):
 
 def watcher_loop(bus, quiet_after, stop_evt, tick=1.0, idle_cb=None):
     """Per-tick: one ps sweep drives BOTH lane-state derivation (existing
-    status transitions below) AND the idle busy predicate — never a second
+    lane-state derivation below) AND the idle busy predicate — never a second
     ps sweep for idle detection."""
     last = {}  # (task, lane) -> (state, run_id)
+    seen_refuse = {}  # task -> set of refuse keys
     idle_since = None
     idle_samples = 0
     while not stop_evt.is_set():
@@ -1444,6 +2119,13 @@ def watcher_loop(bus, quiet_after, stop_evt, tick=1.0, idle_cb=None):
                     ev = {"event": "lane", "lane": lane, "from": old_state, "to": state}
                     append_event(task, ev)
                     bus.publish(task, ev)
+                    try:
+                        write_advise(
+                            task,
+                            build_advise(task, [ev], 0, quiet_after, snap),
+                        )
+                    except Exception:
+                        pass
 
                 if state in TERMINAL_STATES:
                     ended = slot.get("ended") or slot.get("_mtime")
@@ -1454,6 +2136,15 @@ def watcher_loop(bus, quiet_after, stop_evt, tick=1.0, idle_cb=None):
 
                 seen.add(key)
                 last[key] = (state, run_id)
+
+            # Surface capacity/same-lane refuse so waiters wake.
+            now_ref = _refuse_keys(task)
+            prev_ref = seen_refuse.get(task, set())
+            for key_r in now_ref - prev_ref:
+                ts, lane_r, reason = key_r
+                ev = {"event": "refuse", "lane": lane_r, "reason": reason, "ts": ts}
+                bus.publish(task, ev)
+            seen_refuse[task] = now_ref
 
         for stale in list(last.keys() - seen):
             del last[stale]
@@ -1629,8 +2320,14 @@ def cmd_serve(args):
                     n = int(q.get("n", 50))
                     self._json(tail_events(task, n))
                 elif u.path == "/v1/cli":
-                    # Forest of CLI instances (B2). 5s TTL; one ps per miss.
+                    # Forest of CLI instances. 5s TTL; one ps per miss.
                     self._json(get_cli_payload(boot_id=boot_id))
+                elif u.path == "/v1/advise":
+                    task = q.get("task")
+                    if not task or not name_ok(task):
+                        return self._json({"error": "valid task required"}, 400)
+                    snap = ps_snapshot()
+                    self._json(build_advise(task, [], None, args.quiet_after, snap))
                 elif u.path == "/v1/wait":
                     # Concurrency cap: the jetsam thread
                     # limit is 32; a pile of long-polls must fail loud with
@@ -1657,17 +2354,16 @@ def cmd_serve(args):
         # Request threads must never block process exit, and server_close()
         # must never attempt an unbounded join on them — we wake every
         # blocked /v1/wait explicitly on drain (bus.shutdown()) and rely on
-        # these two flags as the bound-of-last-resort (H1/H2/H5: "a wait
+        # these two flags as the bound-of-last-resort ("a wait
         # that cannot be woken is a lane failure").
         srv.daemon_threads = True
         srv.block_on_close = False
         srv_holder["srv"] = srv
     except OSError as e:
-        # Duplicate instance (D1-D9): probe the peer before deciding this is
-        # a crash. Healthy peer -> exit 0 (nothing to restart;
-        # exit-code convention); dead socket -> exit 1 with an actionable
-        # message (never exit 2 here — that would thrash under
-        # KeepAlive.SuccessfulExit=false keeps intentional exit-0 down).
+        # Duplicate instance: probe the peer before deciding this is
+        # a crash. Healthy peer -> exit 0 (nothing to restart);
+        # dead socket -> exit 1 with an actionable message (never exit 2
+        # here — that would thrash under KeepAlive.SuccessfulExit=false).
         peer_healthy = _health_ok(args.host, args.port, timeout=2.0)
         if peer_healthy:
             print(
@@ -1767,6 +2463,8 @@ def main():
     p.add_argument("--task")
     p.add_argument("--json", action="store_true")
     p.add_argument("--quiet-after", type=float, default=DEFAULT_QUIET_AFTER)
+    p.add_argument("--stall-after", type=float, default=None,
+                   help="headless silence budget (default: AGENT_SWITCHBOARD_STALL_AFTER or 90)")
     p.add_argument("--ensure", action="store_true",
                    help="best-effort ensure_daemon() before running (or set AGENT_SWITCHBOARD_ENSURE=1)")
     p.set_defaults(fn=cmd_status)
@@ -1782,9 +2480,23 @@ def main():
     p.add_argument("--alert-quiet", action="store_true",
                    help="also return on RUNNING->QUIET transitions")
     p.add_argument("--quiet-after", type=float, default=DEFAULT_QUIET_AFTER)
+    p.add_argument("--stall-after", type=float, default=None)
+    p.add_argument("--json", action="store_true",
+                   help="print the advise payload instead of human status")
+    p.add_argument("--stay", action="store_true",
+                   help="do not early-return if currently idle (orchestrator safety-net)")
+    p.add_argument("--advise",
+                   help="also write the advise payload to this path")
     p.add_argument("--ensure", action="store_true",
                    help="best-effort ensure_daemon() before running (or set AGENT_SWITCHBOARD_ENSURE=1)")
     p.set_defaults(fn=cmd_wait)
+
+    p = sub.add_parser("advise", help="print the current advise payload for a task")
+    p.add_argument("--task", required=True)
+    p.add_argument("--quiet-after", type=float, default=DEFAULT_QUIET_AFTER)
+    p.add_argument("--advise", help="also write the payload to this path")
+    p.add_argument("--ensure", action="store_true")
+    p.set_defaults(fn=cmd_advise)
 
     p = sub.add_parser("events", help="tail the observation log")
     p.add_argument("--task", required=True)

@@ -304,6 +304,79 @@ def extract_worker_meta(worker_args):
     return channel, cwd
 
 
+def _classify_launcher_cmd(command):
+    if not command:
+        return None
+    a0 = command.split(None, 1)[0]
+    b0 = os.path.basename(a0)
+    if b0 in ("claude", "claude.exe") or a0.endswith("/claude") or a0.endswith("/claude.exe"):
+        return "claude"
+    if b0 == "grok" or "/.grok/bin/grok" in a0 or "/.grok/downloads/grok" in a0:
+        toks = command.split()
+        if len(toks) >= 2 and toks[1] == "leader":
+            return None
+        return "grok"
+    return None
+
+
+def find_launcher():
+    """Walk live ancestors NOW (before the tool shell can exit) for the
+    first claude/grok keep-node. Falls back to CLAUDE_PID. Ambiguous /
+    missing → all-None (forest will leave the wrapper as a root)."""
+    launcher_cli_pid = None
+    launcher_cli_kind = None
+    launcher_sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get(
+        "GROK_SESSION_ID"
+    )
+    by = {}
+    if os.name != "nt":
+        try:
+            out = subprocess.check_output(
+                ["ps", "-axo", "pid=,ppid=,command="],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                parts = line.strip().split(None, 2)
+                if len(parts) < 3:
+                    continue
+                try:
+                    by[int(parts[0])] = (int(parts[1]), parts[2])
+                except ValueError:
+                    continue
+        except Exception:
+            by = {}
+    cur = os.getppid()
+    seen = set()
+    for _ in range(12):
+        if cur in seen or cur not in by:
+            break
+        seen.add(cur)
+        ppid, cmd = by[cur]
+        kind = _classify_launcher_cmd(cmd)
+        if kind:
+            launcher_cli_pid = cur
+            launcher_cli_kind = kind
+            break
+        cur = ppid
+    if launcher_cli_pid is None:
+        env_pid = os.environ.get("CLAUDE_PID")
+        if env_pid and str(env_pid).isdigit():
+            ep = int(env_pid)
+            rec = by.get(ep)
+            if rec and _classify_launcher_cmd(rec[1]) == "claude":
+                launcher_cli_pid = ep
+                launcher_cli_kind = "claude"
+    parent_lane = os.environ.get("AGENT_SWITCHBOARD_PARENT_LANE") or None
+    return {
+        "launcher_cli_pid": launcher_cli_pid,
+        "launcher_cli_kind": launcher_cli_kind,
+        "launcher_sid": launcher_sid,
+        "launcher_recorded_at": time.time(),
+        "parent_lane": parent_lane,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--task", required=True)
@@ -375,6 +448,13 @@ def main():
             if slot_active(s, snap):
                 active += 1
         if active >= cap:
+            append_event(tdir, {
+                "event": "refuse",
+                "lane": args.lane,
+                "reason": "capacity",
+                "active": active,
+                "cap": cap,
+            })
             print(f"agent-dispatch: capacity reached ({active}/{cap} active lanes in "
                   f"task {args.task!r}) — refusing dispatch", file=sys.stderr)
             return 2
@@ -382,6 +462,11 @@ def main():
         existing = read_json(slot_path) if os.path.exists(slot_path) else False
         if existing is not False:
             if slot_active(existing, snap):
+                append_event(tdir, {
+                    "event": "refuse",
+                    "lane": args.lane,
+                    "reason": "lane_active",
+                })
                 print(f"agent-dispatch: lane {args.lane!r} is still ACTIVE (worker or "
                       f"wrapper alive — ORPHAN counts). Refusing: never double-dispatch "
                       f"a live lane. If it truly must go, stop it yourself first.",
@@ -392,6 +477,7 @@ def main():
             # load_slots()/status never sees the lane vanish mid-swap.
 
         child = subprocess.Popen([args.prog] + worker_args)
+        launcher = find_launcher()
 
         if existing is not False:
             stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -418,6 +504,11 @@ def main():
             "started": time.time(),
             "exit_code": None,
             "ended": None,
+            "launcher_cli_pid": launcher.get("launcher_cli_pid"),
+            "launcher_cli_kind": launcher.get("launcher_cli_kind"),
+            "launcher_sid": launcher.get("launcher_sid"),
+            "launcher_recorded_at": launcher.get("launcher_recorded_at"),
+            "parent_lane": launcher.get("parent_lane"),
         }
         write_json_atomic(slot_path, slot)
         append_event(tdir, {"event": "dispatch", "lane": args.lane, "pid": child.pid,

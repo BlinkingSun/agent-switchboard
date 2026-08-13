@@ -172,7 +172,10 @@ body {
 }
 
 .global-totals .gt[data-state="RUNNING"] strong { color: var(--running); }
-.global-totals .gt[data-state="QUIET"] strong { color: var(--quiet); }
+.global-totals .gt[data-state="QUIET"] strong,
+.global-totals .gt[data-state="WAITING_INPUT"] strong { color: var(--quiet); }
+.global-totals .gt[data-state="WORKING_TOOL"] strong { color: var(--running); }
+.global-totals .gt[data-state="STALLED"] strong,
 .global-totals .gt[data-state="DIED"] strong,
 .global-totals .gt[data-state="FAILED"] strong { color: var(--danger); }
 .global-totals .gt[data-state="DONE"] strong { color: var(--done); }
@@ -482,9 +485,21 @@ body {
   box-shadow: 0 0 8px rgba(53, 208, 122, 0.55), 0 0 2px rgba(53, 208, 122, 0.9);
 }
 
-.lamp[data-state="QUIET"] {
+.lamp[data-state="QUIET"],
+.lamp[data-state="WAITING_INPUT"] {
   background: radial-gradient(circle at 35% 30%, #f0d080 0%, var(--quiet) 45%, #9a6a10 100%);
   box-shadow: 0 0 8px rgba(224, 165, 46, 0.45), 0 0 2px rgba(224, 165, 46, 0.85);
+}
+
+.lamp[data-state="WORKING_TOOL"] {
+  background: radial-gradient(circle at 35% 30%, #7aefb0 0%, var(--running) 45%, #1a8a4a 100%);
+  box-shadow: 0 0 8px rgba(53, 208, 122, 0.55), 0 0 2px rgba(53, 208, 122, 0.9);
+}
+
+.lamp[data-state="STALLED"] {
+  background: radial-gradient(circle at 35% 30%, #ff8a8f 0%, var(--danger) 45%, #8a1c22 100%);
+  box-shadow: 0 0 8px rgba(229, 72, 77, 0.5), 0 0 2px rgba(229, 72, 77, 0.9);
+  animation: lamp-pulse 1.5s ease-in-out infinite;
 }
 
 .lamp[data-state="DIED"],
@@ -568,19 +583,23 @@ body {
   color: var(--text);
 }
 
-.tile[data-state="RUNNING"] .tile-num { color: var(--running); }
-.tile[data-state="QUIET"] .tile-num { color: var(--quiet); }
+.tile[data-state="RUNNING"] .tile-num,
+.tile[data-state="WORKING_TOOL"] .tile-num { color: var(--running); }
+.tile[data-state="QUIET"] .tile-num,
+.tile[data-state="WAITING_INPUT"] .tile-num { color: var(--quiet); }
 .tile[data-state="DONE"] .tile-num { color: var(--done); }
 .tile[data-state="ORPHAN"] .tile-num { color: var(--quiet); }
 
 .tile[data-state="DIED"].nonzero,
-.tile[data-state="FAILED"].nonzero {
+.tile[data-state="FAILED"].nonzero,
+.tile[data-state="STALLED"].nonzero {
   border-color: rgba(229, 72, 77, 0.45);
   background: linear-gradient(180deg, #221518 0%, var(--slot) 100%);
 }
 
 .tile[data-state="DIED"] .tile-num,
-.tile[data-state="FAILED"] .tile-num {
+.tile[data-state="FAILED"] .tile-num,
+.tile[data-state="STALLED"] .tile-num {
   color: var(--danger);
 }
 
