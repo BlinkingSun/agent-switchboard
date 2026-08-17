@@ -59,23 +59,76 @@
   }
 
   /**
-   * Counts for header/section: EXCLUDE agent_dispatch nodes.
-   * kind enum: claude | grok | agent_dispatch
+   * Family for a CLI tree node. Wrappers (agent_dispatch) return null.
+   * grok-sub counts as grok; cursor-sub counts as cursor.
+   */
+  function cliFamily(kind) {
+    if (kind === "claude" || kind === "claude-sub") return "claude";
+    if (kind === "grok" || kind === "grok-sub") return "grok";
+    if (kind === "cursor" || kind === "cursor-sub") return "cursor";
+    return null;
+  }
+
+  /**
+   * Counts every live agent instance: sessions AND subagents.
+   * Excludes agent_dispatch wrappers. kind enum:
+   *   claude | grok | cursor | grok-sub | cursor-sub | agent_dispatch
    */
   function countCliKinds(roots) {
-    var c = { claude: 0, grok: 0 };
+    var c = { claude: 0, grok: 0, cursor: 0 };
     function walk(nodes) {
       if (!nodes) return;
       for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
-        if (n.kind === "claude") c.claude++;
-        else if (n.kind === "grok") c.grok++;
-        // agent_dispatch intentionally not counted
+        var fam = cliFamily(n.kind);
+        if (fam) c[fam]++;
         if (n.children && n.children.length) walk(n.children);
       }
     }
     walk(roots || []);
     return c;
+  }
+
+  /**
+   * Flatten /v1/cli counts whether nested
+   *   {claude:{interactive,headless}, grok_subagents:N}
+   * or already flat {claude:N, grok:N, cursor:N}.
+   */
+  function flattenCliCounts(counts) {
+    var out = { claude: 0, grok: 0, cursor: 0 };
+    if (!counts || typeof counts !== "object") return out;
+    function fam(key) {
+      var v = counts[key];
+      if (typeof v === "number") return v;
+      if (v && typeof v === "object") {
+        return (v.interactive || 0) + (v.headless || 0);
+      }
+      return 0;
+    }
+    out.claude = fam("claude");
+    out.grok = fam("grok") + (counts.grok_subagents || 0);
+    out.cursor = fam("cursor") + (counts.cursor_subagents || 0);
+    return out;
+  }
+
+  /** Fixed display order for the CLI harness families. */
+  var CLI_FAMILIES = ["claude", "grok", "cursor"];
+
+  /**
+   * Harness families with at least one live instance, in display order.
+   * A harness with nothing running is omitted entirely — a machine without
+   * grok or cursor installed never sees those names in the bar.
+   * @returns {Array<{key:string, n:number}>}
+   */
+  function liveCliFamilies(counts) {
+    var out = [];
+    if (!counts) return out;
+    for (var i = 0; i < CLI_FAMILIES.length; i++) {
+      var k = CLI_FAMILIES[i];
+      var n = counts[k] || 0;
+      if (n > 0) out.push({ key: k, n: n });
+    }
+    return out;
   }
 
   /**
@@ -165,7 +218,63 @@
     var cnt = countCliKinds(roots);
     check("count claude=1", cnt.claude === 1);
     check("count grok=2", cnt.grok === 2);
-    check("agent_dispatch not in counts", cnt.claude + cnt.grok === 3);
+    check("count cursor=0", cnt.cursor === 0);
+    check("agent_dispatch not in counts", cnt.claude + cnt.grok + cnt.cursor === 3);
+
+    var withSubs = [
+      {
+        kind: "claude",
+        children: [
+          {
+            kind: "agent_dispatch",
+            children: [
+              {
+                kind: "grok",
+                children: [{ kind: "grok-sub", children: [] }],
+              },
+              {
+                kind: "cursor",
+                children: [{ kind: "cursor-sub", children: [] }],
+              },
+            ],
+          },
+        ],
+      },
+    ];
+    var c2 = countCliKinds(withSubs);
+    check("subagents count as family", c2.claude === 1 && c2.grok === 2 && c2.cursor === 2);
+    check("live includes subagents", c2.claude + c2.grok + c2.cursor === 5);
+    var flat = flattenCliCounts({
+      claude: { interactive: 2, headless: 0 },
+      grok: { interactive: 1, headless: 0 },
+      cursor: { interactive: 1, headless: 1 },
+      grok_subagents: 3,
+      cursor_subagents: 1,
+    });
+    check("flatten nested + subagents", flat.claude === 2 && flat.grok === 4 && flat.cursor === 3);
+
+    // Harness chips: only families with live instances are named (T40)
+    var famAll = liveCliFamilies({ claude: 2, grok: 2, cursor: 3 });
+    check(
+      "all three live -> all three named",
+      famAll.length === 3 &&
+        famAll[0].key === "claude" &&
+        famAll[1].key === "grok" &&
+        famAll[2].key === "cursor"
+    );
+    var famSolo = liveCliFamilies({ claude: 1, grok: 0, cursor: 0 });
+    check(
+      "claude only -> grok/cursor hidden",
+      famSolo.length === 1 && famSolo[0].key === "claude" && famSolo[0].n === 1
+    );
+    var famGap = liveCliFamilies({ claude: 0, grok: 0, cursor: 4 });
+    check(
+      "cursor only -> order preserved, claude hidden",
+      famGap.length === 1 && famGap[0].key === "cursor" && famGap[0].n === 4
+    );
+    check("no families live -> empty", liveCliFamilies({ claude: 0, grok: 0, cursor: 0 }).length === 0);
+    check("missing keys treated as zero", liveCliFamilies({ claude: 3 }).length === 1);
+    check("null counts -> empty", liveCliFamilies(null).length === 0);
 
     // model family truncation
     check("model null -> null", formatModelLabel(null) === null);
@@ -176,6 +285,8 @@
     check("model grok-4.5 passthrough", formatModelLabel("grok-4.5") === "grok-4.5");
     check("model grok-4.6 passthrough", formatModelLabel("grok-4.6") === "grok-4.6");
     check("model default passthrough", formatModelLabel("default") === "default");
+    check("model auto passthrough", formatModelLabel("auto") === "auto");
+    check("model composer passthrough", formatModelLabel("composer") === "composer");
 
     var failed = [];
     for (var i = 0; i < results.length; i++) {
@@ -196,6 +307,9 @@
     applyOrderingResult: applyOrderingResult,
     cliNodeCollapseKey: cliNodeCollapseKey,
     countCliKinds: countCliKinds,
+    flattenCliCounts: flattenCliCounts,
+    cliFamily: cliFamily,
+    liveCliFamilies: liveCliFamilies,
     formatModelLabel: formatModelLabel,
     runApplyOrderingSelfTest: runApplyOrderingSelfTest,
   };
@@ -465,14 +579,14 @@
     return laneCount > 15 ? "GRID" : "PANEL";
   }
 
-  /* ── /v1/cli mock fixture ── */
+  /* ── PLAN REV 2 /v1/cli fixture (matches cli-tree-v2 mockup) ── */
 
   function buildMockCliForest() {
-    // Forest shape: {counts:{claude,grok}, roots:[node…]}
-    // kind: claude | grok | agent_dispatch; each node may carry model
-    // Counts exclude agent_dispatch: claude 2, grok 5
+    // Forest shape: {counts:{claude,grok,cursor}, roots:[node…]}
+    // kind: claude | grok | cursor | agent_dispatch; each node may carry model
+    // Counts exclude agent_dispatch: claude 2, grok 5, cursor 1
     return {
-      counts: { claude: 2, grok: 5 },
+      counts: { claude: 2, grok: 5, cursor: 1 },
       roots: [
         {
           pid: 41001,
@@ -554,6 +668,18 @@
               label: "mytask-worker-3",
               channel: "mytask-worker-3",
               model: "grok-4.5",
+              children: [],
+            },
+            {
+              pid: 43104,
+              kind: "cursor",
+              mode: "headless",
+              tty: null,
+              uptime_s: 280,
+              started: "2026-08-09T22:29:20",
+              label: "mytask-worker-4",
+              channel: "mytask-worker-4",
+              model: "auto",
               children: [],
             },
           ],
@@ -727,6 +853,9 @@
     if (kind === "agent_dispatch") return "agent-dispatch";
     if (kind === "claude") return "claude";
     if (kind === "grok") return "grok";
+    if (kind === "cursor") return "cursor";
+    if (kind === "cursor-sub") return "cursor-sub";
+    if (kind === "grok-sub") return "grok-sub";
     return kind || "?";
   }
 
@@ -813,7 +942,10 @@
         // e.g. (exec-master)
         html +=
           '<span class="meta">' + escapeHtml(String(node.label)) + "</span>";
-      } else if (node.channel || (node.label && node.kind === "grok")) {
+      } else if (
+        node.channel ||
+        (node.label && (node.kind === "grok" || node.kind === "cursor"))
+      ) {
         var ch = node.channel || node.label;
         html +=
           '<span class="channel">channel ' +
@@ -843,36 +975,30 @@
   }
 
   function cliCountsFromState() {
-    if (!state.cli) return { claude: 0, grok: 0 };
-    if (state.cli.counts && typeof state.cli.counts.claude === "number") {
-      // Prefer server counts but recompute if roots present (T5 safety)
-      if (state.cli.roots) {
-        return countCliKinds(state.cli.roots);
-      }
-      return {
-        claude: state.cli.counts.claude || 0,
-        grok: state.cli.counts.grok || 0,
-      };
+    if (!state.cli) return { claude: 0, grok: 0, cursor: 0 };
+    // Tree walk is the source of truth (sessions + subagents, all families).
+    if (state.cli.roots && state.cli.roots.length) {
+      return countCliKinds(state.cli.roots);
     }
-    return countCliKinds(state.cli.roots || []);
+    return flattenCliCounts(state.cli.counts);
   }
 
   function renderCliSection() {
     var offline = state.offline;
     var counts = cliCountsFromState();
-    var live = counts.claude + counts.grok;
+    var live = counts.claude + counts.grok + (counts.cursor || 0);
     var meta;
     if (offline && !state.cli) {
       meta = '<span class="unreachable">unreachable</span>';
     } else {
-      meta =
-        "<b>CLAUDE " +
-        counts.claude +
-        "</b> · <b>GROK " +
-        counts.grok +
-        "</b> · <span class=\"ok\">" +
-        live +
-        " live</span>";
+      // Name only the harnesses that actually have something running.
+      var segs = [];
+      var fams = liveCliFamilies(counts);
+      for (var fi = 0; fi < fams.length; fi++) {
+        segs.push("<b>" + fams[fi].key.toUpperCase() + " " + fams[fi].n + "</b>");
+      }
+      segs.push('<span class="ok">' + live + " live</span>");
+      meta = segs.join(" · ");
     }
 
     var body;
@@ -984,17 +1110,19 @@
         state.hidden +
         " finished hidden</span>";
     }
-    // CLI chips (T5: exclude agent_dispatch)
-    var cc = cliCountsFromState();
-    if (!state.offline || state.cli) {
-      html +=
-        '<span class="gt gt-cli">CLI: claude <strong>' +
-        cc.claude +
-        "</strong></span>";
-      html +=
-        '<span class="gt gt-cli">grok <strong>' +
-        cc.grok +
-        "</strong></span>";
+    // CLI chips (T5: exclude agent_dispatch). A harness with nothing live
+    // gets no chip at all — no "cursor 0" on a machine without cursor.
+    var cliFams = liveCliFamilies(cliCountsFromState());
+    if ((!state.offline || state.cli) && cliFams.length) {
+      for (var f = 0; f < cliFams.length; f++) {
+        html +=
+          '<span class="gt gt-cli">' +
+          (f === 0 ? "CLI: " : "") +
+          cliFams[f].key +
+          " <strong>" +
+          cliFams[f].n +
+          "</strong></span>";
+      }
     } else {
       html += '<span class="gt gt-cli">CLI: —</span>';
     }
@@ -1442,7 +1570,7 @@
         roots: data.instances,
       };
     } else {
-      state.cli = { counts: { claude: 0, grok: 0 }, roots: [] };
+      state.cli = { counts: { claude: 0, grok: 0, cursor: 0 }, roots: [] };
     }
   }
 
@@ -1455,7 +1583,7 @@
   /* ── live loop (ordering guard + cli piggyback) ───── */
 
   /**
-   * Single status+cli refresh with monotonic apply seq.
+   * Single status+cli refresh with monotonic apply seq (R6a / SPEC item 3).
    * /v1/cli piggybacks this path — no extra long-poll (T4).
    */
   async function refreshStatus() {
@@ -1515,7 +1643,7 @@
   }
 
   /**
-   * Cursor recovery without nesting full initialLoad inside waitLoop.
+   * Cursor recovery without nesting full initialLoad inside waitLoop (R6c).
    * Uses health + generation-guarded refreshStatus.
    */
   async function recoverFromWaitError() {
@@ -1548,7 +1676,7 @@
           "&timeout=55";
         var data = await fetchJson(url);
         setOffline(false);
-        // Success path: reset backoff
+        // Success path: reset backoff (R6c / G15)
         state.backoff = BACKOFF_MIN;
 
         // boot_id change or gap → full resync
@@ -1593,7 +1721,7 @@
         renderAll();
         await sleep(state.backoff);
         state.backoff = Math.min(BACKOFF_MAX, state.backoff + 1000);
-        // Single recovery path — no initialLoad inside catch
+        // Single recovery path — no initialLoad inside catch (R6c)
         await recoverFromWaitError();
       }
     }

@@ -38,7 +38,7 @@ Commands:
   switchboard wait   --task T [--timeout S] [--interval S] [--lane L ...]
                      [--watch-file P ...] [--alert-quiet] [--quiet-after S]
                      [--json] [--stay] [--advise PATH]
-  switchboard advise --task T
+  switchboard advise --task T [--json]
   switchboard events --task T [-n N]
   switchboard serve  [--host 127.0.0.1] [--port 17920]
 
@@ -48,8 +48,9 @@ ORPHAN/CORRUPT/STALLED/WAITING_INPUT, on refuse events, on --watch-file
 changes, and (with --alert-quiet) on QUIET. QUIET alone is not a wake.
 
 serve HTTP API (read-only): GET /v1/health /v1/tasks /v1/status /v1/events
-/v1/cli (spawn-tree forest of claude/grok/agent_dispatch nodes), GET /v1/advise?task=T,
-and long-poll /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55].
+/v1/cli (spawn-tree forest of claude/grok/cursor/agent_dispatch nodes),
+GET /v1/advise?task=T, and long-poll
+/v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55].
 
 Status rows carry ended_s for terminal lanes (seconds since finish; source:
 slot 'ended', else last terminal transition in events.jsonl, else slot file
@@ -79,7 +80,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 ROOT = os.environ.get(
     "AGENT_SWITCHBOARD_ROOT",
     os.path.expanduser("~/.agent-switchboard/state"),
@@ -95,6 +96,15 @@ CLAUDE_SETTINGS_PATH = os.environ.get(
 )
 CLAUDE_PROJECTS_ROOT = os.environ.get(
     "AGENT_SWITCHBOARD_CLAUDE_PROJECTS", os.path.expanduser("~/.claude/projects")
+)
+CURSOR_CONFIG_PATH = os.environ.get(
+    "AGENT_SWITCHBOARD_CURSOR_CONFIG", os.path.expanduser("~/.cursor/cli-config.json")
+)
+CURSOR_CHANNEL_DIR = os.environ.get(
+    "AGENT_SWITCHBOARD_CURSOR_CHANNELS", os.path.expanduser("~/cursor-bridge/channels")
+)
+CURSOR_LOG_DIR = os.environ.get(
+    "AGENT_SWITCHBOARD_CURSOR_LOGS", os.path.expanduser("~/cursor-bridge/logs")
 )
 TERMINAL = {"DONE", "FAILED", "DIED", "ORPHAN"}
 # Default wait wake set. QUIET is opt-in (--alert-quiet). STALLED and
@@ -216,8 +226,13 @@ _PYTHON_NAMES = {
 }
 _SHELL_NAMES = {"bash", "sh", "zsh"}
 # Keep-nodes emitted in the forest. Internal kinds use *_cli names.
-_KEEP_KINDS = frozenset({"claude_cli", "grok_cli", "agent_dispatch"})
-_KIND_OUT = {"claude_cli": "claude", "grok_cli": "grok", "agent_dispatch": "agent_dispatch"}
+_KEEP_KINDS = frozenset({"claude_cli", "grok_cli", "cursor_cli", "agent_dispatch"})
+_KIND_OUT = {
+    "claude_cli": "claude",
+    "grok_cli": "grok",
+    "cursor_cli": "cursor",
+    "agent_dispatch": "agent_dispatch",
+}
 
 # /v1/cli cache: one ps+classify per TTL window (default 5s).
 _CLI_CACHE = {
@@ -227,7 +242,7 @@ _CLI_CACHE = {
     "sweep_count": 0,
 }
 _CLI_CACHE_LOCK = threading.Lock()
-_MODEL_DEFAULTS = {"claude": None, "grok": None, "loaded_at": 0.0}
+_MODEL_DEFAULTS = {"claude": None, "grok": None, "cursor": None, "loaded_at": 0.0}
 
 
 def ps_cli_snapshot():
@@ -325,8 +340,9 @@ def viewer_process_match(command):
 def kind_from_command(command):
     """Classify a process from argv0/early argv ONLY (no free-text matching).
 
-    Returns internal kind or None. Keep-nodes: claude_cli, grok_cli, agent_dispatch.
-    Classified-but-never-emitted: grok_ask, switchboard_daemon, shell_tool, viewer.
+    Returns internal kind or None. Keep-nodes: claude_cli, grok_cli,
+    cursor_cli, agent_dispatch. Classified-but-never-emitted: grok_ask,
+    cursor_ask, switchboard_daemon, shell_tool, viewer.
     Claude.app helpers return None (excluded).
     """
     if not command:
@@ -349,12 +365,28 @@ def kind_from_command(command):
         return None
 
     if b0 in _SHELL_NAMES and len(toks) >= 2:
-        if os.path.basename(toks[1]) == "grok-ask":
+        script = os.path.basename(toks[1])
+        if script == "grok-ask":
             return "grok_ask"
+        if script == "cursor-ask":
+            return "cursor_ask"
         # Pure tool shells (zsh -c / bash -c) — classify for completeness, never emit.
         if toks[1] in ("-c", "-lc") or (len(toks) >= 3 and toks[1] in ("-c", "-lc")):
             return "shell_tool"
         return "shell_tool"
+
+    if b0 == "cursor-ask" or a0.endswith("/cursor-ask"):
+        return "cursor_ask"
+    if (
+        b0 == "cursor-agent"
+        or a0.endswith("/cursor-agent")
+        or "/.local/share/cursor-agent/" in a0
+        or "/cursor-agent/versions/" in command
+    ):
+        return "cursor_cli"
+    # node + cursor-agent index.js (exec -a failed / older launcher)
+    if b0 == "node" and any("cursor-agent" in t for t in toks[:8]):
+        return "cursor_cli"
 
     if b0 in ("claude", "claude.exe") or a0.endswith("/claude") or a0.endswith(
         "/claude.exe"
@@ -407,11 +439,16 @@ def _parse_wrapper_flags(command, kind):
             return t.split("=", 1)[1], i + 1
         return None, i
 
-    if kind in ("grok_ask", "agent_dispatch"):
+    if kind in ("grok_ask", "cursor_ask", "agent_dispatch"):
         i = 0
         if i < len(toks) and os.path.basename(toks[i]) in (_PYTHON_NAMES | _SHELL_NAMES):
             i += 1
-        if i < len(toks) and os.path.basename(toks[i]) in ("grok-ask", "agent-dispatch", "team-dispatch"):
+        if i < len(toks) and os.path.basename(toks[i]) in (
+            "grok-ask",
+            "cursor-ask",
+            "agent-dispatch",
+            "team-dispatch",
+        ):
             i += 1
         while i < len(toks):
             t = toks[i]
@@ -456,6 +493,32 @@ def _parse_wrapper_flags(command, kind):
                 i += 1
                 continue
             break  # free-text prompt
+        return meta
+
+    if kind == "cursor_cli":
+        # cursor-agent: -p/--print is headless; --workspace is the cwd.
+        for t in toks[1:10]:
+            if t in ("-p", "--print"):
+                meta["headless_flag"] = True
+                break
+        for j in range(len(toks) - 1, 0, -1):
+            t = toks[j]
+            if t.startswith("--model="):
+                meta["model"] = t.split("=", 1)[1]
+                break
+            if t.startswith("-m=") and len(t) > 3:
+                meta["model"] = t.split("=", 1)[1]
+                break
+            if t in ("-m", "--model") and j + 1 < len(toks):
+                meta["model"] = toks[j + 1]
+                break
+        for j, t in enumerate(toks):
+            if t in ("--workspace", "-d", "--cwd") and j + 1 < len(toks) and toks[j + 1][:1] in "/~":
+                meta["cwd_arg"] = toks[j + 1]
+            elif t.startswith("--workspace=") and t.split("=", 1)[1][:1] in "/~":
+                meta["cwd_arg"] = t.split("=", 1)[1]
+            elif t.startswith("--cwd=") and t.split("=", 1)[1][:1] in "/~":
+                meta["cwd_arg"] = t.split("=", 1)[1]
         return meta
 
     if kind == "grok_cli":
@@ -549,14 +612,46 @@ def _toml_models_default(text):
     return found
 
 
+def _cursor_config_model(data):
+    """Display id from ~/.cursor/cli-config.json. Never invents a version."""
+    if not isinstance(data, dict):
+        return None
+    model = data.get("model") if isinstance(data.get("model"), dict) else {}
+    selected = data.get("selectedModel") if isinstance(data.get("selectedModel"), dict) else {}
+    for key in (
+        model.get("displayModelId"),
+        model.get("displayNameShort"),
+        model.get("displayName"),
+        selected.get("modelId"),
+        model.get("modelId"),
+    ):
+        if key:
+            return str(key)
+    return None
+
+
+def cursor_channel_model(channel):
+    """model field from a cursor-ask channel state file, or None."""
+    if not channel or not name_ok(channel):
+        return None
+    data = read_json(os.path.join(CURSOR_CHANNEL_DIR, "%s.json" % channel)) or {}
+    mid = data.get("model")
+    return mid if mid else None
+
+
 def _load_model_defaults(now=None):
-    """Read claude/grok default models once per short window (cached with sweep).
+    """Read claude/grok/cursor default models once per short window.
 
     Grok default is [models].default or None — never a hardcoded version.
+    Cursor default is cli-config display id or None.
     """
     now = now if now is not None else time.time()
     if _MODEL_DEFAULTS["loaded_at"] and (now - _MODEL_DEFAULTS["loaded_at"]) < 60:
-        return _MODEL_DEFAULTS["claude"], _MODEL_DEFAULTS["grok"]
+        return (
+            _MODEL_DEFAULTS["claude"],
+            _MODEL_DEFAULTS["grok"],
+            _MODEL_DEFAULTS["cursor"],
+        )
 
     claude_default = "default"
     try:
@@ -574,16 +669,24 @@ def _load_model_defaults(now=None):
     except Exception:
         pass
 
+    cursor_default = None
+    try:
+        cursor_default = _cursor_config_model(read_json(CURSOR_CONFIG_PATH) or {})
+    except Exception:
+        pass
+
     _MODEL_DEFAULTS["claude"] = claude_default
     _MODEL_DEFAULTS["grok"] = grok_default
+    _MODEL_DEFAULTS["cursor"] = cursor_default
     _MODEL_DEFAULTS["loaded_at"] = now
-    return claude_default, grok_default
+    return claude_default, grok_default, cursor_default
 
 
 def reset_model_defaults():
     """Test helper: drop the 60s config cache."""
     _MODEL_DEFAULTS["claude"] = None
     _MODEL_DEFAULTS["grok"] = None
+    _MODEL_DEFAULTS["cursor"] = None
     _MODEL_DEFAULTS["loaded_at"] = 0.0
 
 
@@ -825,6 +928,8 @@ def _reattach_dispatch_orphans(nodes, roots):
             "claude_cli": "claude",
             "grok": "grok",
             "grok_cli": "grok",
+            "cursor": "cursor",
+            "cursor_cli": "cursor",
         }.get(lk, lk)
         if want and parent.get("kind") != want:
             kept.append(r)
@@ -855,17 +960,17 @@ def build_cli_forest(snap, now=None):
     """Collapse shims and reattach keep-nodes: pure function on a process snap.
 
     1. Classify from ONE snap.
-    2. Keep-nodes: claude_cli | grok_cli | agent_dispatch only.
-    3. Never emit: grok_ask, pure shells, switchboard_daemon, Claude.app, viewer.
+    2. Keep-nodes: claude_cli | grok_cli | cursor_cli | agent_dispatch only.
+    3. Never emit: grok_ask, cursor_ask, pure shells, switchboard_daemon,
+       Claude.app, viewer.
     4. Re-parent each keep-node to the first keep-node on its ancestor chain
        (walk at most 10). Roots = keep-nodes with no keep-ancestor.
-    5. Labels: agent_dispatch task/lane; grok channel from nearest collapsed
-       grok_ask + task/lane from agent_dispatch ancestor; claude tty or
-       (exec-master) when headless/-p.
-    6. kind enum out: claude | grok | agent_dispatch (+ virtual grok-sub
-       children grafted onto resumed grok nodes for in-process native
-       subagents; pid null, virtual true, excluded from claude/grok counts,
-       totalled in counts.grok_subagents). Counts exclude agent_dispatch.
+    5. Labels: agent_dispatch task/lane; grok/cursor channel from nearest
+       collapsed grok_ask/cursor_ask + task/lane from agent_dispatch ancestor;
+       claude tty or (exec-master) when headless/-p.
+    6. kind enum out: claude | grok | cursor | agent_dispatch (+ virtual
+       grok-sub children grafted onto resumed grok nodes). Counts exclude
+       agent_dispatch. Cursor slaves that are real OS processes nest via PPID.
     Every node carries both started and started_iso (same ISO string) + model.
     """
     now = now if now is not None else time.time()
@@ -874,12 +979,15 @@ def build_cli_forest(snap, now=None):
             "counts": {
                 "claude": {"interactive": 0, "headless": 0},
                 "grok": {"interactive": 0, "headless": 0},
+                "cursor": {"interactive": 0, "headless": 0},
                 "grok_subagents": 0,
+                "cursor_subagents": 0,
+                "totals": {"claude": 0, "grok": 0, "cursor": 0, "live": 0},
             },
             "roots": [],
         }
 
-    claude_def, grok_def = _load_model_defaults(now)
+    claude_def, grok_def, cursor_def = _load_model_defaults(now)
 
     # Classify every process once.
     kinds = {}  # pid -> kind or None
@@ -958,6 +1066,31 @@ def build_cli_forest(snap, now=None):
                 if not channel:
                     channel = tm.get("channel")
             label = channel
+        elif ikind == "cursor_cli":
+            ask = nearest_kind_ancestor(pid, "cursor_ask")
+            if ask is not None:
+                am = _parse_wrapper_flags(
+                    snap[ask].get("command") or "", "cursor_ask"
+                )
+                channel = am.get("channel")
+                if not meta.get("cwd_arg"):
+                    meta["cwd_arg"] = am.get("cwd_arg")
+                if not model:
+                    model = am.get("model")
+            td = nearest_kind_ancestor(pid, "agent_dispatch")
+            if td is not None:
+                tm = _parse_wrapper_flags(
+                    snap[td].get("command") or "", "agent_dispatch"
+                )
+                task = tm.get("task")
+                lane = tm.get("lane")
+                if not channel:
+                    channel = tm.get("channel")
+                if not model:
+                    model = tm.get("model")
+            if not model and channel:
+                model = cursor_channel_model(channel)
+            label = channel
         elif ikind == "claude_cli":
             if mode == "headless" or meta.get("headless_flag"):
                 # A dispatched Claude lane carries its identity on the
@@ -1009,6 +1142,8 @@ def build_cli_forest(snap, now=None):
                 model = claude_def
             elif ikind == "grok_cli":
                 model = grok_def
+            elif ikind == "cursor_cli":
+                model = cursor_def
             else:
                 model = None
 
@@ -1075,27 +1210,53 @@ def build_cli_forest(snap, now=None):
     counts = {
         "claude": {"interactive": 0, "headless": 0},
         "grok": {"interactive": 0, "headless": 0},
-        "grok_subagents": sub_total,
+        "cursor": {"interactive": 0, "headless": 0},
+        "grok_subagents": 0,
+        "cursor_subagents": 0,
     }
 
     def count_walk(node):
         k = node["kind"]
-        if k in ("claude", "grok"):
+        if k in ("claude", "grok", "cursor"):
             m = node["mode"] if node["mode"] in ("interactive", "headless") else "headless"
             counts[k][m] += 1
+        elif k == "grok-sub":
+            counts["grok_subagents"] += 1
+        elif k == "cursor-sub":
+            counts["cursor_subagents"] += 1
         for c in node.get("children") or []:
             count_walk(c)
 
     for r in roots:
         count_walk(r)
 
+    counts["totals"] = {
+        "claude": counts["claude"]["interactive"] + counts["claude"]["headless"],
+        "grok": (
+            counts["grok"]["interactive"]
+            + counts["grok"]["headless"]
+            + counts["grok_subagents"]
+        ),
+        "cursor": (
+            counts["cursor"]["interactive"]
+            + counts["cursor"]["headless"]
+            + counts["cursor_subagents"]
+        ),
+    }
+    counts["totals"]["live"] = (
+        counts["totals"]["claude"]
+        + counts["totals"]["grok"]
+        + counts["totals"]["cursor"]
+    )
+
     return {"counts": counts, "roots": roots}
 
 
 def cli_busy(snap=None):
-    """True if any claude_cli or grok_cli process is present (idle source).
+    """True if any claude_cli, grok_cli, or cursor_cli process is present.
 
-    Viewer / agent_dispatch / grok_ask / switchboard are NOT CLI instances.
+    Viewer / agent_dispatch / grok_ask / cursor_ask / switchboard are NOT CLI
+    instances.
     """
     if snap is None:
         snap = ps_cli_snapshot()
@@ -1104,7 +1265,7 @@ def cli_busy(snap=None):
     for rec in snap.values():
         cmd = rec["command"] if isinstance(rec, dict) else rec
         k = kind_from_command(cmd)
-        if k in ("claude_cli", "grok_cli"):
+        if k in ("claude_cli", "grok_cli", "cursor_cli"):
             return True
     return False
 
@@ -1168,7 +1329,8 @@ def get_cli_payload(boot_id=None, force=False, now=None):
         }
         print(
             f"switchboard cli: sweep {sweep_ms:.1f}ms "
-            f"(claude={forest['counts']['claude']} grok={forest['counts']['grok']})",
+            f"(claude={forest['counts']['claude']} grok={forest['counts']['grok']} "
+            f"cursor={forest['counts'].get('cursor')})",
             file=sys.stderr,
         )
         return payload
@@ -1346,6 +1508,28 @@ def heartbeat(slot):
             newest = max(newest, term_mt)
             if now - term_mt < 30:
                 growing = True
+
+    # cursor-ask lanes: channel jsonl is the activity heartbeat.
+    ch = slot.get("channel")
+    prog_base = slot.get("prog_base") or ""
+    if ch and (
+        prog_base == "cursor-ask"
+        or "cursor-ask" in (slot.get("prog") or "")
+        or slot.get("provider") == "cursor"
+    ):
+        log_p = os.path.join(CURSOR_LOG_DIR, "%s.jsonl" % ch)
+        mt = _file_mtime(log_p)
+        if mt:
+            newest = max(newest, mt)
+            if now - mt < 30:
+                growing = True
+        ev = _tail_last_json(log_p)
+        if isinstance(ev, dict) and last is None:
+            last = ev
+        st_p = os.path.join(CURSOR_CHANNEL_DIR, "%s.json" % ch)
+        mt = _file_mtime(st_p)
+        if mt:
+            newest = max(newest, mt)
 
     claude_p = claude_transcript_for(slot)
     if claude_p:

@@ -14,7 +14,11 @@ event-driven waits.
 
 ![Dashboard with 123 lanes across 5 tasks](assets/dashboard-123-lanes.png)
 
-![Grid view: busy multi-task board — CLI spawn tree plus concurrent task lanes (Claude + Grok headless workers)](assets/grid-cli-sessions.png)
+![Grid view: CLI spawn tree with Claude, Grok and Cursor sessions nested under their dispatch wrappers, plus concurrent task lanes](assets/grid-cli-sessions.png)
+
+Claude, Grok and Cursor are all first-class CLI kinds. A harness is named in
+the bars only while it has something live, so a Grok-only (or Claude-only)
+machine never sees the others.
 
 ## How it works
 
@@ -75,7 +79,7 @@ switchboard serve            # 127.0.0.1:17920, read-only
 | `GET /v1/tasks` | known task names |
 | `GET /v1/status[?task=T]` | derived lanes (includes `ended_s` for terminal rows) |
 | `GET /v1/events?task=T` | recent observation log (tail-read; rotates under size cap) |
-| `GET /v1/cli` | spawn-tree forest of live CLI sessions (claude / grok / agent_dispatch), including **virtual `grok-sub` rows** for a grok session's active in-process native subagents (pid-less, `virtual: true`, counted in `counts.grok_subagents`). Model is argv `-m` → session `current_model_id` → `[models].default` → `null` — never a hardcoded version. |
+| `GET /v1/cli` | spawn-tree forest of live CLI sessions (claude / grok / cursor / agent_dispatch), including **virtual `grok-sub` rows** for a grok session's active in-process native subagents (pid-less, `virtual: true`, counted in `counts.grok_subagents`). Cursor slaves are real OS processes and nest by ppid. `counts.totals` carries per-family totals plus `live`. Model is argv `-m` → session `current_model_id` → `[models].default` / cursor `cli-config` display id → `null` — never a hardcoded version. |
 | `GET /v1/advise?task=T` | current advise payload (closed `next` verb list) |
 | `GET /v1/wait?cursor=N[&task=T][&timeout=55]` | long-poll; returns within ~1s of a transition; `gap:true` if the cursor fell behind the ring |
 
@@ -97,7 +101,10 @@ A Tauri 2 desktop app (macOS + Windows) renders the daemon live: collapsible
 per-task sections, panel rows or dense lamp grid (auto past 15 lanes),
 attention-sorted DIED/FAILED, clickable state-filter tiles, event ticker,
 **CLI SESSIONS** tree (model chips, apply-ordering guard), and a **START
-DAEMON** button (launchd kickstart only — never kills lanes). Finished lanes
+DAEMON** button (launchd kickstart only — never kills lanes). The harness
+chips in the top bar and the CLI SESSIONS rollup name only the families that
+currently have a live instance — no `cursor 0` on a machine without Cursor,
+no `grok 0` on a machine without Grok. Finished lanes
 hide from the board after 30 minutes (`ended_s`); the CLI/JSON stay complete
 (presentation-only retention).
 
@@ -126,6 +133,7 @@ launch from a shell.
 | `AGENT_SWITCHBOARD_WORKER` | *(unset)* | default `--exec` worker for `agent-dispatch` |
 | `AGENT_SWITCHBOARD_MAX` | `10` | per-task capacity cap |
 | `AGENT_SWITCHBOARD_CHANNEL_DIR` | *(unset)* | optional channel→sessionId map for QUIET |
+| `AGENT_SWITCHBOARD_CURSOR_CHANNEL_DIR` | *(unset)* | second channel-state dir, searched after the first |
 | `AGENT_SWITCHBOARD_HOST` / `_PORT` | `127.0.0.1` / `17920` | daemon bind / ensure probe |
 | `AGENT_SWITCHBOARD_EVENTS_MAX_BYTES` | `1000000` | events.jsonl rotate threshold |
 | `AGENT_SWITCHBOARD_COLD_AFTER` | `86400` | cold-archive terminal slots (seconds) |
@@ -144,6 +152,9 @@ launch from a shell.
 | `AGENT_SWITCHBOARD_GROK_CONFIG` | `~/.grok/config.toml` | grok `[models].default` source |
 | `AGENT_SWITCHBOARD_CLAUDE_SETTINGS` | `~/.claude/settings.json` | claude default model |
 | `AGENT_SWITCHBOARD_CLAUDE_PROJECTS` | `~/.claude/projects` | claude transcript root |
+| `AGENT_SWITCHBOARD_CURSOR_CONFIG` | `~/.cursor/cli-config.json` | cursor default-model source |
+| `AGENT_SWITCHBOARD_CURSOR_CHANNELS` | `~/cursor-bridge/channels` | cursor bridge channel state |
+| `AGENT_SWITCHBOARD_CURSOR_LOGS` | `~/cursor-bridge/logs` | cursor bridge lane logs (activity) |
 | `AGENT_SWITCHBOARD_BIN` | *(unset)* | switchboard binary for `exec-master-stop-hook.py` |
 | `AGENT_SWITCHBOARD_EXEC_MASTER` | *(unset)* | `1` = treat hook caller as an exec-master |
 
@@ -154,7 +165,7 @@ would *terminate* the probed process — don't roll your own with it.)
 ## Tests
 
 ```bash
-bash tests/sb_test.sh    # 90 checks in an isolated temp state root
+bash tests/sb_test.sh    # 95 checks in an isolated temp state root
 ```
 
 Covers happy paths and the dangerous ones: silent kills, the finalize-window
@@ -162,8 +173,9 @@ DIED false alarm, stale-wrapper clobbering, parallel capacity races, corrupt
 slots, orphan lanes, path-escape names, first-sight publish, flocked events
 rotation, re-dispatch visibility, boot_id/gap, cold-archive, idle self-exit,
 SIGTERM drain, wait capacity 503, `/v1/cli` forest unit + live checks, model
-truth (no hardcoded fallback), launcher reattach, stall/advise/refuse, and
-the sample `SubagentStop` hook.
+truth (no hardcoded fallback), launcher reattach, cursor classification /
+ppid-nested slaves / model fallback, stall/advise/refuse, and the sample
+`SubagentStop` hook.
 
 ## License
 

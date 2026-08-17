@@ -110,6 +110,21 @@ Cursor's background/CLI agents (`cursor-agent`) wrap the same way:
 agent-dispatch --task mytask --lane fix-tests \
     --exec cursor-agent -- -p "make the test suite green" --output-format text
 ```
+`cursor-agent` is a first-class kind in `/v1/cli`: it is classified from argv0
+(including the versioned `~/.local/share/cursor-agent/versions/…` launcher and
+the `node …/cursor-agent/index.js` form), and Cursor slaves — real OS
+processes, unlike Grok's in-process subagents — nest under their parent by ppid.
+Model resolution is argv `-m` → channel state → `~/.cursor/cli-config.json`
+display id → `null`.
+
+As with Grok, if you drive Cursor through a bridge script (a thin `cursor-ask`
+wrapper exposing `-c` / `-d` / `-m`), wrap the bridge rather than the raw
+binary: the wrapper is collapsed out of the forest and its channel becomes the
+lane's label. Point `AGENT_SWITCHBOARD_CURSOR_CHANNEL_DIR` at the bridge's
+channel-state dir so a resumed channel keeps its session id, and
+`AGENT_SWITCHBOARD_CURSOR_LOGS` at its per-lane logs so activity/QUIET is
+derived for free.
+
 For IDE-side agents you can't wrap, you still get the observe side: have your
 orchestrator watch their declared output artifact with
 `switchboard wait --watch-file <artifact>`.
@@ -118,8 +133,8 @@ orchestrator watch their declared output artifact with
 If it runs from a shell, `--exec <prog>` wraps it. If you can't wrap it,
 `--watch-file` its output. The HTTP long-poll (`/v1/wait?cursor=N`) serves
 dashboards, TVs, and other tools without polling cost. The `/v1/cli` forest
-classifies live claude/grok processes (and `agent-dispatch` nodes) for the
-viewer's CLI SESSIONS panel.
+classifies live claude/grok/cursor processes (and `agent-dispatch` nodes) for
+the viewer's CLI SESSIONS panel; a harness you don't run simply never appears.
 
 ## Notes
 - Capacity: the wrapper refuses dispatch past the configured cap (exit 2) —

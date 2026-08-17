@@ -48,7 +48,10 @@ ROOT = os.environ.get(
     os.path.expanduser("~/.agent-switchboard/state"),
 )
 DEFAULT_WORKER = os.environ.get("AGENT_SWITCHBOARD_WORKER", "")
+# Channel-state dirs, searched in order. A bridge writes <channel>.json with
+# sessionId/model; set the second one when you run a mixed grok+cursor fleet.
 CHANNEL_DIR = os.environ.get("AGENT_SWITCHBOARD_CHANNEL_DIR", "")
+CURSOR_CHANNEL_DIR = os.environ.get("AGENT_SWITCHBOARD_CURSOR_CHANNEL_DIR", "")
 DEFAULT_PORT = 17920
 LAUNCHD_LABEL = "com.agent-switchboard"
 # Test-only kill switches — mirror bin/switchboard's. ENSURE_DISABLE must be
@@ -283,8 +286,8 @@ def append_event(tdir, event):
 
 
 def extract_worker_meta(worker_args):
-    """Pull -c/--channel and -d/--cwd (spaced or = forms) for metadata."""
-    channel = cwd = None
+    """Pull -c/--channel, -d/--cwd, and -m/--model (spaced or = forms)."""
+    channel = cwd = model = None
     i = 0
     while i < len(worker_args):
         a = worker_args[i]
@@ -296,12 +299,33 @@ def extract_worker_meta(worker_args):
             cwd = worker_args[i + 1]
             i += 2
             continue
+        if a in ("-m", "--model") and i + 1 < len(worker_args):
+            model = worker_args[i + 1]
+            i += 2
+            continue
         if a.startswith("--channel="):
             channel = a.split("=", 1)[1]
         elif a.startswith("--cwd="):
             cwd = a.split("=", 1)[1]
+        elif a.startswith("--model="):
+            model = a.split("=", 1)[1]
+        elif a.startswith("-m=") and len(a) > 3:
+            model = a.split("=", 1)[1]
         i += 1
-    return channel, cwd
+    return channel, cwd, model
+
+
+def _read_channel_state(channel):
+    """First channel dir that has state for this channel. Same keys either way."""
+    if not channel:
+        return None
+    for root in (CHANNEL_DIR, CURSOR_CHANNEL_DIR):
+        if not root:
+            continue
+        data = read_json(os.path.join(root, f"{channel}.json"))
+        if data:
+            return data
+    return None
 
 
 def _classify_launcher_cmd(command):
@@ -316,6 +340,16 @@ def _classify_launcher_cmd(command):
         if len(toks) >= 2 and toks[1] == "leader":
             return None
         return "grok"
+    if (
+        b0 in ("cursor-agent", "cursor")
+        or a0.endswith("/cursor-agent")
+        or "/.local/share/cursor-agent/" in a0
+        or "/cursor-agent/versions/" in command
+    ):
+        return "cursor"
+    toks = command.split()
+    if b0 == "node" and any("cursor-agent" in t for t in toks[:8]):
+        return "cursor"
     return None
 
 
@@ -423,12 +457,14 @@ def main():
     if cap is None:
         cap = int(os.environ.get("AGENT_SWITCHBOARD_MAX", "10"))
 
-    channel, cwd = extract_worker_meta(worker_args)
+    channel, cwd, model = extract_worker_meta(worker_args)
     session_id = None
-    if channel and CHANNEL_DIR:
-        ch = read_json(os.path.join(CHANNEL_DIR, f"{channel}.json"))
+    if channel:
+        ch = _read_channel_state(channel)
         if ch:
             session_id = ch.get("sessionId")  # resumed channel -> same session
+            if not model:
+                model = ch.get("model") or None
 
     run_id = uuid.uuid4().hex
 
@@ -500,6 +536,7 @@ def main():
             "channel": channel,
             "cwd": cwd,
             "session_id": session_id,
+            "model": model,
             "report": args.report,
             "started": time.time(),
             "exit_code": None,

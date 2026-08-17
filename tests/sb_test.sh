@@ -357,7 +357,7 @@ snap_i = {
         200,
         "??",
         "/usr/bin/Python /usr/local/bin/agent-dispatch "
-        "--task mytask --lane worker-1 --report /tmp/r.md -- "
+        "--task mytask --lane spike-x --report /tmp/r.md -- "
         "grok-ask -w -c ch-x",
     ),
     400: rec(
@@ -388,7 +388,7 @@ assert_true(roots_i[0].get("started") and roots_i[0].get("started_iso"), "i: sta
 assert_true(roots_i[0]["started"] == roots_i[0]["started_iso"], "i: started == started_iso")
 kids = roots_i[0]["children"]
 assert_true(len(kids) == 1 and kids[0]["kind"] == "agent_dispatch", "i: agent_dispatch under claude")
-assert_true(kids[0]["label"] == "mytask/worker-1", "i: agent_dispatch label task/lane")
+assert_true(kids[0]["label"] == "mytask/spike-x", "i: agent_dispatch label task/lane")
 gk = kids[0]["children"]
 assert_true(len(gk) == 1 and gk[0]["kind"] == "grok", "i: grok under agent_dispatch")
 assert_true(gk[0].get("channel") == "ch-x" or gk[0].get("label") == "ch-x", "i: grok channel")
@@ -541,10 +541,10 @@ for key in ("ts","boot_id","counts","roots"):
     if key not in d1:
         ok=False; msgs.append("missing "+key)
 c=d1.get("counts") or {}
-if not (isinstance(c.get("claude"), dict) and isinstance(c.get("grok"), dict)):
-    ok=False; msgs.append("counts not nested interactive/headless")
+if not (isinstance(c.get("claude"), dict) and isinstance(c.get("grok"), dict) and isinstance(c.get("cursor"), dict)):
+    ok=False; msgs.append("counts not nested interactive/headless (claude/grok/cursor)")
 else:
-    for k in ("claude","grok"):
+    for k in ("claude","grok","cursor"):
         for m in ("interactive","headless"):
             if m not in c[k]:
                 ok=False; msgs.append("counts.%s missing %s"%(k,m))
@@ -556,7 +556,7 @@ def walk(nodes):
         yield n
         yield from walk(n.get("children") or [])
 for n in walk(d1.get("roots")):
-    if n.get("kind") not in ("claude","grok","agent_dispatch","grok-sub"):
+    if n.get("kind") not in ("claude","grok","cursor","agent_dispatch","grok-sub","cursor-sub"):
         ok=False; msgs.append("bad kind "+str(n.get("kind")))
     if "started" not in n or "started_iso" not in n:
         ok=False; msgs.append("missing started pair on pid %s"%n.get("pid"))
@@ -1112,7 +1112,7 @@ json.dump({
 snap = {
     100: rec(100, 1, "ttys001", "claude"),
     300: rec(300, 1, "??",
-             "/usr/bin/Python /usr/local/bin/agent-dispatch --task demo --lane bee -- grok-ask -w"),
+             "/usr/bin/Python /tmp/bin/agent-dispatch --task demo --lane bee -- grok-ask -w"),
     500: rec(500, 300, "??", "/home/user/.grok/bin/grok -p hi"),
 }
 forest = sb.build_cli_forest(snap, now=NOW)
@@ -1176,7 +1176,149 @@ if [ $? -eq 0 ]; then
   ck ok ok "T35j stale launcher stays root"
   ck ok ok "T35k last_active sid match for long-lived TUI"
 else
-  ck fail ok "T35 v1.3.0 unit block"
+  ck fail ok "T35 v0.3.0 unit block"
+fi
+
+# T40: Cursor is a first-class CLI kind (classify, forest, model, counts)
+python3 - "$SB" <<'EOF'
+import importlib.machinery, importlib.util, sys, os, json, tempfile, shutil, time
+
+loader = importlib.machinery.SourceFileLoader("sb", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+sb = importlib.util.module_from_spec(spec)
+loader.exec_module(sb)
+
+NOW = 1723252800.0
+LSTART = "Fri Aug  9 12:00:00 2024"
+
+def rec(pid, ppid, tty, command, lstart=LSTART):
+    return {"pid": pid, "ppid": ppid, "tty": tty, "lstart": lstart, "command": command}
+
+def find(nodes, pred):
+    for n in nodes:
+        if pred(n):
+            return n
+        hit = find(n.get("children") or [], pred)
+        if hit:
+            return hit
+    return None
+
+def assert_true(cond, msg):
+    if not cond:
+        print("FAIL_ASSERT", msg)
+        sys.exit(1)
+
+CA = "/home/user/.local/share/cursor-agent/versions/2026.08.11-e8db854/cursor-agent"
+ASK = "/usr/local/bin/cursor-ask"
+
+assert_true(sb.kind_from_command(CA + " -p hi") == "cursor_cli", "cursor-agent is cursor_cli")
+assert_true(
+    sb.kind_from_command("/bin/bash %s -w -c ch-x" % ASK) == "cursor_ask",
+    "bash cursor-ask is cursor_ask",
+)
+assert_true(sb.kind_from_command(ASK + " -w -c ch-x") == "cursor_ask", "bare cursor-ask")
+assert_true(
+    sb.kind_from_command("node %s/index.js -p hi" % os.path.dirname(CA)) == "cursor_cli",
+    "node + cursor-agent path",
+)
+assert_true(
+    sb.kind_from_command("/home/user/.grok/bin/agent -p hi") == "grok_cli",
+    "grok agent is still grok (not cursor)",
+)
+
+tmp = tempfile.mkdtemp(prefix="sb-t40-")
+try:
+    cfg = os.path.join(tmp, "cli-config.json")
+    json.dump({
+        "model": {
+            "modelId": "default",
+            "displayModelId": "auto",
+            "displayNameShort": "Auto",
+        },
+        "selectedModel": {"modelId": "default"},
+    }, open(cfg, "w"))
+    chdir = os.path.join(tmp, "channels")
+    os.makedirs(chdir)
+    json.dump({"channel": "ch-x", "sessionId": "sid-1", "model": "composer"},
+              open(os.path.join(chdir, "ch-x.json"), "w"))
+    sb.CURSOR_CONFIG_PATH = cfg
+    sb.CURSOR_CHANNEL_DIR = chdir
+    sb.reset_model_defaults()
+
+    snap = {
+        100: rec(100, 1, "ttys001", "claude"),
+        300: rec(
+            300, 100, "??",
+            "/usr/bin/Python /usr/local/bin/agent-dispatch "
+            "--task teamcursor --lane exec-a --exec %s -- "
+            "-w -c ch-x -m composer -d /tmp/lane" % ASK,
+        ),
+        400: rec(400, 300, "??", "/bin/bash %s -w -c ch-x -m composer -d /tmp/lane" % ASK),
+        500: rec(
+            500, 400, "??",
+            CA + " -p PROMPT --output-format json --trust --workspace /tmp/lane "
+            "--model composer --force",
+        ),
+        600: rec(600, 500, "??", CA + " -p SLAVE --workspace /tmp/lane --model gpt-5"),
+    }
+    forest = sb.build_cli_forest(snap, now=NOW)
+    roots = forest["roots"]
+    assert_true(len(roots) == 1 and roots[0]["kind"] == "claude", "claude root")
+    td = roots[0]["children"]
+    assert_true(len(td) == 1 and td[0]["kind"] == "agent_dispatch", "agent_dispatch under claude")
+    kids = td[0]["children"]
+    assert_true(len(kids) == 1 and kids[0]["kind"] == "cursor", "cursor under dispatch")
+    assert_true(kids[0].get("channel") == "ch-x" or kids[0].get("label") == "ch-x", "channel")
+    assert_true(kids[0].get("model") == "composer", "model from --model")
+    assert_true(kids[0]["mode"] == "headless", "headless via -p")
+    slaves = kids[0]["children"]
+    assert_true(len(slaves) == 1 and slaves[0]["kind"] == "cursor", "slave cursor nests via PPID")
+    assert_true(slaves[0].get("model") == "gpt-5", "slave model from --model")
+    assert_true(forest["counts"]["cursor"]["headless"] == 2, "counts.cursor.headless == 2")
+    assert_true(forest["counts"]["cursor"]["interactive"] == 0, "no interactive cursor")
+    kinds = []
+    def walk(ns):
+        for n in ns:
+            kinds.append(n["kind"])
+            walk(n.get("children") or [])
+    walk(roots)
+    assert_true("cursor_ask" not in kinds, "cursor_ask not emitted")
+
+    # Interactive cursor TUI is a root with tty; model falls back to cli-config
+    sb.reset_model_defaults()
+    forest_i = sb.build_cli_forest(
+        {9: rec(9, 1, "ttys007", CA)},
+        now=NOW,
+    )
+    node = find(forest_i["roots"], lambda n: n["pid"] == 9)
+    assert_true(node and node["kind"] == "cursor", "interactive cursor root")
+    assert_true(node["mode"] == "interactive" and node["tty"] == "ttys007", "tty")
+    assert_true(node.get("model") == "auto", "cli-config displayModelId fallback")
+    assert_true(forest_i["counts"]["cursor"]["interactive"] == 1, "interactive count")
+
+    # Channel state model when argv has none
+    sb.reset_model_defaults()
+    forest_ch = sb.build_cli_forest({
+        10: rec(10, 1, "??", "/bin/bash %s -w -c ch-x -d /tmp/lane" % ASK),
+        11: rec(11, 10, "??", CA + " -p HI --workspace /tmp/lane --force"),
+    }, now=NOW)
+    cur = find(forest_ch["roots"], lambda n: n["kind"] == "cursor")
+    assert_true(cur and cur.get("model") == "composer", "model from cursor-ask channel")
+
+    # cli_busy includes cursor
+    assert_true(sb.cli_busy({12: rec(12, 1, "??", CA + " -p hi")}) is True, "cli_busy cursor")
+    print("ALL_T40_OK")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+EOF
+if [ $? -eq 0 ]; then
+  ck ok ok "T40a cursor-agent classified as cursor"
+  ck ok ok "T40b cursor-ask collapsed; cursor under agent_dispatch"
+  ck ok ok "T40c slave cursor nests via PPID with own model"
+  ck ok ok "T40d interactive cursor + cli-config model fallback"
+  ck ok ok "T40e channel-state model + cli_busy"
+else
+  ck fail ok "T40 cursor first-class kind unit block"
 fi
 
 # T36: refuse event is written
