@@ -388,7 +388,11 @@ def kind_from_command(command):
     if b0 == "node" and any("cursor-agent" in t for t in toks[:8]):
         return "cursor_cli"
 
-    if b0 in ("claude", "claude.exe") or a0.endswith("/claude") or a0.endswith(
+    # Case-insensitive: Claude Code rewrites its process title to "CLAUDE"
+    # (observed 2026-08-20, Fable 5 session), which made whole session trees
+    # vanish and orphaned their cursor/grok children to top level.
+    b0_l, a0_l = b0.lower(), a0.lower()
+    if b0_l in ("claude", "claude.exe") or a0_l.endswith("/claude") or a0_l.endswith(
         "/claude.exe"
     ):
         return "claude_cli"
