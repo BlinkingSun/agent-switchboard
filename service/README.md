@@ -1,6 +1,9 @@
 # Running the daemon at login
 
-The daemon is read-only and binds 127.0.0.1 only.
+The daemon is read-only and binds 127.0.0.1 only. Configuration (including
+`AGENT_SWITCHBOARD_DONE_EXPIRE`, `AGENT_SWITCHBOARD_AGENTS_MAX_BYTES`, and
+`AGENT_SWITCHBOARD_REAPER`) is via environment variables — see the main
+[README](../README.md#configuration).
 
 ## macOS (launchd)
 

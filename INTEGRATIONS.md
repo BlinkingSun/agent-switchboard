@@ -21,9 +21,33 @@ Plus an HTTP API for tools/UIs on `127.0.0.1:17920` (`switchboard serve`):
 | `GET /v1/tasks` | task list |
 | `GET /v1/status[?task=T]` | lanes with derived `state`; terminal rows include `ended_s` |
 | `GET /v1/events?task=T` | observation log tail |
-| `GET /v1/cli` | spawn-tree forest (`kind`: `claude` \| `grok` \| `agent_dispatch`, plus pid-less virtual `grok-sub` children on grok nodes; optional `model`) |
+| `GET /v1/cli` | spawn-tree forest (`kind`: `claude` \| `grok` \| `cursor` \| `agent_dispatch`, plus pid-less virtual `grok-sub` children on grok nodes; per-node `status`: `running` \| `active` \| `completed` \| `cancelled` \| `failed` \| `error`; optional `model`) |
 | `GET /v1/advise?task=T` | current advise payload (closed `next` verbs) |
 | `GET /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55]` | long-poll; `gap:true` if cursor behind ring; HTTP 503 + `Retry-After` when wait capacity is full |
+
+### Hub, iOS, and other API consumers
+
+Remote dashboards (hub relay, iOS viewer, custom tools) consume the same GET
+endpoints. Payload changes are **additive only** — new fields may appear, but
+existing keys are not renamed or removed without a major version bump.
+
+What changes for consumers:
+
+- **Status passthrough:** lane rows keep derived `state` as today; `/v1/cli`
+  nodes now carry a parallel `status` field (`running` through `error`) for
+  the spawn-tree panel.
+- **Terminal retention:** `/v1/status` lane rows carry `ended_s` on terminal
+  DONE/FAILED/DIED slots and drop from served output after
+  `AGENT_SWITCHBOARD_DONE_EXPIRE` (default 15 minutes). Ended `/v1/cli` nodes
+  do **not** expose `ended_s` or an end timestamp — `_node_from_ledger` emits
+  only start-side `started` / `started_iso` plus terminal `status`; consumers
+  must not look for a missing field. Both halves use the same expiry window
+  internally. Slot files remain on disk until `AGENT_SWITCHBOARD_COLD_AFTER`
+  (24h).
+- **Agent ledger:** `switchboard agents` reads the same start/end records the
+  daemon uses to merge ended CLI nodes; consumers can poll `/v1/cli` alone.
+
+Clients should tolerate unknown fields and absent optional keys.
 
 Everything is **OBSERVE/ALERT ONLY by default**: the switchboard never kills, restarts, or
 re-dispatches — your orchestrator reads the alerts and decides. Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only (no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes. (The viewer
@@ -148,7 +172,10 @@ the viewer's CLI SESSIONS panel; a harness you don't run simply never appears.
   (RUNNING/DIED) is unaffected.
 - `AGENT_SWITCHBOARD_ROOT` relocates all state (useful for tests/CI).
 - Memory hygiene: `events.jsonl` rotates at `AGENT_SWITCHBOARD_EVENTS_MAX_BYTES`;
-  terminal slots cold-archive after `AGENT_SWITCHBOARD_COLD_AFTER` (default 24h).
+  `agents.jsonl` rotates at `AGENT_SWITCHBOARD_AGENTS_MAX_BYTES` (32MB, one
+  `.1` sibling); terminal slots cold-archive after `AGENT_SWITCHBOARD_COLD_AFTER`
+  (default 24h). Served status and `/v1/cli` omit terminal rows after
+  `AGENT_SWITCHBOARD_DONE_EXPIRE` (default 15 min).
 - Lifecycle: idle self-exit after `AGENT_SWITCHBOARD_IDLE_GRACE` when no CLI,
   viewer, or active slot is present; `/v1/wait` returns 503 past
   `AGENT_SWITCHBOARD_WAIT_CAP` concurrent waiters.

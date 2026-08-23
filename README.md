@@ -56,6 +56,9 @@ switchboard status [--task mytask] [--json]
 # advise payload and always writes state/<task>/advise.json
 switchboard wait --task mytask [--lane worker-1] [--watch-file PHASE.txt] --timeout 570 --json
 switchboard advise --task mytask
+
+# audit — live CLI/subagent ledger (orchestration tuning, runaway detection)
+switchboard agents [--since 15m] [--live] [--json]
 ```
 
 `agent-dispatch` also enforces a per-task capacity cap (refusal = exit 2,
@@ -80,9 +83,65 @@ switchboard serve            # 127.0.0.1:17920, read-only
 | `GET /v1/tasks` | known task names |
 | `GET /v1/status[?task=T]` | derived lanes (includes `ended_s` for terminal rows) |
 | `GET /v1/events?task=T` | recent observation log (tail-read; rotates under size cap) |
-| `GET /v1/cli` | spawn-tree forest of live CLI sessions (claude / grok / cursor / agent_dispatch), including **virtual `grok-sub` rows** for a grok session's active in-process native subagents (pid-less, `virtual: true`, counted in `counts.grok_subagents`). Cursor slaves are real OS processes and nest by ppid. `counts.totals` carries per-family totals plus `live`. Model is argv `-m` → session `current_model_id` → `[models].default` / cursor `cli-config` display id → `null` — never a hardcoded version. |
+| `GET /v1/cli` | spawn-tree forest of live CLI sessions (claude / grok / cursor / agent_dispatch), including **virtual `grok-sub` rows** for a grok session's active in-process native subagents (pid-less, `virtual: true`, counted in `counts.grok_subagents`). Cursor slaves are real OS processes and nest by ppid. Each node carries `status` (see below). `counts.totals` carries per-family totals plus `live`. |
 | `GET /v1/advise?task=T` | current advise payload (closed `next` verb list) |
-| `GET /v1/wait?cursor=N[&task=T][&timeout=55]` | long-poll; returns within ~1s of a transition; `gap:true` if the cursor fell behind the ring |
+| `GET /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55]` | long-poll; returns within ~1s of a transition; `gap:true` if the cursor fell behind the ring; HTTP 503 + `Retry-After` when wait capacity is full |
+
+### `/v1/cli` node `status`
+
+Vocabulary: `running` | `active` | `completed` | `cancelled` | `failed` | `error`.
+
+| Status | Meaning |
+|---|---|
+| `running` | live OS process, CPU not yet showing activity |
+| `active` | live process with recent CPU growth, or a live non-virtual child |
+| `completed` | terminal success (exit 0, or grok-sub `meta.json` done) |
+| `cancelled` | confirm-file reap of a STALLED or ORPHAN worker, or grok-sub `meta.json` cancel |
+| `failed` | terminal non-zero exit |
+| `error` | died without clean finalization (`DIED` slot state) |
+
+Live nodes: first observation → `running` unless a live non-virtual child is
+present (`active`); later ticks compare CPU-time delta (≥0.05s over a ≥1s gap →
+`active`, else `running`). Virtual `grok-sub` rows mirror `meta.json` status
+(never CPU-derived). Ended nodes are merged from the agent ledger until
+`AGENT_SWITCHBOARD_DONE_EXPIRE` past their end timestamp (same 15-min served-board
+retention as terminal lane rows). A cache hit may serve status up to
+`AGENT_SWITCHBOARD_CLI_CACHE_TTL` (5s) stale.
+
+**Classifier identity:** `kind_from_command` uses **argv0 and early argv
+position only** — flag values and prompt text never determine kind. Bridge
+scripts (`grok-ask`, `cursor-ask`) collapse out; their channel becomes the
+lane label.
+
+**Model fill:** argv **end-scan** for `-m` / `--model` on `claude`, `grok`, and
+`cursor` keep nodes (wrapper scripts `grok-ask` / `cursor-ask` /
+`agent-dispatch` still use early-token scan) → bridge inheritance → grok
+session `current_model_id` or cursor channel-state model → installed default:
+Claude `"default"` string / grok `[models].default` / cursor `cli-config.json`
+display id → `null` when grok or cursor has no configured default. Never a
+hardcoded version string.
+
+### Agent ledger (`switchboard agents`)
+
+Append-only audit trail at `$AGENT_SWITCHBOARD_ROOT/agents.jsonl` (single
+`agents.jsonl.1` rollover at `AGENT_SWITCHBOARD_AGENTS_MAX_BYTES`, default
+32MB). Purpose: orchestration tuning and runaway detection across every CLI
+session and grok in-process subagent.
+
+| Record | Shape |
+|---|---|
+| `start` | `ev`, `ts`, `id`, `kind`, `pid`, `parents`, `channel`, `label`, `model`, `cwd`, `task`, `lane`, `observed` (`live` \| `posthoc`) |
+| `end` | `ev`, `ts`, `id`, `status`, `ended_source` (`slot`, `meta`, `gone`, `reap`) |
+
+```bash
+switchboard agents [--since 15m] [--live] [--json] [--ensure]
+```
+
+`--since` (default `15m`): ended-row window as `<int><s|m|h|d>` (e.g. `90s`,
+`2h`). `--live`: `running`/`active` nodes from a live sweep only (no ended
+rows). `--json`: `{"running":[...],"ended":[{"start":...,"end":...}],
+"counts":{"running":N,"ended":M}}`. Human output prints `RUNNING` / `ENDED`
+sections then a `running=N ended=M` summary line.
 
 CLI and status also support best-effort daemon wake-up via `--ensure` or
 `AGENT_SWITCHBOARD_ENSURE=1` (launchd kickstart on macOS when the health probe
@@ -139,7 +198,9 @@ launch from a shell.
 | `AGENT_SWITCHBOARD_HOST` / `_PORT` | `127.0.0.1` / `17920` | daemon bind / ensure probe |
 | `AGENT_SWITCHBOARD_EVENTS_MAX_BYTES` | `1000000` | events.jsonl rotate threshold |
 | `AGENT_SWITCHBOARD_COLD_AFTER` | `86400` | cold-archive terminal slots (seconds) |
-| `AGENT_SWITCHBOARD_DONE_EXPIRE` | `900` | omit terminal (DONE/FAILED/DIED) rows from served status/board after this many seconds; `0` disables. Slot files stay until `COLD_AFTER` |
+| `AGENT_SWITCHBOARD_DONE_EXPIRE` | `900` | omit terminal (DONE/FAILED/DIED) rows from served status/board and ended `/v1/cli` nodes after this many seconds; `0` disables. Slot files stay until `COLD_AFTER` |
+| `AGENT_SWITCHBOARD_AGENTS_MAX_BYTES` | `33554432` (32MB) | `agents.jsonl` rotate threshold (one `.1` sibling) |
+| `AGENT_SWITCHBOARD_REAPER` | *(unset)* | `1` enables CLI-only `switchboard reap` (default off; see [OBSERVE/ALERT contract](#how-it-works)) |
 | `AGENT_SWITCHBOARD_BUS_MAXLEN` | `2000` | in-memory event-bus ring size |
 | `AGENT_SWITCHBOARD_CLI_CACHE_TTL` | `5.0` | `/v1/cli` snapshot reuse (seconds) |
 | `AGENT_SWITCHBOARD_IDLE_GRACE` | `300` | idle self-exit grace (seconds) |
@@ -161,6 +222,9 @@ launch from a shell.
 | `AGENT_SWITCHBOARD_BIN` | *(unset)* | switchboard binary for `exec-master-stop-hook.py` |
 | `AGENT_SWITCHBOARD_EXEC_MASTER` | *(unset)* | `1` = treat hook caller as an exec-master |
 
+`AGENT_SWITCHBOARD_INVESTIGATOR` is a reserved name (spawn deferred; not read by
+this release).
+
 Python 3.9+ stdlib only — no dependencies. macOS / Linux / Windows.
 (Windows liveness uses `OpenProcess` via ctypes; `os.kill(pid, 0)` there
 would *terminate* the probed process — don't roll your own with it.)
@@ -168,7 +232,7 @@ would *terminate* the probed process — don't roll your own with it.)
 ## Tests
 
 ```bash
-bash tests/sb_test.sh    # 95 checks in an isolated temp state root
+bash tests/sb_test.sh    # 186 checks in an isolated temp state root
 ```
 
 Covers happy paths and the dangerous ones: silent kills, the finalize-window
