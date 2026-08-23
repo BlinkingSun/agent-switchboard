@@ -14,6 +14,8 @@ State layout ($AGENT_SWITCHBOARD_ROOT, default ~/.agent-switchboard/state):
   <task>/slot-<lane>.json   written by agent-dispatch, derived fields on read
   <task>/events.jsonl       append-only observation log
   <task>/history/           archived slots from finished/replaced lanes
+  agents.jsonl              append-only CLI/subagent ledger (start/end)
+  agents.jsonl.1            single size-cap rollover sibling
 
 Derived states:
   RUNNING        worker pid alive with recent/unknown activity — ALSO shown
@@ -40,6 +42,7 @@ Commands:
                      [--json] [--stay] [--advise PATH]
   switchboard advise --task T [--json]
   switchboard events --task T [-n N]
+  switchboard agents [--since DUR] [--live] [--json]
   switchboard serve  [--host 127.0.0.1] [--port 17920]
 
 wait exit codes: 0 = event occurred (or all watched lanes already terminal),
@@ -48,7 +51,9 @@ ORPHAN/CORRUPT/STALLED/WAITING_INPUT, on refuse events, on --watch-file
 changes, and (with --alert-quiet) on QUIET. QUIET alone is not a wake.
 
 serve HTTP API (read-only): GET /v1/health /v1/tasks /v1/status /v1/events
-/v1/cli (spawn-tree forest of claude/grok/cursor/agent_dispatch nodes),
+/v1/cli (spawn-tree forest of claude/grok/cursor/agent_dispatch nodes,
+each stamped with status in running|active|completed|cancelled|failed|error;
+a cache hit may serve status up to CLI_CACHE_TTL (5s) stale),
 GET /v1/advise?task=T, and long-poll
 /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55].
 
@@ -56,7 +61,9 @@ Status rows carry ended_s for terminal lanes (seconds since finish; source:
 slot 'ended', else last terminal transition in events.jsonl, else slot file
 mtime). Served status/board output omits terminal slots (DONE/FAILED/DIED)
 once ended_s is past AGENT_SWITCHBOARD_DONE_EXPIRE (default 900s); slot
-files stay on disk until COLD_AFTER. 15-min served-board retention
+files stay on disk until COLD_AFTER. ORPHAN is never omitted (it is in
+wait's TERMINAL but not TERMINAL_STATES). The same _done_expire() knob
+omits ended CLI/ledger nodes from /v1/cli. 15-min served-board retention
 (daemon-side, all UIs inherit).
 
 PID-reuse hardening: on POSIX every liveness pass takes ONE `ps` snapshot and
@@ -120,9 +127,13 @@ DEFAULT_STALL_AFTER = float(os.environ.get("AGENT_SWITCHBOARD_STALL_AFTER", 90))
 DEFAULT_STALL_INTERACTIVE = float(os.environ.get("AGENT_SWITCHBOARD_STALL_INTERACTIVE", 900))
 DEFAULT_PORT = 17920
 EVENTS_MAX_BYTES = int(os.environ.get("AGENT_SWITCHBOARD_EVENTS_MAX_BYTES", 1_000_000))
+# Ledger size cap (bytes). Import-time fallback only; live reads go through
+# _agents_max_bytes(). Single .1 rollover; mid-write rotation is replace-then-append.
+AGENTS_MAX_BYTES = int(os.environ.get("AGENT_SWITCHBOARD_AGENTS_MAX_BYTES", 32 * 1024 * 1024))
 COLD_AFTER = float(os.environ.get("AGENT_SWITCHBOARD_COLD_AFTER", 86400))
-# Board-omit window for terminal (DONE/FAILED/DIED) rows in task_status.
-# Import-time fallback only; live reads go through _done_expire(). 0 disables.
+# Board-omit window for terminal (DONE/FAILED/DIED) rows in task_status
+# AND ended CLI/ledger nodes on /v1/cli. Import-time fallback only; live
+# reads go through _done_expire(). 0 disables.
 DONE_EXPIRE_S = float(os.environ.get("AGENT_SWITCHBOARD_DONE_EXPIRE", 900))
 BUS_MAXLEN = int(os.environ.get("AGENT_SWITCHBOARD_BUS_MAXLEN", 2000))
 CLI_CACHE_TTL = float(os.environ.get("AGENT_SWITCHBOARD_CLI_CACHE_TTL", 5.0))
@@ -214,11 +225,22 @@ else:
 # ---------------------------------------------------------------- CLI detect + forest
 # CLI forest: classify from argv0/path only; collapse shims; reattach to keep-nodes.
 
-PS_CLI_CMD = ["ps", "-axo", "pid=,ppid=,tty=,lstart=,command="]
+# time BEFORE lstart: lstart is the only multi-token field and must stay
+# adjacent to the greedy command tail.
+PS_CLI_CMD = ["ps", "-axo", "pid=,ppid=,tty=,time=,lstart=,command="]
+PS_CLI_CMD_LEGACY = ["ps", "-axo", "pid=,ppid=,tty=,lstart=,command="]
 # lstart is exactly 5 whitespace-separated tokens: Mon Aug  9 22:09:11 2026
 _PS_CLI_LINE = re.compile(
+    r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+"
+    r"(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$"
+)
+_PS_CLI_LINE_LEGACY = re.compile(
     r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+"
     r"(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$"
+)
+# Hub CLI_TREE_STATUSES. An out-of-vocabulary emit is a lane failure.
+CLI_TREE_STATUSES = frozenset(
+    {"running", "active", "completed", "cancelled", "failed", "error"}
 )
 _PYTHON_NAMES = {
     "Python",
@@ -250,26 +272,89 @@ _CLI_CACHE = {
     "sweep_count": 0,
 }
 _CLI_CACHE_LOCK = threading.Lock()
+# CPU-delta history for per-node status. Key (pid, lstart); lstart defeats
+# pid reuse. Guarded by _CLI_CACHE_LOCK. Written only on a real sweep.
+_CPU_PREV = {}
 _MODEL_DEFAULTS = {"claude": None, "grok": None, "cursor": None, "loaded_at": 0.0}
 
 
-def ps_cli_snapshot():
-    """Rich process map for CLI classification (argv0/path identity).
+def _parse_cputime(raw):
+    """Parse BSD MMMM:SS.cc or GNU [DD-]HH:MM:SS to seconds. None if unparseable.
 
-    One call: ps -axo pid=,ppid=,tty=,lstart=,command=
-    Returns {pid: {pid, ppid, tty, lstart, command}} or None on failure.
+    Structural only, never a platform sniff: leading DD- => GNU days;
+    three colon fields => GNU HH:MM:SS; two fields => BSD unbounded minutes
+    (live: 631:38.69). Unparseable => None => first observation, never an error.
     """
-    if os.name == "nt":
+    if not raw or not isinstance(raw, str):
         return None
+    s = raw.strip()
+    if not s:
+        return None
+    days = 0
+    if "-" in s:
+        left, right = s.split("-", 1)
+        if left.isdigit() and right.count(":") >= 2:
+            try:
+                days = int(left)
+            except ValueError:
+                return None
+            s = right
+        else:
+            return None
+    parts = s.split(":")
     try:
-        out = subprocess.check_output(
-            PS_CLI_CMD, text=True, stderr=subprocess.DEVNULL
-        )
-    except Exception:
+        if len(parts) == 3:
+            h = int(parts[0])
+            m = int(parts[1])
+            sec = float(parts[2])
+            return days * 86400.0 + h * 3600.0 + m * 60.0 + sec
+        if len(parts) == 2:
+            m = int(parts[0])
+            sec = float(parts[1])
+            return days * 86400.0 + m * 60.0 + sec
+    except ValueError:
         return None
+    return None
+
+
+def _ps_cli_parse_six(text):
+    """Parse six-field (pid ppid tty cputime lstart command) ps text.
+
+    Returns (snap, nonempty_line_count, match_count).
+    """
     snap = {}
-    for line in out.splitlines():
+    nlines = 0
+    nmatch = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        nlines += 1
         m = _PS_CLI_LINE.match(line)
+        if not m:
+            continue
+        nmatch += 1
+        pid_s, ppid_s, tty, cputime, lstart, command = m.groups()
+        try:
+            pid = int(pid_s)
+            snap[pid] = {
+                "pid": pid,
+                "ppid": int(ppid_s),
+                "tty": tty,
+                "lstart": lstart,
+                "command": command,
+                "cputime": cputime,
+                "cpu_s": _parse_cputime(cputime),
+            }
+        except ValueError:
+            continue
+    return snap, nlines, nmatch
+
+
+def _ps_cli_parse_legacy(text):
+    """Parse five-field (pid ppid tty lstart command) ps text. cpu_s=None."""
+    snap = {}
+    for line in text.splitlines():
+        m = _PS_CLI_LINE_LEGACY.match(line)
         if not m:
             continue
         pid_s, ppid_s, tty, lstart, command = m.groups()
@@ -281,9 +366,42 @@ def ps_cli_snapshot():
                 "tty": tty,
                 "lstart": lstart,
                 "command": command,
+                "cputime": None,
+                "cpu_s": None,
             }
         except ValueError:
             continue
+    return snap
+
+
+def ps_cli_snapshot():
+    """Rich process map for CLI classification (argv0/path identity).
+
+    One call: ps -axo pid=,ppid=,tty=,time=,lstart=,command=
+    Returns {pid: {pid, ppid, tty, lstart, command, cputime, cpu_s}} or None
+    on failure. Existing keys (pid/ppid/tty/lstart/command) are unchanged.
+
+    If the six-group regex matches ZERO of >=1 output lines, retry once with
+    the legacy five-field command. Degraded CPU (cpu_s=None) is acceptable;
+    an empty forest from a parse miss is not.
+    """
+    if os.name == "nt":
+        return None
+    try:
+        out = subprocess.check_output(
+            PS_CLI_CMD, text=True, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        return None
+    snap, nlines, nmatch = _ps_cli_parse_six(out)
+    if nlines >= 1 and nmatch == 0:
+        try:
+            out2 = subprocess.check_output(
+                PS_CLI_CMD_LEGACY, text=True, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            return snap
+        return _ps_cli_parse_legacy(out2)
     return snap
 
 
@@ -990,6 +1108,9 @@ def grok_active_subagents(sid, proc_started_ts, now, parent_model=None):
             continue
         started_iso = iso(ts) if ts is not None else None
         model = m.get("effective_model_id") or parent_model
+        sub_id = m.get("subagent_id")
+        if not sub_id:
+            sub_id = os.path.basename(os.path.dirname(meta_path))
         out.append({
             "pid": None,
             "kind": "grok-sub",
@@ -1002,7 +1123,7 @@ def grok_active_subagents(sid, proc_started_ts, now, parent_model=None):
             "model": model,
             "children": [],
             "virtual": True,
-            "subagent_id": m.get("subagent_id"),
+            "subagent_id": sub_id,
             "status": m.get("status"),
         })
     out.sort(key=lambda n: n.get("started") or "")
@@ -1285,6 +1406,8 @@ def build_cli_forest(snap, now=None):
             nodes[pid]["task"] = task
         if lane:
             nodes[pid]["lane"] = lane
+        if ikind == "grok_cli" and pid in grok_sess:
+            nodes[pid]["session_id"] = grok_sess[pid][0]
 
     # Re-parent: attach each keep-node under first keep-ancestor (≤10 walk).
     roots = []
@@ -1401,10 +1524,19 @@ def viewer_running(snap=None):
     return False
 
 
-def get_cli_payload(boot_id=None, force=False, now=None):
-    """Build /v1/cli response with 5s TTL cache (one ps sweep per window)."""
+def get_cli_payload(boot_id=None, force=False, now=None, mono=None):
+    """Build /v1/cli response with 5s TTL cache (one ps sweep per window).
+
+    Per-node `status` is computed on a cache miss (after build_cli_forest,
+    which stays pure) and stored with the forest. A TTL hit never resamples
+    CPU and never touches _CPU_PREV — it serves the status computed with
+    that cached structure, which may therefore be up to CLI_CACHE_TTL (5s)
+    stale. Ended CLI/ledger nodes are merged in before the cache store and
+    omitted once _done_expire() past their end ts.
+    """
     now_wall = now if now is not None else time.time()
-    mono = time.monotonic()
+    if mono is None:
+        mono = time.monotonic()
     with _CLI_CACHE_LOCK:
         if (
             not force
@@ -1423,7 +1555,16 @@ def get_cli_payload(boot_id=None, force=False, now=None):
         t0 = time.monotonic()
         snap = ps_cli_snapshot()
         forest = build_cli_forest(snap or {}, now=now_wall)
+        _attach_cli_status(forest, snap or {}, now_wall, mono)
         sweep_ms = round((time.monotonic() - t0) * 1000.0, 2)
+        try:
+            _ledger_ingest(forest, snap, now_wall)
+        except Exception:
+            pass
+        try:
+            _merge_ended_into_forest(forest, now_wall)
+        except Exception:
+            pass
         _CLI_CACHE["sweep_count"] = _CLI_CACHE["sweep_count"] + 1
         _CLI_CACHE["sweep_ms"] = sweep_ms
         _CLI_CACHE["mono"] = mono
@@ -1451,12 +1592,714 @@ def get_cli_payload(boot_id=None, force=False, now=None):
 
 
 def reset_cli_cache():
-    """Test helper: clear /v1/cli TTL cache and sweep counter."""
+    """Test helper: clear /v1/cli TTL cache, sweep counter, and CPU history.
+
+    Clearing _CPU_PREV means no history exists — the next sweep is a first
+    observation for every node.
+    """
     with _CLI_CACHE_LOCK:
         _CLI_CACHE["payload"] = None
         _CLI_CACHE["mono"] = 0.0
         _CLI_CACHE["sweep_ms"] = 0.0
         _CLI_CACHE["sweep_count"] = 0
+        _CPU_PREV.clear()
+
+
+def _iso_z(t=None):
+    """UTC ISO8601 with trailing Z, for ledger timestamps."""
+    dt = datetime.datetime.fromtimestamp(
+        t if t is not None else time.time(), datetime.timezone.utc
+    )
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ledger_id_os(pid, lstart):
+    """Deterministic OS-process ledger id: p:<pid>:<lstart> with ws runs -> '-'."""
+    collapsed = re.sub(r"\s+", "-", (lstart or "").strip())
+    return "p:%s:%s" % (pid, collapsed)
+
+
+def _ledger_id_gs(sid, subagent_id):
+    return "gs:%s:%s" % (sid, subagent_id)
+
+
+def _virtual_cli_status(raw):
+    """Map grok-sub meta.json status into CLI_TREE_STATUSES. Never CPU-derived."""
+    if raw in CLI_TREE_STATUSES:
+        return raw
+    return "running"
+
+
+# Slot-file / wrapper states that are not in CLI_TREE_STATUSES.
+_SLOT_STATE_TO_CLI = {
+    "DONE": "completed",
+    "FAILED": "failed",
+    "DIED": "error",
+    "CANCELLED": "cancelled",
+}
+
+
+def _clamp_cli_status(raw, default="completed"):
+    """Clamp a status onto CLI_TREE_STATUSES at an emit boundary.
+
+    In-allowlist values pass through. Known slot-state strings map
+    (DONE->completed, FAILED->failed, DIED->error, CANCELLED->cancelled).
+    Anything else returns default (completed for terminal ledger nodes).
+    """
+    if raw in CLI_TREE_STATUSES:
+        return raw
+    mapped = _SLOT_STATE_TO_CLI.get(raw)
+    if mapped:
+        return mapped
+    return default
+
+
+def _first_obs_status(node):
+    """First observation: running, unless a live OS-process child is present.
+
+    Virtual grok-subs (virtual True / pid None) do not count — they burn no
+    CPU of their own.
+    """
+    for c in node.get("children") or []:
+        if c.get("pid") is not None and not c.get("virtual"):
+            return "active"
+    return "running"
+
+
+def _attach_cli_status(forest, snap, now, mono):
+    """Stamp `status` and `id` on every node. Mutates forest in place.
+
+    build_cli_forest stays pure (no CPU state, no globals). Called from the
+    cache-MISS branch of get_cli_payload AFTER the forest is built and BEFORE
+    it is stored in _CLI_CACHE["payload"]. Caller holds _CLI_CACHE_LOCK.
+    """
+    snap = snap or {}
+    prev_status_by_pid = {}
+
+    def _collect_prev(ns):
+        for n in ns or []:
+            if n.get("pid") is not None and n.get("status"):
+                prev_status_by_pid[n["pid"]] = n["status"]
+            _collect_prev(n.get("children") or [])
+
+    cached = _CLI_CACHE.get("payload") or {}
+    _collect_prev(cached.get("roots"))
+
+    def walk(node, parent_sid):
+        pid = node.get("pid")
+        virtual = bool(node.get("virtual")) or pid is None
+        rec = snap.get(pid) if pid is not None else None
+        if not isinstance(rec, dict):
+            rec = {}
+        lstart = rec.get("lstart") or ""
+        sid = node.get("session_id") or parent_sid
+
+        if virtual:
+            sub = node.get("subagent_id") or ""
+            if node.get("kind") == "grok-sub":
+                node["id"] = _ledger_id_gs(sid or "", sub)
+            elif not node.get("id"):
+                node["id"] = _ledger_id_gs(sid or "", sub)
+            node["status"] = _virtual_cli_status(node.get("status"))
+        else:
+            node["id"] = _ledger_id_os(pid, lstart)
+            cpu_s = rec.get("cpu_s")
+            key = (pid, lstart)
+            prev = _CPU_PREV.get(key)
+            if prev is None or cpu_s is None or prev.get("cpu_s") is None:
+                status = _first_obs_status(node)
+                if cpu_s is not None:
+                    _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
+            else:
+                gap = float(mono) - float(prev["mono"])
+                delta = float(cpu_s) - float(prev["cpu_s"])
+                if gap > 120.0 or delta < 0:
+                    status = _first_obs_status(node)
+                    _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
+                elif gap < 1.0:
+                    # Do not recompute; do not touch _CPU_PREV (no flap).
+                    status = prev_status_by_pid.get(pid) or "running"
+                elif delta >= 0.05 and gap >= 1.0:
+                    status = "active"
+                    _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
+                else:
+                    status = "running"
+                    _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
+            if status not in CLI_TREE_STATUSES:
+                status = "running"
+            node["status"] = status
+
+        next_sid = node.get("session_id") or (
+            sid if node.get("kind") == "grok" else parent_sid
+        )
+        for c in node.get("children") or []:
+            walk(c, next_sid)
+
+    for r in forest.get("roots") or []:
+        walk(r, None)
+
+    if snap:
+        live_keys = set()
+        for p, rec in snap.items():
+            ls = rec.get("lstart") if isinstance(rec, dict) else None
+            live_keys.add((p, ls))
+        for k in list(_CPU_PREV.keys()):
+            if k not in live_keys:
+                del _CPU_PREV[k]
+
+
+# ---------------------------------------------------------------- agent ledger
+
+_LEDGER_SEEN_START = set()
+_LEDGER_SEEN_END = set()
+_LEDGER_STARTS = {}
+_LEDGER_ENDS = {}
+_LEDGER_LIVE = {}
+_LEDGER_CWD_DONE = set()
+_LEDGER_GROK_META_MEMO = set()
+_LEDGER_SEEDED = False
+_SINCE_RE = re.compile(r"^(\d+)([smhd])$")
+
+
+def _agents_max_bytes():
+    raw = os.environ.get("AGENT_SWITCHBOARD_AGENTS_MAX_BYTES")
+    if raw is not None and raw != "":
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return 32 * 1024 * 1024
+
+
+def _agents_path():
+    return os.path.join(ROOT, "agents.jsonl")
+
+
+def parse_since(dur):
+    """Parse --since <int><s|m|h|d> to seconds. None on failure."""
+    if not dur or not isinstance(dur, str):
+        return None
+    m = _SINCE_RE.match(dur.strip())
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def _ledger_append(rec):
+    """Best-effort JSONL append with single .1 rollover. Never raises."""
+    try:
+        path = _agents_path()
+        os.makedirs(ROOT, exist_ok=True)
+        cap = _agents_max_bytes()
+        line = json.dumps(rec, separators=(",", ":")) + "\n"
+        with file_lock(path + ".lock"):
+            try:
+                if os.path.getsize(path) >= cap:
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass
+            with open(path, "a") as f:
+                f.write(line)
+                f.flush()
+    except Exception:
+        pass
+
+
+def _seed_ledger():
+    """Tail the last 256KB of agents.jsonl. Bounded, best-effort, non-fatal."""
+    global _LEDGER_SEEDED
+    if _LEDGER_SEEDED:
+        return
+    _LEDGER_SEEDED = True
+    path = _agents_path()
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 256 * 1024))
+            data = f.read()
+        if size > 256 * 1024:
+            nl = data.find(b"\n")
+            if nl >= 0:
+                data = data[nl + 1 :]
+        for raw in data.splitlines():
+            try:
+                rec = json.loads(raw.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            rid = rec.get("id")
+            ev = rec.get("ev")
+            if not rid:
+                continue
+            if ev == "start":
+                if rid not in _LEDGER_SEEN_START:
+                    _LEDGER_SEEN_START.add(rid)
+                    _LEDGER_STARTS[rid] = rec
+            elif ev == "end":
+                if rid not in _LEDGER_SEEN_END:
+                    _LEDGER_SEEN_END.add(rid)
+                    _LEDGER_ENDS[rid] = rec
+    except Exception:
+        pass
+
+
+def _kind_internal(kind):
+    return {
+        "claude": "claude_cli",
+        "grok": "grok_cli",
+        "cursor": "cursor_cli",
+        "agent_dispatch": "agent_dispatch",
+    }.get(kind)
+
+
+def _ledger_cwd(node, rec):
+    """cwd for a start record: cwd_arg, else grok session cwd, else _proc_cwd once."""
+    rec = rec if isinstance(rec, dict) else {}
+    cmd = rec.get("command") or ""
+    ikind = _kind_internal(node.get("kind"))
+    meta = _parse_wrapper_flags(cmd, ikind) if ikind else {}
+    cwd = meta.get("cwd_arg")
+    if cwd:
+        return os.path.expanduser(cwd)
+    if node.get("kind") == "grok":
+        sid, sess_cwd = resolve_grok_sid(
+            cmd, rec, meta.get("cwd_arg"), _lstart_ts(rec.get("lstart"))
+        )
+        if sess_cwd:
+            return os.path.expanduser(sess_cwd)
+    nid = node.get("id")
+    pid = node.get("pid")
+    if nid and nid not in _LEDGER_CWD_DONE:
+        _LEDGER_CWD_DONE.add(nid)
+        c = _proc_cwd(pid)
+        if c:
+            return c
+    return None
+
+
+def _write_start(node, rec, parents, observed, now):
+    nid = node.get("id")
+    if not nid or nid in _LEDGER_SEEN_START:
+        return
+    channel = node.get("channel")
+    if channel is None and "channel" not in node:
+        channel = None
+    rec = rec if isinstance(rec, dict) else {}
+    start = {
+        "ev": "start",
+        "ts": _iso_z(now),
+        "id": nid,
+        "kind": node.get("kind"),
+        "pid": node.get("pid") if node.get("pid") is not None else None,
+        "parents": list(parents or [])[:10],
+        "channel": channel,
+        "label": node.get("label"),
+        "model": node.get("model"),
+        "cwd": _ledger_cwd(node, rec),
+        "task": node.get("task"),
+        "lane": node.get("lane"),
+        "observed": observed,
+    }
+    _ledger_append(start)
+    _LEDGER_SEEN_START.add(nid)
+    _LEDGER_STARTS[nid] = start
+
+
+def _write_end(nid, status, ended_source, now):
+    if not nid or nid in _LEDGER_SEEN_END:
+        return
+    if status not in CLI_TREE_STATUSES:
+        status = "completed"
+    end = {
+        "ev": "end",
+        "ts": _iso_z(now),
+        "id": nid,
+        "status": status,
+        "ended_source": ended_source,
+    }
+    _ledger_append(end)
+    _LEDGER_SEEN_END.add(nid)
+    _LEDGER_ENDS[nid] = end
+
+
+def _slot_end_for_pid(pid, task=None, lane=None, snap=None):
+    """If a lane slot claims this pid as terminal, (status, 'slot'); else None."""
+    candidates = []
+    if task and lane and name_ok(task) and name_ok(lane):
+        slot = read_json(os.path.join(task_dir(task), "slot-%s.json" % lane))
+        if slot:
+            candidates.append(slot)
+    if pid is not None:
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            pid = None
+    if pid is not None:
+        for t in list_tasks():
+            for _lane, slot in load_slots(t).items():
+                try:
+                    sp = int(slot.get("pid")) if slot.get("pid") is not None else None
+                except (TypeError, ValueError):
+                    sp = None
+                try:
+                    wp = (
+                        int(slot.get("wrapper_pid"))
+                        if slot.get("wrapper_pid") is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    wp = None
+                if sp == pid or wp == pid:
+                    candidates.append(slot)
+    thin = None
+    if snap:
+        thin = {
+            p: (r["command"] if isinstance(r, dict) else r) for p, r in snap.items()
+        }
+    seen = set()
+    for slot in candidates:
+        key = id(slot)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not slot or slot.get("corrupt"):
+            continue
+        if slot.get("status") == "exited":
+            return (
+                "completed" if slot.get("exit_code") == 0 else "failed",
+                "slot",
+            )
+        state, _ = derive(slot, snap=thin)
+        if state == "DONE":
+            return "completed", "slot"
+        if state == "FAILED":
+            return "failed", "slot"
+        if state == "DIED":
+            return "error", "slot"
+    return None
+
+
+def _id_for_node(node, snap, parent_sid):
+    if node.get("id"):
+        return node["id"], node.get("session_id") or parent_sid
+    pid = node.get("pid")
+    virtual = bool(node.get("virtual")) or pid is None
+    rec = (snap or {}).get(pid) if pid is not None else None
+    rec = rec if isinstance(rec, dict) else {}
+    sid = node.get("session_id") or parent_sid
+    if virtual or node.get("kind") == "grok-sub":
+        sub = node.get("subagent_id") or ""
+        nid = _ledger_id_gs(sid or "", sub)
+        node["id"] = nid
+        return nid, sid
+    nid = _ledger_id_os(pid, rec.get("lstart") or "")
+    node["id"] = nid
+    return nid, sid
+
+
+def _ledger_ingest(forest, snap, now):
+    """Idempotent start/end ingest from a forest + successful ps snap.
+
+    ps_cli_snapshot() returning None or an empty mapping is never 'everything
+    ended' — no end records from a failed or empty sweep. Writes are
+    best-effort and never raise (caller also guards).
+    """
+    _seed_ledger()
+    if snap is None or not snap:
+        return
+    now = now if now is not None else time.time()
+    seen = {}
+
+    def walk(node, parent_ids, parent_sid):
+        nid, sid = _id_for_node(node, snap, parent_sid)
+        rec = snap.get(node.get("pid")) if node.get("pid") is not None else None
+        rec = rec if isinstance(rec, dict) else {}
+        _write_start(node, rec, parent_ids, "live", now)
+        virtual = bool(node.get("virtual")) or node.get("pid") is None
+        seen[nid] = {
+            "pid": node.get("pid"),
+            "kind": node.get("kind"),
+            "task": node.get("task"),
+            "lane": node.get("lane"),
+            "virtual": virtual,
+            "parents": list(parent_ids or [])[:10],
+            "session_id": node.get("session_id") or sid,
+        }
+        chain = ([nid] + list(parent_ids or []))[:10]
+        next_sid = node.get("session_id") or (
+            sid if node.get("kind") == "grok" else parent_sid
+        )
+        for c in node.get("children") or []:
+            walk(c, chain, next_sid)
+
+    for r in (forest or {}).get("roots") or []:
+        walk(r, [], None)
+
+    _ledger_orphan_grok_subs(forest, now)
+
+    for nid, info in list(_LEDGER_LIVE.items()):
+        if nid in seen:
+            continue
+        if info.get("virtual") or info.get("pid") is None or str(nid).startswith("gs:"):
+            continue
+        mapped = _slot_end_for_pid(
+            info.get("pid"), info.get("task"), info.get("lane"), snap
+        )
+        if mapped:
+            status, src = mapped
+        else:
+            status, src = "completed", "gone"
+        _write_end(nid, status, src, now)
+
+    _LEDGER_LIVE.clear()
+    _LEDGER_LIVE.update(seen)
+
+
+def _ledger_orphan_grok_subs(forest, now):
+    """Ingest grok-sub meta.json including completed/cancelled (glob only).
+
+    Does not apply the live-forest terminal skip or the proc_started_ts-60
+    stale filter. Terminal (sid, subagent_id) pairs are memoised so a
+    terminal sub is read once. name_ok(sid) still gates.
+    """
+    pattern = os.path.join(
+        GROK_SESS_ROOT, "*", "*", "subagents", "*", "meta.json"
+    )
+    grok_by_sid = {}
+
+    def index(ns, chain):
+        for n in ns or []:
+            nid = n.get("id")
+            sid = n.get("session_id")
+            if n.get("kind") == "grok" and sid:
+                grok_by_sid[sid] = (nid, chain)
+            next_chain = ([nid] + chain)[:10] if nid else chain
+            index(n.get("children") or [], next_chain)
+
+    index((forest or {}).get("roots") or [], [])
+    for nid, info in _LEDGER_LIVE.items():
+        sid = info.get("session_id")
+        if sid and sid not in grok_by_sid:
+            grok_by_sid[sid] = (nid, list(info.get("parents") or []))
+
+    try:
+        paths = glob.glob(pattern)
+    except Exception:
+        return
+    for meta_path in paths:
+        try:
+            parts = os.path.normpath(meta_path).split(os.sep)
+            # .../<cwd_enc>/<sid>/subagents/<sub_id>/meta.json
+            if len(parts) < 4 or parts[-1] != "meta.json":
+                continue
+            sub_dir = parts[-2]
+            sid = parts[-4]
+            if not name_ok(sid):
+                continue
+            # Path dir is the fallback subagent_id; a terminal pair is not re-read.
+            if (sid, sub_dir) in _LEDGER_GROK_META_MEMO:
+                continue
+            m = read_json(meta_path)
+            if not m:
+                continue
+            sub_id = m.get("subagent_id") or sub_dir
+            key = (sid, sub_id)
+            raw_status = m.get("status")
+            terminal = raw_status in CLI_TREE_STATUSES and raw_status not in (
+                "running",
+                "active",
+            )
+            if key in _LEDGER_GROK_META_MEMO:
+                continue
+            nid = _ledger_id_gs(sid, sub_id)
+            parent_id, parent_chain = grok_by_sid.get(sid, (None, []))
+            parents = ([parent_id] + list(parent_chain))[:10] if parent_id else []
+            fake = {
+                "id": nid,
+                "kind": "grok-sub",
+                "pid": None,
+                "virtual": True,
+                "subagent_id": sub_id,
+                "label": m.get("description") or m.get("subagent_type") or "subagent",
+                "model": m.get("effective_model_id"),
+                "status": raw_status,
+                "channel": None,
+                "task": None,
+                "lane": None,
+            }
+            observed = "live" if nid in _LEDGER_LIVE else "posthoc"
+            if nid not in _LEDGER_SEEN_START:
+                _write_start(fake, {}, parents, observed, now)
+            if terminal:
+                mapped = _virtual_cli_status(raw_status)
+                _write_end(nid, mapped, "meta", now)
+                _LEDGER_GROK_META_MEMO.add(key)
+                _LEDGER_GROK_META_MEMO.add((sid, sub_dir))
+        except Exception:
+            continue
+
+
+def _node_from_ledger(start, end):
+    started = start.get("ts")
+    node = {
+        "id": start.get("id"),
+        "pid": start.get("pid"),
+        "kind": start.get("kind") or "grok",
+        "mode": "headless",
+        "tty": None,
+        "started": started,
+        "started_iso": started,
+        "uptime_s": None,
+        "label": start.get("label"),
+        "model": start.get("model"),
+        "children": [],
+        "status": _clamp_cli_status(end.get("status"), default="completed"),
+    }
+    if start.get("channel"):
+        node["channel"] = start["channel"]
+    if start.get("task"):
+        node["task"] = start["task"]
+    if start.get("lane"):
+        node["lane"] = start["lane"]
+    if node["kind"] == "grok-sub":
+        node["virtual"] = True
+    return node
+
+
+def _merge_ended_into_forest(forest, now):
+    """Serve ended CLI/ledger nodes until _done_expire() past their end ts."""
+    _seed_ledger()
+    expire = _done_expire()
+    now = now if now is not None else time.time()
+    live_ids = set()
+    by_id = {}
+
+    def index(ns):
+        for n in ns or []:
+            nid = n.get("id")
+            if nid:
+                live_ids.add(nid)
+                by_id[nid] = n
+            index(n.get("children") or [])
+
+    index((forest or {}).get("roots") or [])
+    for eid, end in list(_LEDGER_ENDS.items()):
+        if eid in live_ids:
+            continue
+        ts = _parse_iso_ts(end.get("ts"))
+        if ts is None:
+            continue
+        if expire > 0 and (now - ts) >= expire:
+            continue
+        start = _LEDGER_STARTS.get(eid) or {"id": eid, "kind": "grok"}
+        node = _node_from_ledger(start, end)
+        parents = start.get("parents") or []
+        attached = False
+        if parents:
+            parent = by_id.get(parents[0])
+            if parent is not None:
+                parent.setdefault("children", []).append(node)
+                attached = True
+        if not attached:
+            forest.setdefault("roots", []).append(node)
+        by_id[eid] = node
+        live_ids.add(eid)
+
+
+def _collect_cli_nodes(roots, statuses=None):
+    out = []
+
+    def walk(ns):
+        for n in ns or []:
+            st = n.get("status")
+            if statuses is None or st in statuses:
+                out.append(n)
+            walk(n.get("children") or [])
+
+    walk(roots)
+    return out
+
+
+def cmd_agents(args):
+    """Live CLI nodes first, then ended ledger rows inside --since.
+
+    --since grammar: <int><s|m|h|d> (e.g. 90s, 15m, 2h, 1d). Default 15m.
+    --live: running/active from a live sweep only (no ended rows).
+    --json: JSON object with running, ended, counts. Human form prints
+    rows then a `running=N ended=M` summary line.
+    """
+    _maybe_ensure(args)
+    since_s = 900.0
+    if getattr(args, "since", None):
+        parsed = parse_since(args.since)
+        if parsed is None:
+            print(
+                "switchboard agents: --since must be <int><s|m|h|d> "
+                "(e.g. 90s, 15m, 2h, 1d)",
+                file=sys.stderr,
+            )
+            return 2
+        since_s = float(parsed)
+    now = time.time()
+    payload = get_cli_payload(force=True, now=now)
+    running = _collect_cli_nodes(
+        payload.get("roots"), statuses=("running", "active")
+    )
+    ended = []
+    if not getattr(args, "live", False):
+        cutoff = now - since_s
+        _seed_ledger()
+        for eid, end in _LEDGER_ENDS.items():
+            ts = _parse_iso_ts(end.get("ts"))
+            if ts is None or ts < cutoff:
+                continue
+            start = _LEDGER_STARTS.get(eid) or {}
+            ended.append({"start": start, "end": end})
+        ended.sort(key=lambda r: r["end"].get("ts") or "")
+
+    counts = {"running": len(running), "ended": len(ended)}
+    if args.json:
+        print(
+            json.dumps(
+                {"running": running, "ended": ended, "counts": counts},
+                indent=2,
+            )
+        )
+    else:
+        print("RUNNING")
+        if not running:
+            print("  (none)")
+        for n in running:
+            print(
+                "  %s  %s  %s  %s  %s"
+                % (
+                    n.get("id") or "-",
+                    n.get("kind") or "-",
+                    n.get("status") or "-",
+                    n.get("label") or "-",
+                    n.get("model") or "-",
+                )
+            )
+        print("ENDED")
+        if not ended:
+            print("  (none)")
+        for row in ended:
+            e, s = row["end"], row["start"]
+            print(
+                "  %s  %s  %s  %s  %s"
+                % (
+                    e.get("id") or "-",
+                    s.get("kind") or "-",
+                    e.get("status") or "-",
+                    e.get("ended_source") or "-",
+                    s.get("label") or "-",
+                )
+            )
+        print("running=%d ended=%d" % (counts["running"], counts["ended"]))
+    return 0
 
 
 # ---------------------------------------------------------------- slot reading
@@ -1701,10 +2544,12 @@ def _stall_budget(explicit=None):
 
 
 def _done_expire():
-    """Seconds after which terminal slots are omitted from served status.
+    """Seconds after which terminal slots AND ended CLI/ledger nodes are omitted.
 
-    Read env on every call so `AGENT_SWITCHBOARD_DONE_EXPIRE=1 switchboard status`
-    works (import-time DONE_EXPIRE_S is only the documented default). 0 disables.
+    Single knob for both halves of goal 2 (served /v1/status slots and the
+    CLI-grid / ledger half). Read env on every call so
+    `AGENT_SWITCHBOARD_DONE_EXPIRE=1 switchboard status` works (import-time
+    DONE_EXPIRE_S is only the documented default). 0 disables.
     """
     raw = os.environ.get("AGENT_SWITCHBOARD_DONE_EXPIRE")
     if raw is not None and raw != "":
@@ -2472,6 +3317,18 @@ def watcher_loop(bus, quiet_after, stop_evt, tick=1.0, idle_cb=None):
         for stale in list(last.keys() - seen):
             del last[stale]
 
+        # Durable agent ledger: same snap as this tick, never a second ps.
+        # Failed/empty snap is skipped inside _ledger_ingest (no 'everything
+        # ended'). Never raise into the watcher.
+        try:
+            if rich_snap:
+                now_wall = time.time()
+                wforest = build_cli_forest(rich_snap, now=now_wall)
+                with _CLI_CACHE_LOCK:
+                    _ledger_ingest(wforest, rich_snap, now_wall)
+        except Exception:
+            pass
+
         # ---- Idle busy predicate: cli_busy() OR viewer_running() OR
         # any_active (computed above from this SAME tick's slot pass) ----
         # FAIL CLOSED: rich_snap is None (ps sweep failed) OR empty mapping
@@ -2826,6 +3683,24 @@ def main():
     p.add_argument("--task", required=True)
     p.add_argument("-n", type=int, default=20)
     p.set_defaults(fn=cmd_events)
+
+    p = sub.add_parser(
+        "agents",
+        help="live CLI nodes, then ended ledger rows (every-subagent ledger)",
+    )
+    p.add_argument(
+        "--since",
+        default="15m",
+        help="ended-row window: <int><s|m|h|d> (e.g. 90s, 15m, 2h, 1d); default 15m",
+    )
+    p.add_argument(
+        "--live",
+        action="store_true",
+        help="running/active from a live sweep only (skip ended ledger rows)",
+    )
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--ensure", action="store_true")
+    p.set_defaults(fn=cmd_agents)
 
     p = sub.add_parser("serve", help="background HTTP status service (long-poll)")
     p.add_argument("--host", default="127.0.0.1")

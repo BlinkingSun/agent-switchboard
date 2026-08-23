@@ -1509,6 +1509,63 @@ json.dump(d, open(p, 'w'))
 CLI0=$(AGENT_SWITCHBOARD_DONE_EXPIRE=0 "$SB" status --task t41 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"] for s in d[0]["slots"] if s["lane"]=="done"))')
 ck "$CLI0" "done" "T41f DONE_EXPIRE=0 keeps stale DONE listed"
 
+# T41g: expired FAILED omitted from served /v1/status (Q7; ports 17950-17954).
+AGENT_SWITCHBOARD_DONE_EXPIRE=1 "$SB" serve --port 17950 >/dev/null 2>&1 &
+SRV41G=$!
+sleep 1.5
+"$TD" --task t41g --lane fail --exec /bin/bash -- -c 'exit 1' >/dev/null 2>&1
+python3 -c "
+import json, time, os
+p = os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'], 't41g', 'slot-fail.json')
+d = json.load(open(p))
+d['ended'] = time.time() - 5
+json.dump(d, open(p, 'w'))
+"
+"$TD" --task t41g --lane fresh --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+LANES41G=$(curl -s "http://127.0.0.1:17950/v1/status?task=t41g" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"]+":"+s["state"] for s in d[0]["slots"]))')
+ck "$LANES41G" "fresh:DONE" "T41g expired FAILED omitted from served /v1/status; fresher DONE stays"
+kill "$SRV41G" 2>/dev/null
+wait 2>/dev/null
+
+# T41h: expired DIED omitted; ORPHAN NEVER omitted regardless of age (Q7).
+# Craft slots (same class as T16) so ORPHAN does not depend on killing a
+# wrapper without also killing its child.
+AGENT_SWITCHBOARD_DONE_EXPIRE=1 "$SB" serve --port 17951 >/dev/null 2>&1 &
+SRV41H=$!
+sleep 1.5
+mkdir -p "$AGENT_SWITCHBOARD_ROOT/t41h"
+python3 -c "
+import json, time, os
+root = os.environ['AGENT_SWITCHBOARD_ROOT']
+json.dump({
+    'task': 't41h', 'lane': 'died', 'run_id': 't41h-died', 'status': 'running',
+    'pid': 999998, 'wrapper_pid': 999997,
+    'prog': 'goneworker', 'prog_base': 'goneworker',
+    'wrapper_base': 'agent-dispatch',
+    'started': time.time() - 100, 'ended': time.time() - 10,
+}, open(os.path.join(root, 't41h', 'slot-died.json'), 'w'))
+"
+bash -c 'exec -a t41horph sleep 60' &
+OW41H=$!
+python3 - "$OW41H" <<'EOF'
+import json, os, sys, time
+ow = int(sys.argv[1])
+root = os.environ["AGENT_SWITCHBOARD_ROOT"]
+p = os.path.join(root, "t41h", "slot-orph.json")
+json.dump({
+    "task": "t41h", "lane": "orph", "run_id": "t41h-orph", "status": "running",
+    "pid": ow, "wrapper_pid": 999999,
+    "prog": "t41horph", "prog_base": "t41horph",
+    "started": time.time() - 10000,
+}, open(p, "w"))
+os.utime(p, (time.time() - 10000, time.time() - 10000))
+EOF
+LANES41H=$(curl -s "http://127.0.0.1:17951/v1/status?task=t41h" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(sorted(s["lane"]+":"+s["state"] for s in d[0]["slots"])) )')
+ck "$LANES41H" "orph:ORPHAN" "T41h expired DIED omitted; ORPHAN never omitted regardless of age"
+kill -9 "$OW41H" 2>/dev/null
+kill "$SRV41H" 2>/dev/null
+wait 2>/dev/null
+
 # T50: viewer classifier is argv0/path-position only. A path appearing as a
 # flag value or inside prompt text must not classify a process as viewer.
 python3 - "$SB" <<'EOF'
@@ -1612,6 +1669,693 @@ if [ $? -eq 0 ]; then
 else
   ck fail ok "T50 viewer argv0/path-position classifier unit block"
 fi
+
+# T51: per-node status (cpu delta, first-obs, epsilon, fallback, allowlist)
+python3 - "$SB" <<'EOF'
+import importlib.machinery, importlib.util, sys, os, json, tempfile, shutil, time, subprocess
+
+loader = importlib.machinery.SourceFileLoader("sb", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+sb = importlib.util.module_from_spec(spec)
+loader.exec_module(sb)
+
+NOW = 1723252800.0
+LSTART = "Fri Aug  9 12:00:00 2024"
+ALLOW = sb.CLI_TREE_STATUSES
+
+
+def rec(pid, ppid, tty, command, lstart=LSTART, cputime="0:00.00", cpu_s=0.0):
+    return {
+        "pid": pid, "ppid": ppid, "tty": tty, "lstart": lstart,
+        "command": command, "cputime": cputime, "cpu_s": cpu_s,
+    }
+
+
+def find(nodes, pred):
+    for n in nodes:
+        if pred(n):
+            return n
+        hit = find(n.get("children") or [], pred)
+        if hit:
+            return hit
+    return None
+
+
+def walk(nodes):
+    for n in nodes or []:
+        yield n
+        yield from walk(n.get("children") or [])
+
+
+def assert_true(cond, msg):
+    if not cond:
+        print("FAIL_ASSERT", msg)
+        sys.exit(1)
+
+
+def reset_ledger(root):
+    sb.ROOT = root
+    sb._LEDGER_SEEN_START.clear()
+    sb._LEDGER_SEEN_END.clear()
+    sb._LEDGER_STARTS.clear()
+    sb._LEDGER_ENDS.clear()
+    sb._LEDGER_LIVE.clear()
+    sb._LEDGER_CWD_DONE.clear()
+    sb._LEDGER_GROK_META_MEMO.clear()
+    sb._LEDGER_SEEDED = True
+    sb.reset_cli_cache()
+    sb.reset_model_defaults()
+
+
+tmp = tempfile.mkdtemp(prefix="sb-t51-")
+try:
+    reset_ledger(tmp)
+
+    # --- cputime parser unit: BSD unbounded minutes + GNU [DD-]HH:MM:SS
+    assert_true(abs(sb._parse_cputime("631:38.69") - (631 * 60 + 38.69)) < 1e-6, "BSD 631:38.69")
+    assert_true(sb._parse_cputime("00:00:01") == 1.0, "GNU HH:MM:SS")
+    assert_true(sb._parse_cputime("1-02:03:04") == 1 * 86400 + 2 * 3600 + 3 * 60 + 4, "GNU DD-HH:MM:SS")
+    assert_true(sb._parse_cputime("not-a-time") is None, "unparseable => None")
+    print("PASS_UNIT T51a cputime parser BSD+GNU")
+
+    # lstart-bearing six-group row
+    line = "  900  1 ttys009 631:38.69 Fri Aug  9 12:00:00 2024 /home/user/.grok/bin/grok"
+    snap6, nlines, nmatch = sb._ps_cli_parse_six(line + "\n")
+    assert_true(nlines == 1 and nmatch == 1 and 900 in snap6, "six-group matches lstart row")
+    assert_true(snap6[900]["lstart"] == "Fri Aug  9 12:00:00 2024", "lstart captured")
+    assert_true(abs(snap6[900]["cpu_s"] - (631 * 60 + 38.69)) < 1e-6, "cpu_s from row")
+    gnu_line = "  901  1 ttys009 00:00:01 Fri Aug  9 12:00:00 2024 /home/user/.grok/bin/grok"
+    gsnap, _, _ = sb._ps_cli_parse_six(gnu_line + "\n")
+    assert_true(gsnap[901]["cpu_s"] == 1.0, "GNU cputime on lstart row")
+    print("PASS_UNIT T51b lstart-bearing six-group row")
+
+    # MANDATORY legacy fallback: stub ps output the six-group regex cannot match
+    five = "  900  1 ttys009 Fri Aug  9 12:00:00 2024 /home/user/.grok/bin/grok\n"
+    calls = []
+    real_co = sb.subprocess.check_output
+
+    def fake_co(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return five
+
+    sb.subprocess.check_output = fake_co
+    try:
+        snap_fb = sb.ps_cli_snapshot()
+    finally:
+        sb.subprocess.check_output = real_co
+    assert_true(calls[0] == sb.PS_CLI_CMD, "first ps is six-field")
+    assert_true(len(calls) >= 2 and calls[1] == sb.PS_CLI_CMD_LEGACY, "retry legacy five-field")
+    assert_true(snap_fb and 900 in snap_fb, "fallback snap populated")
+    assert_true(snap_fb[900]["cpu_s"] is None, "fallback cpu_s=None")
+    forest_fb = sb.build_cli_forest(snap_fb, now=NOW)
+    assert_true(forest_fb["roots"] and forest_fb["roots"][0]["kind"] == "grok", "forest still populated")
+    print("PASS_UNIT T51c legacy-regex fallback")
+
+    grok_cmd = "/home/user/.grok/bin/grok"
+
+    def payload_for(snap, mono, now=NOW):
+        sb.ps_cli_snapshot = lambda: snap
+        return sb.get_cli_payload(force=True, now=now, mono=mono)
+
+    # cpu-delta => active; idle => running
+    reset_ledger(tmp)
+    snap_idle = {900: rec(900, 1, "ttys009", grok_cmd, cpu_s=1.0)}
+    p1 = payload_for(snap_idle, 1000.0)
+    n1 = find(p1["roots"], lambda n: n["pid"] == 900)
+    assert_true(n1 and n1["status"] == "running", "first obs idle => running")
+    snap_idle2 = {900: rec(900, 1, "ttys009", grok_cmd, cpu_s=1.0)}
+    p2 = payload_for(snap_idle2, 1001.5)
+    n2 = find(p2["roots"], lambda n: n["pid"] == 900)
+    assert_true(n2 and n2["status"] == "running", "idle delta 0 => running")
+    snap_busy = {900: rec(900, 1, "ttys009", grok_cmd, cpu_s=1.20)}
+    p3 = payload_for(snap_busy, 1003.0)
+    n3 = find(p3["roots"], lambda n: n["pid"] == 900)
+    assert_true(n3 and n3["status"] == "active", "cpu-delta => active")
+    print("PASS_UNIT T51d cpu-delta active / idle running")
+
+    # live OS child => active (real spawned child, not a virtual grok-sub)
+    reset_ledger(tmp)
+    child = subprocess.Popen(["sleep", "60"])
+    try:
+        snap_ch = {
+            100: rec(100, 1, "ttys001", grok_cmd, cpu_s=1.0),
+            child.pid: rec(
+                child.pid, 100, "??", grok_cmd + " -p child-prompt", cpu_s=0.2
+            ),
+        }
+        pch = payload_for(snap_ch, 50.0)
+        parent = find(pch["roots"], lambda n: n["pid"] == 100)
+        kid = find(pch["roots"], lambda n: n["pid"] == child.pid)
+        assert_true(parent and kid, "parent+real child in forest")
+        assert_true(kid.get("virtual") is not True and kid.get("pid") is not None, "child is OS pid")
+        assert_true(parent["status"] == "active", "live OS child => parent active")
+        assert_true(kid["status"] == "running", "child first-obs running")
+    finally:
+        child.kill()
+        child.wait()
+    print("PASS_UNIT T51e live OS child => active")
+
+    # first-obs: virtual grok-sub does NOT count as a child
+    reset_ledger(tmp)
+    sess = os.path.join(tmp, "sessions")
+    sb.GROK_SESS_ROOT = sess
+    cwd = "/tmp/lane-t51"
+    enc = __import__("urllib.parse").parse.quote(cwd, safe="")
+    sid = "019ff000-0000-0000-0000-00000000t51a"
+    sub = os.path.join(sess, enc, sid, "subagents", "sub-virt")
+    os.makedirs(sub)
+    started = sb._lstart_ts(LSTART)
+    created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))
+    json.dump({"created_at": created, "current_model_id": "grok-4.6"},
+              open(os.path.join(sess, enc, sid, "summary.json"), "w"))
+    json.dump({
+        "subagent_id": "sub-virt", "parent_session_id": sid,
+        "status": "running", "started_at": created, "description": "virt",
+    }, open(os.path.join(sub, "meta.json"), "w"))
+    cmd = grok_cmd + " --resume %s --cwd /tmp/lane-t51" % sid
+    snap_v = {3: rec(3, 1, "??", cmd, cpu_s=0.0)}
+    pv = payload_for(snap_v, 70.0)
+    node = find(pv["roots"], lambda n: n["pid"] == 3)
+    subs = [c for c in (node["children"] if node else []) if c.get("kind") == "grok-sub"]
+    assert_true(node and len(subs) == 1 and subs[0].get("virtual") is True, "virtual grok-sub grafted")
+    assert_true(node["status"] == "running", "virtual grok-sub does not pin parent active")
+    assert_true(subs[0]["status"] == "running", "virtual status from meta running")
+    assert_true(subs[0]["status"] in ALLOW, "virtual status in allowlist")
+    print("PASS_UNIT T51f first-obs virtual grok-sub excluded")
+
+    # epsilon boundary: 0.04s => running, 0.06s => active
+    reset_ledger(tmp)
+    payload_for({900: rec(900, 1, "ttys009", grok_cmd, cpu_s=1.00)}, 2000.0)
+    p04 = payload_for({900: rec(900, 1, "ttys009", grok_cmd, cpu_s=1.04)}, 2001.5)
+    assert_true(find(p04["roots"], lambda n: n["pid"] == 900)["status"] == "running", "0.04s => running")
+    reset_ledger(tmp)
+    payload_for({900: rec(900, 1, "ttys009", grok_cmd, cpu_s=1.00)}, 2000.0)
+    p06 = payload_for({900: rec(900, 1, "ttys009", grok_cmd, cpu_s=1.06)}, 2001.5)
+    assert_true(find(p06["roots"], lambda n: n["pid"] == 900)["status"] == "active", "0.06s => active")
+    print("PASS_UNIT T51g epsilon 0.04 running / 0.06 active")
+
+    # gap<1.0s carries status forward
+    reset_ledger(tmp)
+    payload_for({900: rec(900, 1, "ttys009", grok_cmd, cpu_s=1.00)}, 3000.0)
+    pgap = payload_for({900: rec(900, 1, "ttys009", grok_cmd, cpu_s=2.00)}, 3000.5)
+    assert_true(find(pgap["roots"], lambda n: n["pid"] == 900)["status"] == "running",
+                "gap<1.0s carries running despite large delta")
+    print("PASS_UNIT T51h gap<1.0s carry-forward")
+
+    # gap>120s re-firsts (would have been active on delta)
+    reset_ledger(tmp)
+    payload_for({900: rec(900, 1, "ttys009", grok_cmd, cpu_s=1.00)}, 4000.0)
+    p120 = payload_for({900: rec(900, 1, "ttys009", grok_cmd, cpu_s=2.00)}, 4121.0)
+    assert_true(find(p120["roots"], lambda n: n["pid"] == 900)["status"] == "running",
+                "gap>120s re-firsts to running")
+    print("PASS_UNIT T51i gap>120s re-first")
+
+    # TTL hit never resamples / never touches _CPU_PREV
+    reset_ledger(tmp)
+    sb.CLI_CACHE_TTL = 5.0
+    nps = {"n": 0}
+    snap_t = {900: rec(900, 1, "ttys009", grok_cmd, cpu_s=1.0)}
+
+    def counted_ps():
+        nps["n"] += 1
+        return snap_t
+
+    sb.ps_cli_snapshot = counted_ps
+    sb.reset_cli_cache()
+    a = sb.get_cli_payload(now=NOW, mono=5000.0)
+    prev_cpu = {k: dict(v) for k, v in sb._CPU_PREV.items()}
+    b = sb.get_cli_payload(now=NOW, mono=5001.0)
+    assert_true(nps["n"] == 1 and b["cached"] is True, "TTL hit does not resample")
+    assert_true({k: dict(v) for k, v in sb._CPU_PREV.items()} == prev_cpu, "TTL hit does not touch _CPU_PREV")
+    sb.CLI_CACHE_TTL = float(os.environ.get("AGENT_SWITCHBOARD_CLI_CACHE_TTL", 5.0))
+    print("PASS_UNIT T51j TTL hit leaves _CPU_PREV")
+
+    # emitted status always inside the hub allowlist
+    bad = []
+    for n in walk(p3["roots"]):
+        if n.get("status") not in ALLOW:
+            bad.append((n.get("pid"), n.get("status")))
+    for n in walk(pv["roots"]):
+        if n.get("status") not in ALLOW:
+            bad.append((n.get("pid"), n.get("status")))
+    assert_true(not bad, "status allowlist %s" % bad)
+    print("PASS_UNIT T51k status allowlist")
+
+    print("ALL_T51_OK")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+    sb.ps_cli_snapshot = sb.ps_cli_snapshot  # leftover; process exits
+EOF
+if [ $? -eq 0 ]; then
+  ck ok ok "T51a cputime parser BSD unbounded minutes + GNU [DD-]HH:MM:SS"
+  ck ok ok "T51b lstart-bearing six-group row"
+  ck ok ok "T51c mandatory legacy-regex fallback (stubbed ps, cpu_s=None, forest populated)"
+  ck ok ok "T51d cpu-delta => active; idle => running"
+  ck ok ok "T51e live OS child => active (real spawned child)"
+  ck ok ok "T51f first-obs; virtual grok-sub does not count as a child"
+  ck ok ok "T51g epsilon 0.04s running / 0.06s active"
+  ck ok ok "T51h gap<1.0s carries status forward"
+  ck ok ok "T51i gap>120s re-firsts"
+  ck ok ok "T51j TTL hit never resamples / never touches _CPU_PREV"
+  ck ok ok "T51k emitted status inside hub allowlist"
+else
+  ck fail ok "T51 per-node status unit block"
+fi
+
+# T52: agent ledger + CLI-grid retention + agents CLI + rollover (ports 17950-17954)
+python3 - "$SB" <<'EOF'
+import importlib.machinery, importlib.util, sys, os, json, tempfile, shutil, time, subprocess, glob
+
+loader = importlib.machinery.SourceFileLoader("sb", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+sb = importlib.util.module_from_spec(spec)
+loader.exec_module(sb)
+
+NOW = 1_700_000_000.0
+LSTART = "Tue Aug 18 02:45:07 2026"
+GROK = "/home/user/.grok/bin/grok"
+
+
+def rec(pid, ppid, tty, command, lstart=LSTART, cpu_s=0.0):
+    return {
+        "pid": pid, "ppid": ppid, "tty": tty, "lstart": lstart,
+        "command": command, "cputime": "0:00.00", "cpu_s": cpu_s,
+    }
+
+
+def find(nodes, pred):
+    for n in nodes:
+        if pred(n):
+            return n
+        hit = find(n.get("children") or [], pred)
+        if hit:
+            return hit
+    return None
+
+
+def walk(nodes):
+    for n in nodes or []:
+        yield n
+        yield from walk(n.get("children") or [])
+
+
+def assert_true(cond, msg):
+    if not cond:
+        print("FAIL_ASSERT", msg)
+        sys.exit(1)
+
+
+def reset_ledger(root):
+    sb.ROOT = root
+    sb._LEDGER_SEEN_START.clear()
+    sb._LEDGER_SEEN_END.clear()
+    sb._LEDGER_STARTS.clear()
+    sb._LEDGER_ENDS.clear()
+    sb._LEDGER_LIVE.clear()
+    sb._LEDGER_CWD_DONE.clear()
+    sb._LEDGER_GROK_META_MEMO.clear()
+    sb._LEDGER_SEEDED = True
+    sb.reset_cli_cache()
+    sb.reset_model_defaults()
+
+
+def payload_for(snap, mono, now):
+    sb.ps_cli_snapshot = lambda: snap
+    return sb.get_cli_payload(force=True, now=now, mono=mono)
+
+
+def ledger_rows(root):
+    path = os.path.join(root, "agents.jsonl")
+    if not os.path.isfile(path):
+        return []
+    out = []
+    for line in open(path):
+        line = line.strip()
+        if line:
+            out.append(json.loads(line))
+    return out
+
+
+tmp = tempfile.mkdtemp(prefix="sb-t52-")
+try:
+    reset_ledger(tmp)
+    dummy = {1: rec(1, 0, "??", "/sbin/launchd", cpu_s=0.0)}  # non-keep, keeps snap nonempty
+    snap_g = {
+        1: rec(1, 0, "??", "/sbin/launchd", cpu_s=0.0),
+        4242: rec(4242, 1, "ttys001", GROK, cpu_s=0.0),
+    }
+    p1 = payload_for(snap_g, 10.0, NOW)
+    node = find(p1["roots"], lambda n: n["pid"] == 4242)
+    assert_true(node and node.get("id"), "live node has id")
+    want_id = node["id"]
+    assert_true(want_id.startswith("p:4242:"), "os id p:<pid>:<lstart>")
+    rows = ledger_rows(tmp)
+    starts = [r for r in rows if r.get("ev") == "start" and r.get("id") == want_id]
+    assert_true(len(starts) == 1, "one start for synthetic run")
+    assert_true(starts[0]["observed"] == "live", "observed live")
+    assert_true(starts[0]["kind"] == "grok", "kind grok")
+    assert_true(starts[0]["pid"] == 4242, "pid int")
+    assert_true(starts[0]["parents"] == [], "root parents []")
+    assert_true(starts[0]["channel"] is None, "channel null when absent (not synthesised from label)")
+    # id reconciliation: ledger id == /v1/cli node id
+    assert_true(starts[0]["id"] == want_id, "ledger<->/v1/cli id reconciliation")
+    print("PASS_UNIT T52a id reconciliation + live start")
+
+    # gone => completed, served inside window, omitted after expiry
+    snap_gone = {1: rec(1, 0, "??", "/sbin/launchd", cpu_s=0.0)}
+    p2 = payload_for(snap_gone, 12.0, NOW + 5)
+    ended_node = find(p2["roots"], lambda n: n.get("id") == want_id)
+    assert_true(ended_node and ended_node.get("status") == "completed",
+                "terminal node served with completed inside window")
+    ends = [r for r in ledger_rows(tmp) if r.get("ev") == "end" and r.get("id") == want_id]
+    assert_true(len(ends) == 1 and ends[0]["ended_source"] == "gone", "gone end")
+    assert_true(ends[0]["status"] == "completed", "gone status completed")
+    os.environ["AGENT_SWITCHBOARD_DONE_EXPIRE"] = "1"
+    p3 = payload_for(snap_gone, 14.0, NOW + 5 + 2)
+    omitted = find(p3["roots"], lambda n: n.get("id") == want_id)
+    assert_true(omitted is None, "omitted after expiry")
+    os.environ["AGENT_SWITCHBOARD_DONE_EXPIRE"] = "900"
+    print("PASS_UNIT T52b completed served inside window, omitted after expiry")
+
+    # cancelled path (grok-sub meta)
+    reset_ledger(tmp)
+    sess = os.path.join(tmp, "gs")
+    sb.GROK_SESS_ROOT = sess
+    cwd = "/tmp/lane-t52"
+    enc = __import__("urllib.parse").parse.quote(cwd, safe="")
+    sid = "019ff000-0000-0000-0000-00000000t52c"
+    subp = os.path.join(sess, enc, sid, "subagents", "sub-can")
+    os.makedirs(subp)
+    json.dump({
+        "subagent_id": "sub-can", "parent_session_id": sid,
+        "status": "cancelled", "started_at": "2026-08-18T02:45:07Z",
+        "description": "cancelled-sub",
+    }, open(os.path.join(subp, "meta.json"), "w"))
+    pcan = payload_for({1: rec(1, 0, "??", "/sbin/launchd")}, 20.0, NOW)
+    gs_id = "gs:%s:sub-can" % sid
+    rows = ledger_rows(tmp)
+    st = [r for r in rows if r.get("ev") == "start" and r.get("id") == gs_id]
+    en = [r for r in rows if r.get("ev") == "end" and r.get("id") == gs_id]
+    assert_true(len(st) == 1 and st[0]["observed"] == "posthoc", "posthoc backfill start")
+    assert_true(len(en) == 1 and en[0]["status"] == "cancelled" and en[0]["ended_source"] == "meta",
+                "cancelled meta end")
+    served = find(pcan["roots"], lambda n: n.get("id") == gs_id)
+    assert_true(served and served.get("status") == "cancelled", "cancelled served")
+    print("PASS_UNIT T52c cancelled + posthoc backfill")
+
+    # completed grok-sub ingested (terminal skip does not apply to ledger)
+    subp2 = os.path.join(sess, enc, sid, "subagents", "sub-done")
+    os.makedirs(subp2)
+    json.dump({
+        "subagent_id": "sub-done", "parent_session_id": sid,
+        "status": "completed", "started_at": "2026-08-18T02:45:07Z",
+        "description": "done-sub",
+    }, open(os.path.join(subp2, "meta.json"), "w"))
+    pdone = payload_for({1: rec(1, 0, "??", "/sbin/launchd")}, 21.0, NOW)
+    gd_id = "gs:%s:sub-done" % sid
+    rows = ledger_rows(tmp)
+    st = [r for r in rows if r.get("ev") == "start" and r.get("id") == gd_id]
+    en = [r for r in rows if r.get("ev") == "end" and r.get("id") == gd_id]
+    assert_true(len(st) == 1 and st[0]["observed"] == "posthoc", "completed grok-sub start posthoc")
+    assert_true(len(en) == 1 and en[0]["status"] == "completed" and en[0]["ended_source"] == "meta",
+                "completed grok-sub ingested")
+    print("PASS_UNIT T52d completed grok-sub ingested")
+
+    # error path: slot DIED wins over gone
+    reset_ledger(tmp)
+    os.makedirs(os.path.join(tmp, "t52e"), exist_ok=True)
+    json.dump({
+        "task": "t52e", "lane": "died", "status": "running",
+        "pid": 5555, "wrapper_pid": 5554,
+        "prog_base": "grok", "wrapper_base": "agent-dispatch",
+        "started": NOW - 10,
+    }, open(os.path.join(tmp, "t52e", "slot-died.json"), "w"))
+    snap_live = {
+        1: rec(1, 0, "??", "/sbin/launchd"),
+        5555: rec(5555, 1, "??", GROK),
+    }
+    payload_for(snap_live, 30.0, NOW)
+    snap_dead = {1: rec(1, 0, "??", "/sbin/launchd")}
+    perr = payload_for(snap_dead, 32.0, NOW + 3)
+    rows = ledger_rows(tmp)
+    nid = find(
+        payload_for(snap_live, 30.0, NOW)["roots"] if False else [r for r in rows if r.get("ev") == "start"],
+        lambda r: r.get("pid") == 5555,
+    )
+    # rows is a list of dicts; find() walks children. Use a list comp.
+    st5555 = [r for r in rows if r.get("ev") == "start" and r.get("pid") == 5555]
+    assert_true(len(st5555) == 1, "start for slot pid")
+    en5555 = [r for r in rows if r.get("ev") == "end" and r.get("id") == st5555[0]["id"]]
+    assert_true(len(en5555) == 1, "one end")
+    assert_true(en5555[0]["ended_source"] == "slot" and en5555[0]["status"] == "error",
+                "DIED slot => error, wins over gone")
+    print("PASS_UNIT T52e error path slot DIED")
+
+    # failed/empty sweep never writes ends
+    reset_ledger(tmp)
+    payload_for({
+        1: rec(1, 0, "??", "/sbin/launchd"),
+        9: rec(9, 1, "ttys001", GROK),
+    }, 40.0, NOW)
+    before = [r for r in ledger_rows(tmp) if r.get("ev") == "end"]
+    sb.ps_cli_snapshot = lambda: None
+    sb.get_cli_payload(force=True, now=NOW + 1, mono=41.0)
+    after_none = [r for r in ledger_rows(tmp) if r.get("ev") == "end"]
+    sb.ps_cli_snapshot = lambda: {}
+    sb.get_cli_payload(force=True, now=NOW + 2, mono=42.0)
+    after_empty = [r for r in ledger_rows(tmp) if r.get("ev") == "end"]
+    assert_true(before == after_none == after_empty, "failed/empty sweep writes no ends")
+    print("PASS_UNIT T52f failed/empty sweep no ends")
+
+    # rollover with MAX_BYTES override env
+    roll = tempfile.mkdtemp(prefix="sb-t52-roll-")
+    reset_ledger(roll)
+    os.environ["AGENT_SWITCHBOARD_AGENTS_MAX_BYTES"] = "180"
+    rec_a = {
+        "ev": "start", "ts": "2026-08-18T02:45:07Z", "id": "p:1:Tue-Aug-18-02:45:07-2026",
+        "kind": "grok", "pid": 1, "parents": [], "channel": None, "label": "x" * 40,
+        "model": None, "cwd": None, "task": None, "lane": None, "observed": "live",
+    }
+    rec_b = dict(rec_a, id="p:2:Tue-Aug-18-02:45:07-2026", pid=2)
+    sb._ledger_append(rec_a)
+    sb._ledger_append(rec_b)
+    assert_true(os.path.isfile(os.path.join(roll, "agents.jsonl.1")), "rollover sibling .1")
+    live = open(os.path.join(roll, "agents.jsonl")).read()
+    old = open(os.path.join(roll, "agents.jsonl.1")).read()
+    assert_true(rec_a["id"] in old and rec_b["id"] in live, "append-line atomicity after rotate")
+    os.environ.pop("AGENT_SWITCHBOARD_AGENTS_MAX_BYTES", None)
+    shutil.rmtree(roll, ignore_errors=True)
+    print("PASS_UNIT T52g rollover MAX_BYTES")
+
+    # agents CLI --since / --live / --json + counts line
+    reset_ledger(tmp)
+    # plant a start+end in the ledger file; new process will seed
+    os.makedirs(tmp, exist_ok=True)
+    nid = "p:69697:Tue-Aug-18-02:45:07-2026"
+    with open(os.path.join(tmp, "agents.jsonl"), "w") as f:
+        f.write(json.dumps({
+            "ev": "start", "ts": "2026-08-23T00:00:00Z", "id": nid, "kind": "grok",
+            "pid": 69697, "parents": [], "channel": None, "label": "cli-row",
+            "model": None, "cwd": None, "task": None, "lane": None, "observed": "live",
+        }) + "\n")
+        f.write(json.dumps({
+            "ev": "end", "ts": "2026-08-23T00:01:00Z", "id": nid,
+            "status": "completed", "ended_source": "gone",
+        }) + "\n")
+    env = os.environ.copy()
+    env["AGENT_SWITCHBOARD_ROOT"] = tmp
+    env["AGENT_SWITCHBOARD_ENSURE_DISABLE"] = "1"
+    env["AGENT_SWITCHBOARD_DONE_EXPIRE"] = "900"
+    bin_path = sys.argv[1]
+    py = [sys.executable, bin_path]
+    r_json = subprocess.run(
+        py + ["agents", "--json", "--since", "30d"],
+        capture_output=True, text=True, env=env,
+    )
+    assert_true(r_json.returncode == 0, "agents --json exit 0 got %s %s" % (r_json.returncode, r_json.stderr[-200:]))
+    data = json.loads(r_json.stdout)
+    assert_true("running" in data and "ended" in data and "counts" in data, "json shape")
+    assert_true(data["counts"]["ended"] >= 1, "json counts.ended")
+    assert_true(any(e.get("end", e).get("id") == nid or e.get("id") == nid
+                    for e in data["ended"]), "ended row in json")
+    r_live = subprocess.run(
+        py + ["agents", "--json", "--live", "--since", "30d"],
+        capture_output=True, text=True, env=env,
+    )
+    d_live = json.loads(r_live.stdout)
+    assert_true(d_live["counts"]["ended"] == 0 and d_live["ended"] == [], "--live skips ended")
+    r_h = subprocess.run(
+        py + ["agents", "--since", "30d"],
+        capture_output=True, text=True, env=env,
+    )
+    last = [ln for ln in r_h.stdout.splitlines() if ln.startswith("running=")]
+    assert_true(len(last) == 1 and "ended=" in last[0], "counts line running=N ended=M")
+    r_since = subprocess.run(
+        py + ["agents", "--since", "1s"],
+        capture_output=True, text=True, env=env,
+    )
+    # planted ts is 2026-08-23; suite date is 2026-08-23 so 1s window likely excludes it
+    r_bad = subprocess.run(
+        py + ["agents", "--since", "nope"],
+        capture_output=True, text=True, env=env,
+    )
+    assert_true(r_bad.returncode == 2, "--since grammar reject")
+    print("PASS_UNIT T52h agents CLI --since/--live/--json + counts line")
+
+    # seeded OOV DONE is clamped at emit to completed; never served as OOV
+    reset_ledger(tmp)
+    os.environ["AGENT_SWITCHBOARD_DONE_EXPIRE"] = "900"
+    nid_done = "p:7777:Tue-Aug-18-02:45:07-2026"
+    os.makedirs(tmp, exist_ok=True)
+    with open(os.path.join(tmp, "agents.jsonl"), "w") as f:
+        f.write(json.dumps({
+            "ev": "start", "ts": sb._iso_z(NOW - 10), "id": nid_done, "kind": "grok",
+            "pid": 7777, "parents": [], "channel": None, "label": "oov-done",
+            "model": None, "cwd": None, "task": None, "lane": None, "observed": "live",
+        }) + "\n")
+        f.write(json.dumps({
+            "ev": "end", "ts": sb._iso_z(NOW - 2), "id": nid_done,
+            "status": "DONE", "ended_source": "slot",
+        }) + "\n")
+    sb._LEDGER_SEEDED = False
+    p_oov = payload_for({1: rec(1, 0, "??", "/sbin/launchd")}, 50.0, NOW)
+    served_oov = find(p_oov["roots"], lambda n: n.get("id") == nid_done)
+    assert_true(served_oov is not None, "seeded DONE node is served")
+    assert_true(served_oov.get("status") == "completed", "DONE maps to completed")
+    oov = [n.get("status") for n in walk(p_oov["roots"])
+           if n.get("status") not in sb.CLI_TREE_STATUSES]
+    assert_true(oov == [], "no OOV status emitted")
+    print("PASS_UNIT T52k seeded DONE clamped to completed, never OOV")
+
+    # terminal grok-sub memo short-circuits read_json (one read)
+    reset_ledger(tmp)
+    sess_memo = os.path.join(tmp, "gs-memo")
+    sb.GROK_SESS_ROOT = sess_memo
+    cwd_m = "/tmp/lane-t52-memo"
+    enc_m = __import__("urllib.parse").parse.quote(cwd_m, safe="")
+    sid_m = "019ff000-0000-0000-0000-00000000t52l"
+    subp_m = os.path.join(sess_memo, enc_m, sid_m, "subagents", "sub-once")
+    os.makedirs(subp_m)
+    json.dump({
+        "subagent_id": "sub-once", "parent_session_id": sid_m,
+        "status": "completed", "started_at": "2026-08-18T02:45:07Z",
+        "description": "once-sub",
+    }, open(os.path.join(subp_m, "meta.json"), "w"))
+    reads = {"n": 0}
+    real_rj = sb.read_json
+
+    def counting_read_json(path):
+        reads["n"] += 1
+        return real_rj(path)
+
+    sb.read_json = counting_read_json
+    try:
+        forest_empty = {"roots": []}
+        sb._ledger_orphan_grok_subs(forest_empty, NOW)
+        assert_true(reads["n"] == 1, "first orphan scan reads meta once got %s" % reads["n"])
+        sb._ledger_orphan_grok_subs(forest_empty, NOW)
+        sb._ledger_orphan_grok_subs(forest_empty, NOW)
+        assert_true(reads["n"] == 1, "memo short-circuits further reads got %s" % reads["n"])
+    finally:
+        sb.read_json = real_rj
+    print("PASS_UNIT T52l terminal grok-sub memo reads meta once")
+
+    print("ALL_T52_OK")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+EOF
+if [ $? -eq 0 ]; then
+  ck ok ok "T52a ledger<->/v1/cli id reconciliation for a synthetic run"
+  ck ok ok "T52b terminal completed served inside window, omitted after expiry"
+  ck ok ok "T52c cancelled path + posthoc backfill observed=posthoc"
+  ck ok ok "T52d completed grok-sub ingested"
+  ck ok ok "T52e error path (slot DIED => error, wins over gone)"
+  ck ok ok "T52f failed/empty sweep writes no ends"
+  ck ok ok "T52g rollover with MAX_BYTES override env"
+  ck ok ok "T52h agents CLI --since/--live/--json + counts line"
+  ck ok ok "T52k seeded DONE clamped to completed, never OOV"
+  ck ok ok "T52l terminal grok-sub memo reads meta once"
+else
+  ck fail ok "T52 agent ledger unit block"
+fi
+
+# T52 serve: terminal node on /v1/cli inside window / omitted after expiry (ports 17952-17953)
+T52_ROOT=$(mktemp -d)
+python3 - "$T52_ROOT" <<'EOF'
+import json, os, sys, time
+root = sys.argv[1]
+nid = "p:69697:Tue-Aug-18-02:45:07-2026"
+now = time.time()
+def z(t):
+    import datetime
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+open(os.path.join(root, "agents.jsonl"), "w").write(
+    json.dumps({
+        "ev": "start", "ts": z(now - 10), "id": nid, "kind": "grok",
+        "pid": 69697, "parents": [], "channel": None, "label": "served-row",
+        "model": None, "cwd": None, "task": None, "lane": None, "observed": "posthoc",
+    }) + "\n" + json.dumps({
+        "ev": "end", "ts": z(now - 2), "id": nid,
+        "status": "completed", "ended_source": "gone",
+    }) + "\n"
+)
+EOF
+AGENT_SWITCHBOARD_ROOT="$T52_ROOT" AGENT_SWITCHBOARD_DONE_EXPIRE=900 AGENT_SWITCHBOARD_CLI_CACHE_TTL=0.2 \
+  "$SB" serve --port 17952 >/dev/null 2>&1 &
+SRV52A=$!
+sleep 1.5
+CLI52A=$(curl -s "http://127.0.0.1:17952/v1/cli")
+HIT52A=$(python3 -c '
+import json,sys
+d=json.loads(sys.argv[1])
+def walk(ns):
+    for n in ns or []:
+        yield n
+        yield from walk(n.get("children") or [])
+hit=any(n.get("id")=="p:69697:Tue-Aug-18-02:45:07-2026" and n.get("status")=="completed" for n in walk(d.get("roots")))
+print("YES" if hit else "NO")
+' "$CLI52A")
+ck "$HIT52A" "YES" "T52i served /v1/cli completed node inside DONE_EXPIRE window"
+kill "$SRV52A" 2>/dev/null
+wait 2>/dev/null
+
+python3 - "$T52_ROOT" <<'EOF'
+import json, os, sys, time, datetime
+root = sys.argv[1]
+nid = "p:69697:Tue-Aug-18-02:45:07-2026"
+def z(t):
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+now = time.time()
+open(os.path.join(root, "agents.jsonl"), "w").write(
+    json.dumps({
+        "ev": "start", "ts": z(now - 100), "id": nid, "kind": "grok",
+        "pid": 69697, "parents": [], "channel": None, "label": "old-row",
+        "model": None, "cwd": None, "task": None, "lane": None, "observed": "posthoc",
+    }) + "\n" + json.dumps({
+        "ev": "end", "ts": z(now - 50), "id": nid,
+        "status": "completed", "ended_source": "gone",
+    }) + "\n"
+)
+EOF
+AGENT_SWITCHBOARD_ROOT="$T52_ROOT" AGENT_SWITCHBOARD_DONE_EXPIRE=1 AGENT_SWITCHBOARD_CLI_CACHE_TTL=0.2 \
+  "$SB" serve --port 17953 >/dev/null 2>&1 &
+SRV52B=$!
+sleep 1.5
+CLI52B=$(curl -s "http://127.0.0.1:17953/v1/cli")
+HIT52B=$(python3 -c '
+import json,sys
+d=json.loads(sys.argv[1])
+def walk(ns):
+    for n in ns or []:
+        yield n
+        yield from walk(n.get("children") or [])
+hit=any(n.get("id")=="p:69697:Tue-Aug-18-02:45:07-2026" for n in walk(d.get("roots")))
+print("YES" if hit else "NO")
+' "$CLI52B")
+ck "$HIT52B" "NO" "T52j expired ledger node omitted from served /v1/cli"
+kill "$SRV52B" 2>/dev/null
+wait 2>/dev/null
+rm -rf "$T52_ROOT"
 
 echo; echo "RESULT: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]
