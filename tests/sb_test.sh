@@ -17,32 +17,32 @@ PASS=0; FAIL=0
 ck() { if [ "$1" = "$2" ]; then PASS=$((PASS+1)); echo "PASS: $3"; else FAIL=$((FAIL+1)); echo "FAIL: $3 (got '$1' want '$2')"; fi }
 
 # T1: normal lane completes -> DONE, wrapper exit passes through
-$TD --task demo --lane ok --exec /bin/bash -- -c 'sleep 1; exit 0' >/dev/null 2>&1
+"$TD" --task demo --lane ok --exec /bin/bash -- -c 'sleep 1; exit 0' >/dev/null 2>&1
 ck "$?" "0" "T1a wrapper passes through exit 0"
-ST=$($SB status --task demo --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print([s["state"] for s in d[0]["slots"] if s["lane"]=="ok"][0])')
+ST=$("$SB" status --task demo --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print([s["state"] for s in d[0]["slots"] if s["lane"]=="ok"][0])')
 ck "$ST" "DONE" "T1b completed lane derives DONE"
 
 # T2: failing lane -> FAILED with code
-$TD --task demo --lane bad --exec /bin/bash -- -c 'exit 7' >/dev/null 2>&1
+"$TD" --task demo --lane bad --exec /bin/bash -- -c 'exit 7' >/dev/null 2>&1
 ck "$?" "7" "T2a wrapper passes through exit 7"
-ST=$($SB status --task demo --json | python3 -c 'import json,sys; d=json.load(sys.stdin); s=[s for s in d[0]["slots"] if s["lane"]=="bad"][0]; print(s["state"], s["exit_code"])')
+ST=$("$SB" status --task demo --json | python3 -c 'import json,sys; d=json.load(sys.stdin); s=[s for s in d[0]["slots"] if s["lane"]=="bad"][0]; print(s["state"], s["exit_code"])')
 ck "$ST" "FAILED 7" "T2b failing lane derives FAILED 7"
 
 # T3: silent kill (SIGKILL wrapper+child, like a harness group-kill) -> DIED
-$TD --task demo --lane dead --exec /bin/bash -- -c 'sleep 60' >/dev/null 2>&1 &
+"$TD" --task demo --lane dead --exec /bin/bash -- -c 'sleep 60' >/dev/null 2>&1 &
 WRAP=$!
 sleep 1
 CHILD=$(python3 -c "import json;print(json.load(open('$AGENT_SWITCHBOARD_ROOT/demo/slot-dead.json'))['pid'])")
 kill -9 "$WRAP" "$CHILD" 2>/dev/null
 sleep 1
-ST=$($SB status --task demo --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print([s["state"] for s in d[0]["slots"] if s["lane"]=="dead"][0])')
+ST=$("$SB" status --task demo --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print([s["state"] for s in d[0]["slots"] if s["lane"]=="dead"][0])')
 ck "$ST" "DIED" "T3 silently killed lane derives DIED"
 
 # T4: wait returns promptly on a lane completing (not at timeout)
-$TD --task demo --lane w1 --exec /bin/bash -- -c 'sleep 3' >/dev/null 2>&1 &
+"$TD" --task demo --lane w1 --exec /bin/bash -- -c 'sleep 3' >/dev/null 2>&1 &
 sleep 0.5
 T0=$(date +%s)
-$SB wait --task demo --lane w1 --timeout 30 --interval 1 >/dev/null
+"$SB" wait --task demo --lane w1 --timeout 30 --interval 1 >/dev/null
 RC=$?
 DT=$(( $(date +%s) - T0 ))
 ck "$RC" "0" "T4a wait exits 0 on lane event"
@@ -51,7 +51,7 @@ wait
 
 # T5: wait on already-terminal lanes returns immediately
 T0=$(date +%s)
-$SB wait --task demo --lane ok --timeout 20 >/dev/null
+"$SB" wait --task demo --lane ok --timeout 20 >/dev/null
 RC=$?
 DT=$(( $(date +%s) - T0 ))
 ck "$RC" "0" "T5a wait on terminal lane exits 0"
@@ -61,7 +61,7 @@ ck "$RC" "0" "T5a wait on terminal lane exits 0"
 WF="$AGENT_SWITCHBOARD_ROOT/marker.txt"
 ( sleep 2; echo P3 > "$WF" ) &
 T0=$(date +%s)
-$SB wait --task demo --watch-file "$WF" --timeout 20 --interval 1 >/dev/null
+"$SB" wait --task demo --watch-file "$WF" --timeout 20 --interval 1 >/dev/null
 RC=$?
 DT=$(( $(date +%s) - T0 ))
 ck "$RC" "0" "T6a wait exits 0 on file change"
@@ -69,21 +69,21 @@ ck "$RC" "0" "T6a wait exits 0 on file change"
 wait
 
 # T7: capacity refusal
-$TD --task demo --lane cap1 --exec /bin/bash -- -c 'sleep 15' >/dev/null 2>&1 &
+"$TD" --task demo --lane cap1 --exec /bin/bash -- -c 'sleep 15' >/dev/null 2>&1 &
 sleep 0.5
-$TD --task demo --lane cap2 --max 1 --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+"$TD" --task demo --lane cap2 --max 1 --exec /bin/bash -- -c 'true' >/dev/null 2>&1
 ck "$?" "2" "T7 second dispatch refused at --max 1 (exit 2)"
 
 # T8: same-lane active refusal without --replace
-$TD --task demo --lane cap1 --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+"$TD" --task demo --lane cap1 --exec /bin/bash -- -c 'true' >/dev/null 2>&1
 ck "$?" "2" "T8 active same-lane dispatch refused (exit 2)"
 
 # T9: timeout path exits 3
-$SB wait --task demo --lane cap1 --timeout 3 --interval 1 >/dev/null
+"$SB" wait --task demo --lane cap1 --timeout 3 --interval 1 >/dev/null
 ck "$?" "3" "T9 wait timeout exits 3"
 
 # T10: daemon smoke test on a test port
-$SB serve --port 17999 >/dev/null 2>&1 &
+"$SB" serve --port 17999 >/dev/null 2>&1 &
 SRV=$!
 sleep 1.5
 H=$(curl -s "http://127.0.0.1:17999/v1/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ok"])')
@@ -99,7 +99,7 @@ DT=$(( $(date +%s) - T0 ))
 ck "$EV" "DONE" "T10c long-poll fired on lane completion (${DT}s)"
 # second serve on the SAME port: the first is a HEALTHY peer, so the
 # duplicate now exits 0.
-$SB serve --port 17999 >/dev/null 2>&1
+"$SB" serve --port 17999 >/dev/null 2>&1
 ck "$?" "0" "T10d second serve on same port exits 0 (healthy peer already serving)"
 kill "$SRV" 2>/dev/null
 wait 2>/dev/null
@@ -121,14 +121,14 @@ json.dump({"task":"demo","lane":"fin","run_id":"t11","status":"running",
  "pid":dead,"wrapper_pid":fw,"prog":"/bin/bash","prog_base":"bash",
  "started":time.time()},open(os.path.join(d,"slot-fin.json"),"w"))
 EOF
-ST=$($SB status --task demo --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print([s["state"] for s in d[0]["slots"] if s["lane"]=="fin"][0])')
+ST=$("$SB" status --task demo --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print([s["state"] for s in d[0]["slots"] if s["lane"]=="fin"][0])')
 ck "$ST" "RUNNING" "T11a child-dead+wrapper-alive is RUNNING not DIED"
 kill -9 "$FAKEW" 2>/dev/null; sleep 0.3
-ST=$($SB status --task demo --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print([s["state"] for s in d[0]["slots"] if s["lane"]=="fin"][0])')
+ST=$("$SB" status --task demo --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print([s["state"] for s in d[0]["slots"] if s["lane"]=="fin"][0])')
 ck "$ST" "DIED" "T11b both gone is DIED"
 
 # T12: stale wrapper must NOT clobber a newer slot (finding #2, run_id guard)
-$TD --task demo --lane clob --exec /bin/bash -- -c 'sleep 2' >/dev/null 2>&1 &
+"$TD" --task demo --lane clob --exec /bin/bash -- -c 'sleep 2' >/dev/null 2>&1 &
 sleep 0.6
 python3 - "$AGENT_SWITCHBOARD_ROOT" <<'EOF'
 import json,sys,os,time
@@ -142,8 +142,8 @@ grep -q stale_finalize_skipped "$AGENT_SWITCHBOARD_ROOT/demo/events.jsonl" && ck
 
 # T13: parallel dispatch race at --max 1 => exactly one refused (finding #4)
 mkdir -p "$AGENT_SWITCHBOARD_ROOT/t13"
-( $TD --task t13 --lane p1 --max 1 --exec /bin/bash -- -c 'sleep 2' >/dev/null 2>&1; echo $? > "$AGENT_SWITCHBOARD_ROOT/t13-rc1" ) &
-( $TD --task t13 --lane p2 --max 1 --exec /bin/bash -- -c 'sleep 2' >/dev/null 2>&1; echo $? > "$AGENT_SWITCHBOARD_ROOT/t13-rc2" ) &
+( "$TD" --task t13 --lane p1 --max 1 --exec /bin/bash -- -c 'sleep 2' >/dev/null 2>&1; echo $? > "$AGENT_SWITCHBOARD_ROOT/t13-rc1" ) &
+( "$TD" --task t13 --lane p2 --max 1 --exec /bin/bash -- -c 'sleep 2' >/dev/null 2>&1; echo $? > "$AGENT_SWITCHBOARD_ROOT/t13-rc2" ) &
 wait
 RCS=$(sort "$AGENT_SWITCHBOARD_ROOT/t13-rc1" "$AGENT_SWITCHBOARD_ROOT/t13-rc2" | tr '\n' ' ' | xargs)
 ck "$RCS" "0 2" "T13 parallel capacity race: exactly one refused"
@@ -151,9 +151,9 @@ ck "$RCS" "0 2" "T13 parallel capacity race: exactly one refused"
 # T14: corrupt slot surfaces as CORRUPT and blocks capacity (finding #8)
 mkdir -p "$AGENT_SWITCHBOARD_ROOT/t14/history"
 echo 'garbage{' > "$AGENT_SWITCHBOARD_ROOT/t14/slot-broken.json"
-ST=$($SB status --task t14 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["slots"][0]["state"])')
+ST=$("$SB" status --task t14 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["slots"][0]["state"])')
 ck "$ST" "CORRUPT" "T14a corrupt slot visible as CORRUPT"
-$TD --task t14 --lane fresh --max 1 --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+"$TD" --task t14 --lane fresh --max 1 --exec /bin/bash -- -c 'true' >/dev/null 2>&1
 ck "$?" "2" "T14b corrupt slot counts toward capacity (fail-safe)"
 
 # T16: wait on an ORPHAN-only task blocks (no early "all terminal" no-op spin)
@@ -167,16 +167,16 @@ json.dump({"task":"t16","lane":"orph","run_id":"t16","status":"running",
  "pid":ow,"wrapper_pid":999999,"prog":"orphanworker","prog_base":"orphanworker",
  "started":time.time()},open(os.path.join(root,"t16","slot-orph.json"),"w"))
 EOF
-ST=$($SB status --task t16 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["slots"][0]["state"])')
+ST=$("$SB" status --task t16 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["slots"][0]["state"])')
 ck "$ST" "ORPHAN" "T16a crafted slot derives ORPHAN"
-$SB wait --task t16 --timeout 3 --interval 1 >/dev/null
+"$SB" wait --task t16 --timeout 3 --interval 1 >/dev/null
 ck "$?" "3" "T16b wait on ORPHAN-only blocks to timeout (no no-op spin)"
 kill -9 "$OW" 2>/dev/null
 
 # T15: task name sanitization (finding #7)
-$TD --task '../evil' --lane x --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+"$TD" --task '../evil' --lane x --exec /bin/bash -- -c 'true' >/dev/null 2>&1
 ck "$?" "2" "T15a dispatch rejects path-escape task name"
-$SB status --task '../evil' >/dev/null 2>&1
+"$SB" status --task '../evil' >/dev/null 2>&1
 ck "$?" "2" "T15b status rejects path-escape task name"
 
 # ---- Daemon race + memory hardening ----
@@ -184,11 +184,11 @@ ck "$?" "2" "T15b status rejects path-escape task name"
 # T17: first-sight publish — a brand-new lane must be observable via
 # /v1/wait immediately (old=None -> to=state), not only on its next real
 # state transition (re-dispatch visibility scenario A).
-$SB serve --port 17998 >/dev/null 2>&1 &
+"$SB" serve --port 17998 >/dev/null 2>&1 &
 SRVA=$!
 sleep 1.5
 CUR=$(curl -s "http://127.0.0.1:17998/v1/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["cursor"])')
-$TD --task t17 --lane fs --exec /bin/bash -- -c 'sleep 5' >/dev/null 2>&1 &
+"$TD" --task t17 --lane fs --exec /bin/bash -- -c 'sleep 5' >/dev/null 2>&1 &
 EV=$(curl -s "http://127.0.0.1:17998/v1/wait?task=t17&cursor=$CUR&timeout=10" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -247,7 +247,7 @@ ck "$TAIL_IS" "70 71 72 73 74 75 76 77 78 79" "T19b /v1/events tail matches last
 # T20: re-dispatch never drops the lane from /v1/status mid-swap (poll
 # during the swap; the archive is a copy, the live slot path is atomically
 # replaced and never unlinked — re-dispatch visibility).
-$TD --task t20 --lane swap --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+"$TD" --task t20 --lane swap --exec /bin/bash -- -c 'true' >/dev/null 2>&1
 : > "$AGENT_SWITCHBOARD_ROOT/t20-poll.log"
 ( for i in $(seq 1 60); do
     N=$(curl -s "http://127.0.0.1:17998/v1/status?task=t20" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len([s for s in d[0]["slots"] if s["lane"]=="swap"]))')
@@ -256,7 +256,7 @@ $TD --task t20 --lane swap --exec /bin/bash -- -c 'true' >/dev/null 2>&1
   done ) &
 POLLER=$!
 sleep 0.1
-$TD --task t20 --lane swap --exec /bin/bash -- -c 'sleep 1' >/dev/null 2>&1
+"$TD" --task t20 --lane swap --exec /bin/bash -- -c 'sleep 1' >/dev/null 2>&1
 wait "$POLLER" 2>/dev/null
 MISSING=$(grep -c '^0$' "$AGENT_SWITCHBOARD_ROOT/t20-poll.log" || true)
 ck "${MISSING:-0}" "0" "T20 /v1/status never drops the lane during re-dispatch swap"
@@ -266,14 +266,14 @@ wait 2>/dev/null
 
 # T21: boot_id in /v1/health + /v1/wait, changes across a restart; a stale
 # cursor that predates the trimmed ring gets gap:true and cursor:now.
-AGENT_SWITCHBOARD_BUS_MAXLEN=5 $SB serve --port 17997 >/dev/null 2>&1 &
+AGENT_SWITCHBOARD_BUS_MAXLEN=5 "$SB" serve --port 17997 >/dev/null 2>&1 &
 SRVB=$!
 sleep 1.5
 BOOT1=$(curl -s "http://127.0.0.1:17997/v1/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["boot_id"])')
 ck "${#BOOT1}" "32" "T21a boot_id present in /v1/health (32-char hex)"
 
 for i in 1 2 3 4 5 6 7 8; do
-  $TD --task t21 --lane "churn$i" --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+  "$TD" --task t21 --lane "churn$i" --exec /bin/bash -- -c 'true' >/dev/null 2>&1
 done
 sleep 1.5   # >= one watcher tick: 8 first-sight publishes overflow the 5-slot ring
 
@@ -287,7 +287,7 @@ ck "$WBOOT" "$BOOT1" "T21d /v1/wait reply boot_id matches /v1/health"
 kill "$SRVB" 2>/dev/null
 wait 2>/dev/null
 sleep 0.3
-AGENT_SWITCHBOARD_BUS_MAXLEN=5 $SB serve --port 17997 >/dev/null 2>&1 &
+AGENT_SWITCHBOARD_BUS_MAXLEN=5 "$SB" serve --port 17997 >/dev/null 2>&1 &
 SRVB2=$!
 sleep 1.5
 BOOT2=$(curl -s "http://127.0.0.1:17997/v1/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["boot_id"])')
@@ -298,10 +298,10 @@ wait 2>/dev/null
 # T22: cold-archive moves long-finished slots to history/ on a watcher pass;
 # status/watcher exclude them afterward (T41 is the 15-min served-board
 # filter — files stay; this test is the 24h file-move).
-AGENT_SWITCHBOARD_COLD_AFTER=1 $SB serve --port 17996 >/dev/null 2>&1 &
+AGENT_SWITCHBOARD_COLD_AFTER=1 "$SB" serve --port 17996 >/dev/null 2>&1 &
 SRVC=$!
 sleep 1.5
-$TD --task t22 --lane cold --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+"$TD" --task t22 --lane cold --exec /bin/bash -- -c 'true' >/dev/null 2>&1
 sleep 3   # well past COLD_AFTER=1s, across a couple of 1s watcher ticks
 N=$(curl -s "http://127.0.0.1:17996/v1/status?task=t22" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)[0]["slots"]))')
 ck "$N" "0" "T22a cold-archived slot excluded from /v1/status"
@@ -527,7 +527,7 @@ else
 fi
 
 # T24: live GET /v1/cli shape + sweep cost <100ms + TTL via daemon (port 17985)
-$SB serve --port 17985 >/tmp/sb-b2-serve-17985.log 2>&1 &
+"$SB" serve --port 17985 >/tmp/sb-b2-serve-17985.log 2>&1 &
 SRVD=$!
 sleep 1.5
 CLI1=$(curl -s "http://127.0.0.1:17985/v1/cli")
@@ -602,7 +602,7 @@ mkdir -p "$IDLE_ROOT"
 # (forces the cli/viewer OR-terms to read not-busy on this dev machine,
 # which may have a real claude/grok session attached) with no ACTIVE slot
 # in any task -> the daemon self-exits 0 within grace+2s.
-AGENT_SWITCHBOARD_ROOT="$IDLE_ROOT" AGENT_SWITCHBOARD_IDLE_GRACE=2 AGENT_SWITCHBOARD_IDLE_TEST_FORCE=1 $SB serve --port 17975 >/tmp/sb-t25.log 2>&1 &
+AGENT_SWITCHBOARD_ROOT="$IDLE_ROOT" AGENT_SWITCHBOARD_IDLE_GRACE=2 AGENT_SWITCHBOARD_IDLE_TEST_FORCE=1 "$SB" serve --port 17975 >/tmp/sb-t25.log 2>&1 &
 SRV25=$!
 T0=$(date +%s)
 wait "$SRV25" 2>/dev/null
@@ -614,7 +614,7 @@ ck "$RC25" "0" "T25a idle-exit process exit code 0"
 # T25c: AGENT_SWITCHBOARD_IDLE_DISABLE=1 is the deploy safety valve — it must
 # completely disable idle-exit even with the same short grace + force hook
 # + no active slot.
-AGENT_SWITCHBOARD_ROOT="$IDLE_ROOT" AGENT_SWITCHBOARD_IDLE_GRACE=2 AGENT_SWITCHBOARD_IDLE_TEST_FORCE=1 AGENT_SWITCHBOARD_IDLE_DISABLE=1 $SB serve --port 17975 >/tmp/sb-t25c.log 2>&1 &
+AGENT_SWITCHBOARD_ROOT="$IDLE_ROOT" AGENT_SWITCHBOARD_IDLE_GRACE=2 AGENT_SWITCHBOARD_IDLE_TEST_FORCE=1 AGENT_SWITCHBOARD_IDLE_DISABLE=1 "$SB" serve --port 17975 >/tmp/sb-t25c.log 2>&1 &
 SRV25B=$!
 sleep 5
 if kill -0 "$SRV25B" 2>/dev/null; then ck ok ok "T25c AGENT_SWITCHBOARD_IDLE_DISABLE=1 keeps daemon up past grace+2s"; else ck exited running "T25c AGENT_SWITCHBOARD_IDLE_DISABLE=1 keeps daemon up past grace+2s"; fi
@@ -625,10 +625,10 @@ wait 2>/dev/null
 # AGENT_SWITCHBOARD_IDLE_TEST_FORCE=1 — the active-slot OR-term of the busy
 # predicate is never masked by the test force hook (R2.5 busy predicate).
 # Same isolated root, plus a fresh task so no other test's slot is involved.
-AGENT_SWITCHBOARD_ROOT="$IDLE_ROOT" AGENT_SWITCHBOARD_IDLE_GRACE=2 AGENT_SWITCHBOARD_IDLE_TEST_FORCE=1 $SB serve --port 17976 >/tmp/sb-t26.log 2>&1 &
+AGENT_SWITCHBOARD_ROOT="$IDLE_ROOT" AGENT_SWITCHBOARD_IDLE_GRACE=2 AGENT_SWITCHBOARD_IDLE_TEST_FORCE=1 "$SB" serve --port 17976 >/tmp/sb-t26.log 2>&1 &
 SRV26=$!
 sleep 1.5
-AGENT_SWITCHBOARD_ROOT="$IDLE_ROOT" $TD --task t26 --lane busy --exec /bin/bash -- -c 'sleep 8' >/dev/null 2>&1 &
+AGENT_SWITCHBOARD_ROOT="$IDLE_ROOT" "$TD" --task t26 --lane busy --exec /bin/bash -- -c 'sleep 8' >/dev/null 2>&1 &
 sleep 6
 if kill -0 "$SRV26" 2>/dev/null; then ck ok ok "T26a daemon stays up with an ACTIVE slot present (past grace+2s)"; else ck exited running "T26a daemon stays up with an ACTIVE slot present"; fi
 BR=$(curl -s --max-time 2 "http://127.0.0.1:17976/v1/health" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("slots" in d.get("busy_reasons",[]))' 2>/dev/null)
@@ -639,12 +639,12 @@ wait 2>/dev/null
 # T27: two serves on the SAME scratch port — the second sees a healthy peer
 # and exits 0 immediately; the first is untouched and keeps serving
 # (distinct from T10d, which covers the same contract on b4's port).
-$SB serve --port 17977 >/tmp/sb-t27.log 2>&1 &
+"$SB" serve --port 17977 >/tmp/sb-t27.log 2>&1 &
 SRV27=$!
 sleep 1.5
 H1=$(curl -s --max-time 2 "http://127.0.0.1:17977/v1/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ok"])' 2>/dev/null)
 ck "$H1" "True" "T27a first daemon on 17977 healthy"
-$SB serve --port 17977 >/tmp/sb-t27-dup.log 2>&1
+"$SB" serve --port 17977 >/tmp/sb-t27-dup.log 2>&1
 ck "$?" "0" "T27b duplicate serve on 17977 exits 0 (healthy peer)"
 H2=$(curl -s --max-time 2 "http://127.0.0.1:17977/v1/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ok"])' 2>/dev/null)
 ck "$H2" "True" "T27c first daemon still serving after duplicate exited"
@@ -667,7 +667,7 @@ wait 2>/dev/null
 # T28: SIGTERM drains gracefully — a pending /v1/wait unblocks and the
 # daemon process itself is gone within 3s (bounded join; H1/H2/H5: "a wait
 # that cannot be woken is a lane failure").
-$SB serve --port 17978 >/tmp/sb-t28.log 2>&1 &
+"$SB" serve --port 17978 >/tmp/sb-t28.log 2>&1 &
 SRV28=$!
 sleep 1.5
 CUR28=$(curl -s --max-time 2 "http://127.0.0.1:17978/v1/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["cursor"])')
@@ -684,7 +684,7 @@ wait 2>/dev/null
 
 # T29: /v1/wait concurrency cap — over cap returns 503 with Retry-After: 5
 # (default cap 24, AGENT_SWITCHBOARD_WAIT_CAP overrides for tests).
-AGENT_SWITCHBOARD_WAIT_CAP=2 $SB serve --port 17979 >/tmp/sb-t29.log 2>&1 &
+AGENT_SWITCHBOARD_WAIT_CAP=2 "$SB" serve --port 17979 >/tmp/sb-t29.log 2>&1 &
 SRV29=$!
 sleep 1.5
 CUR29=$(curl -s --max-time 2 "http://127.0.0.1:17979/v1/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["cursor"])')
@@ -824,10 +824,10 @@ else
   ck ok ok "T31a compiled headless grok fixture available"
   # Short TTL so the post-dispatch /v1/cli call is a real sweep, not a
   # pre-dispatch cache hit (default TTL is 5s).
-  AGENT_SWITCHBOARD_CLI_CACHE_TTL=0.5 $SB serve --port 17985 >/tmp/sb-t31-serve.log 2>&1 &
+  AGENT_SWITCHBOARD_CLI_CACHE_TTL=0.5 "$SB" serve --port 17985 >/tmp/sb-t31-serve.log 2>&1 &
   SRV31=$!
   sleep 1.5
-  $TD --task t31 --lane forest --exec "$T31_BIN/grok" -- 25 >/dev/null 2>&1 &
+  "$TD" --task t31 --lane forest --exec "$T31_BIN/grok" -- 25 >/dev/null 2>&1 &
   TD31=$!
   sleep 1.0
   # One more half-second past TTL so the forest reflects the new worker.
@@ -1358,9 +1358,9 @@ else
 fi
 
 # T36: refuse event is written
-$TD --task t36 --lane cap1 --exec /bin/bash -- -c 'sleep 8' >/dev/null 2>&1 &
+"$TD" --task t36 --lane cap1 --exec /bin/bash -- -c 'sleep 8' >/dev/null 2>&1 &
 sleep 0.4
-$TD --task t36 --lane cap2 --max 1 --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+"$TD" --task t36 --lane cap2 --max 1 --exec /bin/bash -- -c 'true' >/dev/null 2>&1
 ck "$?" "2" "T36a capacity refuse exit 2"
 REF=$(python3 -c '
 import json,os
@@ -1378,11 +1378,11 @@ wait 2>/dev/null
 # T37: stall + wait --json + advise
 # Keep bash in the process (a lone `sleep 20` is exec'd; prog_base
 # identity would then treat the worker as gone and derive RUNNING).
-$TD --task t37 --lane hang --exec /bin/bash -- -c 'sleep 20; exit 0' >/dev/null 2>&1 &
+"$TD" --task t37 --lane hang --exec /bin/bash -- -c 'sleep 20; exit 0' >/dev/null 2>&1 &
 sleep 2.2
-ST=$($SB status --task t37 --stall-after 1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["slots"][0]["state"])')
+ST=$("$SB" status --task t37 --stall-after 1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["slots"][0]["state"])')
 ck "$ST" "STALLED" "T37a headless silence past stall budget -> STALLED"
-ADV=$($SB wait --task t37 --lane hang --stall-after 1 --timeout 2 --interval 0.4 --json)
+ADV=$("$SB" wait --task t37 --lane hang --stall-after 1 --timeout 2 --interval 0.4 --json)
 ADV_RC=$?
 ck "$ADV_RC" "0" "T37b wait returns 0 on STALLED"
 NEXT=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("inspect_stalled:hang" in d.get("next",[]), d.get("severity"))' "$ADV")
@@ -1472,10 +1472,10 @@ if [ $? -eq 0 ]; then ck ok ok "T39a stop hook allows non-exec-master"; else ck 
 # T41: DONE rows drop from /v1/status after DONE_EXPIRE, slot file remains
 # (cold-archive / T22 is the 24h file-move; this is the 15-min board filter).
 # Ports 17970-17974 (T10/T21/T22 own 17995-17999; T23 comment reserves 17985-17989).
-AGENT_SWITCHBOARD_DONE_EXPIRE=1 $SB serve --port 17974 >/dev/null 2>&1 &
+AGENT_SWITCHBOARD_DONE_EXPIRE=1 "$SB" serve --port 17974 >/dev/null 2>&1 &
 SRV41=$!
 sleep 1.5
-$TD --task t41 --lane done --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+"$TD" --task t41 --lane done --exec /bin/bash -- -c 'true' >/dev/null 2>&1
 LANES=$(curl -s "http://127.0.0.1:17974/v1/status?task=t41" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"]+":"+s["state"] for s in d[0]["slots"]))')
 ck "$LANES" "done:DONE" "T41a freshly DONE row still listed on /v1/status"
 sleep 2   # past DONE_EXPIRE=1s, across a watcher tick
@@ -1487,13 +1487,13 @@ d = json.load(open(p))
 d['ended'] = time.time() - 5
 json.dump(d, open(p, 'w'))
 "
-$TD --task t41 --lane fresh --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+"$TD" --task t41 --lane fresh --exec /bin/bash -- -c 'true' >/dev/null 2>&1
 LANES=$(curl -s "http://127.0.0.1:17974/v1/status?task=t41" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"]+":"+s["state"] for s in d[0]["slots"]))')
 ck "$LANES" "fresh:DONE" "T41b expired DONE omitted; fresher DONE stays"
 if [ -f "$AGENT_SWITCHBOARD_ROOT/t41/slot-done.json" ]; then ck ok ok "T41c expired DONE slot file remains on disk"; else ck absent present "T41c expired DONE slot file remains on disk"; fi
 HIST=$(ls "$AGENT_SWITCHBOARD_ROOT/t41/history" 2>/dev/null | grep -c '^done-' || true)
 ck "${HIST:-0}" "0" "T41d history/ has no done-* (not cold-archived)"
-CLI=$(AGENT_SWITCHBOARD_DONE_EXPIRE=1 $SB status --task t41 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"] for s in d[0]["slots"]))')
+CLI=$(AGENT_SWITCHBOARD_DONE_EXPIRE=1 "$SB" status --task t41 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"] for s in d[0]["slots"]))')
 ck "$CLI" "fresh" "T41e CLI status --json uses the same task_status omit"
 kill "$SRV41" 2>/dev/null
 wait 2>/dev/null
@@ -1506,8 +1506,112 @@ d = json.load(open(p))
 d['ended'] = time.time() - 10
 json.dump(d, open(p, 'w'))
 "
-CLI0=$(AGENT_SWITCHBOARD_DONE_EXPIRE=0 $SB status --task t41 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"] for s in d[0]["slots"] if s["lane"]=="done"))')
+CLI0=$(AGENT_SWITCHBOARD_DONE_EXPIRE=0 "$SB" status --task t41 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"] for s in d[0]["slots"] if s["lane"]=="done"))')
 ck "$CLI0" "done" "T41f DONE_EXPIRE=0 keeps stale DONE listed"
+
+# T50: viewer classifier is argv0/path-position only. A path appearing as a
+# flag value or inside prompt text must not classify a process as viewer.
+python3 - "$SB" <<'EOF'
+import importlib.machinery, importlib.util, sys
+
+loader = importlib.machinery.SourceFileLoader("sb", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+sb = importlib.util.module_from_spec(spec)
+loader.exec_module(sb)
+
+
+def assert_true(cond, msg):
+    if not cond:
+        print("FAIL_ASSERT", msg)
+        sys.exit(1)
+
+
+assert_true(
+    sb.kind_from_command("grok --cwd /x/agent-switchboard") == "grok_cli",
+    "grok --cwd /x/agent-switchboard is grok_cli not viewer",
+)
+assert_true(
+    sb.kind_from_command("grok --cwd=/tmp/agent-switchboard") == "grok_cli",
+    "grok --cwd=/tmp/agent-switchboard is grok_cli not viewer",
+)
+assert_true(
+    sb.kind_from_command("grok -p look at /agent-switchboard please") == "grok_cli",
+    "grok with /agent-switchboard in prompt text is grok_cli not viewer",
+)
+assert_true(
+    sb.kind_from_command("/bin/bash /usr/local/bin/grok-ask -d /tmp/agent-switchboard")
+    == "grok_ask",
+    "grok-ask -d .../agent-switchboard is grok_ask not viewer",
+)
+assert_true(
+    sb.kind_from_command("/opt/agent-switchboard") == "viewer",
+    "argv0 /opt/agent-switchboard is viewer",
+)
+assert_true(
+    sb.kind_from_command(
+        "/Applications/Agent Switchboard.app/Contents/MacOS/agent-switchboard"
+    )
+    == "viewer",
+    "app-bundle Agent Switchboard.app Contents/MacOS is viewer",
+)
+# D1b: space-bearing install path (command.split() truncates toks[1] at
+# "Internal"). Reconstruct early-argv path tokens; never match flag values
+# or prompt text.
+_PY = (
+    "/Library/Frameworks/Python.framework/Versions/3.13/Resources/"
+    "Python.app/Contents/MacOS/Python"
+)
+_SPACE_AD = (
+    "/Users/me/Internal Development/Tools/oss-widgets/bin/agent-dispatch"
+    " --task t31 --lane forest --exec /tmp/grok -- 25"
+)
+assert_true(
+    sb.kind_from_command(_PY + " " + _SPACE_AD) == "agent_dispatch",
+    "python3 wrapper + space-bearing agent-dispatch is agent_dispatch",
+)
+_ad_meta = sb._parse_wrapper_flags(_PY + " " + _SPACE_AD, "agent_dispatch")
+assert_true(
+    _ad_meta.get("task") == "t31" and _ad_meta.get("lane") == "forest",
+    "space-bearing agent-dispatch still yields --task/--lane",
+)
+assert_true(
+    sb.kind_from_command(
+        "python3 /Users/me/Internal Development/Tools/bin/switchboard serve"
+    )
+    == "switchboard_daemon",
+    "python3 wrapper + space-bearing switchboard is switchboard_daemon",
+)
+assert_true(
+    sb.kind_from_command(
+        "/bin/bash /Users/me/Internal Development/bin/grok-ask -w -c ch-x"
+    )
+    == "grok_ask",
+    "bash wrapper + space-bearing grok-ask is grok_ask",
+)
+assert_true(
+    sb.kind_from_command("python3 /tmp/other.py --cwd /x/agent-dispatch") is None,
+    "python3 + --cwd /x/agent-dispatch is not agent_dispatch (D1: flag value)",
+)
+assert_true(
+    sb.kind_from_command("python3 -c print('/agent-dispatch')") is None,
+    "python3 -c prompt containing /agent-dispatch is not agent_dispatch",
+)
+assert_true(
+    sb.kind_from_command("/bin/bash -c echo /grok-ask") == "shell_tool",
+    "bash -c prompt containing /grok-ask is shell_tool not grok_ask",
+)
+print("ALL_T50_OK")
+EOF
+if [ $? -eq 0 ]; then
+  ck ok ok "T50a grok --cwd /x/agent-switchboard is grok_cli"
+  ck ok ok "T50b grok --cwd=/tmp/agent-switchboard is grok_cli"
+  ck ok ok "T50c grok prompt text /agent-switchboard is grok_cli"
+  ck ok ok "T50d grok-ask -d .../agent-switchboard is grok_ask"
+  ck ok ok "T50e argv0 /opt/agent-switchboard is viewer"
+  ck ok ok "T50f app-bundle Contents/MacOS is viewer"
+else
+  ck fail ok "T50 viewer argv0/path-position classifier unit block"
+fi
 
 echo; echo "RESULT: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

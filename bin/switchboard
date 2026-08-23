@@ -322,13 +322,61 @@ def _tokens(command):
     return command.split() if command else []
 
 
+# Interpreter-script basenames. Used to reconstruct a space-bearing install
+# path after python/shell argv0 (D1b): command.split() breaks "Internal
+# Development" so toks[1] is a truncated prefix, not the script.
+_PYTHON_SCRIPT_KINDS = {
+    "agent-dispatch": "agent_dispatch",
+    "team-dispatch": "agent_dispatch",
+    "switchboard": "switchboard_daemon",
+}
+_SHELL_SCRIPT_KINDS = {
+    "grok-ask": "grok_ask",
+    "cursor-ask": "cursor_ask",
+}
+
+
+def _script_after_interpreter(toks, start, known):
+    """Reconstruct a space-bearing script path in early argv (D1b).
+
+    Structural path marker, same class as the app-bundle check: join tokens
+    after the interpreter until basename is in `known`. Stop at a flag or a
+    new `/`/`~` path so flag values and prompt text are never scanned (D1).
+    Returns (basename if in known else None, index just after the script).
+    """
+    if start >= len(toks):
+        return None, start
+    t = toks[start]
+    if t.startswith("-"):
+        return None, start
+    acc = t
+    i = start
+    while True:
+        base = os.path.basename(acc)
+        if base in known:
+            return base, i + 1
+        if i + 1 >= len(toks):
+            return None, start
+        nxt = toks[i + 1]
+        if nxt.startswith("-") or nxt.startswith("/") or nxt.startswith("~"):
+            return None, start
+        acc = acc + " " + nxt
+        i += 1
+
+
 def viewer_process_match(command):
-    """Viewer identity from argv0/path ONLY (never free-text prompt).
+    """Viewer identity from argv0/path-position ONLY (never free-text prompt).
 
     Never pgrep -f "Agent Switchboard" (prompt-pollution class). App-bundle
     paths contain a space ("Agent Switchboard.app"), so a naive split of
-    command into argv0 truncates early — structural path markers are also
-    checked on the full command string.
+    command into argv0 truncates early — that structural path marker is
+    checked on the full command string. A path appearing as a flag value
+    (`--cwd /x/agent-switchboard`, `--cwd=/x/agent-switchboard`) or inside
+    prompt text is not a match.
+
+    Remaining same-class full-command substring checks (audit; kept, not
+    in this function): Claude.app exclusion in kind_from_command, and
+    cursor-agent versions path in kind_from_command.
     """
     if not command:
         return False
@@ -340,8 +388,6 @@ def viewer_process_match(command):
     # Space-bearing install path (argv0 split loses the rest of the path).
     if "/Agent Switchboard.app/Contents/MacOS/" in command:
         return True
-    if re.search(r"/agent-switchboard(?:\s|$)", command):
-        return True
     return False
 
 
@@ -352,10 +398,15 @@ def kind_from_command(command):
     cursor_cli, agent_dispatch. Classified-but-never-emitted: grok_ask,
     cursor_ask, switchboard_daemon, shell_tool, viewer.
     Claude.app helpers return None (excluded).
+
+    Space-bearing install paths (e.g. ".../Internal Development/...") are
+    recovered by joining early-argv path tokens until a known script
+    basename — never by scanning flag values or prompt text (D1b).
     """
     if not command:
         return None
     # Desktop noise: full-path markers are not free-text prompts.
+    # Same-class full-command substring check (audit; kept).
     if "/Applications/Claude.app/" in command or "Claude Helper" in command:
         return None
     a0 = _argv0(command)
@@ -365,23 +416,31 @@ def kind_from_command(command):
     toks = _tokens(command)
 
     if b0 in _PYTHON_NAMES and len(toks) >= 2:
-        script = os.path.basename(toks[1])
-        if script in ("agent-dispatch", "team-dispatch"):
-            return "agent_dispatch"
-        if script == "switchboard":
-            return "switchboard_daemon"
+        script, _ = _script_after_interpreter(toks, 1, _PYTHON_SCRIPT_KINDS)
+        if script in _PYTHON_SCRIPT_KINDS:
+            return _PYTHON_SCRIPT_KINDS[script]
         return None
 
     if b0 in _SHELL_NAMES and len(toks) >= 2:
-        script = os.path.basename(toks[1])
-        if script == "grok-ask":
-            return "grok_ask"
-        if script == "cursor-ask":
-            return "cursor_ask"
-        # Pure tool shells (zsh -c / bash -c) — classify for completeness, never emit.
-        if toks[1] in ("-c", "-lc") or (len(toks) >= 3 and toks[1] in ("-c", "-lc")):
+        # -c/-lc is a flag, not a script path — do not reconstruct into the
+        # prompt blob (D1).
+        if toks[1] in ("-c", "-lc"):
             return "shell_tool"
+        script, _ = _script_after_interpreter(toks, 1, _SHELL_SCRIPT_KINDS)
+        if script in _SHELL_SCRIPT_KINDS:
+            return _SHELL_SCRIPT_KINDS[script]
+        # Pure tool shells (zsh -c / bash -c) — classify for completeness, never emit.
         return "shell_tool"
+
+    # Direct argv0 is itself a space-bearing wrapper script (no interpreter
+    # prefix). Reconstruct from toks[0] the same way.
+    script0, _ = _script_after_interpreter(
+        toks, 0, {**_PYTHON_SCRIPT_KINDS, **_SHELL_SCRIPT_KINDS}
+    )
+    if script0 in _PYTHON_SCRIPT_KINDS:
+        return _PYTHON_SCRIPT_KINDS[script0]
+    if script0 in _SHELL_SCRIPT_KINDS:
+        return _SHELL_SCRIPT_KINDS[script0]
 
     if b0 == "cursor-ask" or a0.endswith("/cursor-ask"):
         return "cursor_ask"
@@ -389,7 +448,7 @@ def kind_from_command(command):
         b0 == "cursor-agent"
         or a0.endswith("/cursor-agent")
         or "/.local/share/cursor-agent/" in a0
-        or "/cursor-agent/versions/" in command
+        or "/cursor-agent/versions/" in command  # same-class full-command check (audit; kept)
     ):
         return "cursor_cli"
     # node + cursor-agent index.js (exec -a failed / older launcher)
@@ -455,13 +514,20 @@ def _parse_wrapper_flags(command, kind):
         i = 0
         if i < len(toks) and os.path.basename(toks[i]) in (_PYTHON_NAMES | _SHELL_NAMES):
             i += 1
-        if i < len(toks) and os.path.basename(toks[i]) in (
+        _wrap_names = {
             "grok-ask",
             "cursor-ask",
             "agent-dispatch",
             "team-dispatch",
-        ):
+        }
+        if i < len(toks) and os.path.basename(toks[i]) in _wrap_names:
             i += 1
+        else:
+            # Space-bearing script path: skip reconstructed tokens so --task
+            # / --lane after ".../Internal Development/.../agent-dispatch"
+            # are still visible (D1b; T31b label).
+            _, after = _script_after_interpreter(toks, i, _wrap_names)
+            i = after
         while i < len(toks):
             t = toks[i]
             mval, ni = take_model(toks, i)
