@@ -5,7 +5,7 @@
   :root{
     --page:#0b0e12; --panel:#14181f; --slot:#1b212a; --slot-hi:#20272f;
     --border:#262d38; --ink:#e8ecf2; --mut:#8b93a1; --dim:#4a5261;
-    --run:#35d07a; --wait:#e0a52e; --fail:#e5484d; --done:#4a5261;
+    --run:#35d07a; --wait:#e0a52e; --fail:#e5484d; --done:#4a5261; --inv:#5b8fd9;
     --pill-border:#33506b; --pill-ink:#9cc6ea;
     --mono:"SF Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
     --r:9px;
@@ -88,10 +88,14 @@
   .lamp.done{background:radial-gradient(circle at 35% 32%, #6a7484, var(--done) 64%)}
   .lamp.fail{background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%); box-shadow:0 0 8px 1px rgba(229,72,77,.5)}
   .lamp.stall{background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%); box-shadow:0 0 8px 1px rgba(229,72,77,.45)}
-  .lamp.died{background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%); animation:pulse 1.5s ease-in-out infinite}
+  .lamp.died{background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%); box-shadow:0 0 8px 1px rgba(229,72,77,.5)}
   .lamp.orphan{background:transparent; border:2px solid var(--wait)}
-  @keyframes pulse{0%,100%{box-shadow:0 0 5px 0 rgba(229,72,77,.35)}50%{box-shadow:0 0 12px 3px rgba(229,72,77,.75)}}
-  @media (prefers-reduced-motion:reduce){.lamp.died{animation:none}}
+  .lamp.stall-inv{animation:stall-inv-flash 1s steps(2,end) infinite}
+  @keyframes stall-inv-flash{
+    0%,49%{background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%);box-shadow:0 0 8px 1px rgba(229,72,77,.5)}
+    50%,100%{background:radial-gradient(circle at 35% 32%, #8eb8f0, var(--inv) 62%);box-shadow:0 0 8px 1px rgba(91,143,217,.5)}
+  }
+  @media (prefers-reduced-motion:reduce){.lamp.stall-inv{animation:none;background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%)}}
 
   .name{font-weight:700; letter-spacing:.4px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:0 1 auto}
   .pill{border:1px solid var(--border); color:var(--mut); border-radius:6px; padding:2px 8px; font-size:10.5px; letter-spacing:1.2px; white-space:nowrap; flex-shrink:0}
@@ -99,7 +103,9 @@
   .pill.model{background:#12161c; color:var(--mut); letter-spacing:.6px; font-size:11px}
   .pill.pid{background:#12161c; color:var(--mut); letter-spacing:.4px; font-size:11px; font-variant-numeric:tabular-nums}
   .pidlog{color:var(--dim); font-size:11.5px; letter-spacing:.4px; padding:4px 2px 0 18px}
-  .pidlog span{margin-right:14px; white-space:nowrap}
+  .pidlog .grid-row{display:inline-flex; align-items:center; gap:7px; margin-right:14px; white-space:nowrap; vertical-align:middle; opacity:.78}
+  .pidlog .grid-row .lamp.done{background:radial-gradient(circle at 35% 32%, #5a6270, var(--done) 64%)}
+  .pidlog .grid-row .stword{color:var(--mut); letter-spacing:.8px; font-size:10.5px}
   .meta{color:var(--mut); font-size:12.5px; letter-spacing:.3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; flex:1 1 0%}
   .meta .k{color:var(--dim)}
   .up{margin-left:auto; color:var(--mut); font-size:12.5px; letter-spacing:.5px; white-space:nowrap; font-variant-numeric:tabular-nums; padding-left:8px; flex-shrink:0}
@@ -177,8 +183,9 @@
    Standalone preview: ?mock=1 renders MOCK. No network is ever performed.
    ========================================================================== */
 
-const STATE_CLASS = {RUNNING:'run',WORKING_TOOL:'run',WAITING_INPUT:'quiet',QUIET:'quiet',
-                     STALLED:'stall',DIED:'died',FAILED:'fail',DONE:'done',ORPHAN:'quiet',CORRUPT:'fail'};
+const LAMP_STATUS = {active:'run',running:'quiet',failed:'fail',error:'fail',completed:'done',cancelled:'done'};
+const STATE_CLASS = {RUNNING:'quiet',WORKING_TOOL:'run',WAITING_INPUT:'quiet',QUIET:'quiet',
+                     STALLED:'fail',DIED:'fail',FAILED:'fail',DONE:'done',ORPHAN:'quiet',CORRUPT:'fail'};
 const COUNT_ORDER = [['run','RUNNING'],['quiet','QUIET'],['stall','STALLED'],
                      ['died','DIED'],['fail','FAILED'],['done','DONE']];
 const HOST_ORDER = ['mbp','mini','pc','cnc'];
@@ -188,6 +195,35 @@ let DOC = null, activeHost = 'all';
 function lsGet(k,d){ try{ const v=localStorage.getItem(k); return v==null?d:v; }catch(e){ return d; } }
 function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+/* lamp color law — single mapping for tree, slot grid, ended grid (DESIGN.md) */
+function isStallInvestigator(){
+  for(let i=0;i<arguments.length;i++){
+    const s=String(arguments[i]||'').toLowerCase();
+    if(s.startsWith('stall-')) return true;
+  }
+  return false;
+}
+function lampClassFromStatus(status){
+  return LAMP_STATUS[String(status||'').toLowerCase()] || null;
+}
+function lampClassFromState(state){
+  if(state==null||state==='') return 'quiet';
+  const u=String(state).toUpperCase();
+  if(STATE_CLASS[u]!=null) return STATE_CLASS[u];
+  return lampClassFromStatus(state) || 'quiet';
+}
+function resolveLampClass(opts){
+  opts=opts||{};
+  if(opts.fallback==='died') return 'fail';
+  const fromStatus=lampClassFromStatus(opts.status);
+  if(fromStatus) return fromStatus;
+  if(opts.state!=null&&opts.state!=='') return lampClassFromState(opts.state);
+  return 'quiet';
+}
+function lampSpanClass(base, stallInv, sm){
+  return 'lamp'+(sm?' sm':'')+' '+base+(stallInv?' stall-inv':'');
+}
 
 function fmtDur(sec){
   if(sec==null||isNaN(sec)) return '\u2014';
@@ -223,25 +259,34 @@ function agentStates(){
       const k=n.state||stClass(n.status)||'quiet';
       if(c[k]!=null) c[k]++;
     });
+    if(h._has_status){
+      (h._terminal_grid||[]).forEach(r=>{
+        const st=String(r.status||'').toLowerCase();
+        if(st==='failed'||st==='error') c.fail++;
+        else if(st==='completed'||st==='cancelled') c.done++;
+      });
+    }
   });
   const now=Date.now();
   if(activeHost==='all'||activeHost===LOCAL_HOST_ID){
-    CLOSED_PID_LOG.forEach(e=>{ if(now-e.closedAt<PID_LOG_MS) c.died++; });
-    DONE_LOG.forEach(e=>{ if(now-e.at<PID_LOG_MS) c.done++; });
-    FAIL_LOG.forEach(e=>{ if(now-e.at<PID_LOG_MS) c.fail++; });
+    const local=((DOC&&DOC.hosts)||[]).find(x=>x&&x.id===LOCAL_HOST_ID);
+    if(local&&!local._has_status){
+      CLOSED_PID_LOG.forEach(e=>{ if(now-e.closedAt<PID_LOG_MS) c.died++; });
+    }
   }
   return c;
 }
 function cliKindCounts(){
   const c={claude:0,grok:0,cursor:0,live:0};
   hosts().forEach(h=>{
-    if(h.cli){ c.claude+=h.cli.claude||0; c.grok+=h.cli.grok||0; c.cursor+=h.cli.cursor||0; }
-    (function walk(ns){(ns||[]).forEach(n=>{
-      const st=String(n.status||'').toLowerCase();
-      const terminal=st==='completed'||st==='cancelled'||st==='failed'||st==='error';
-      if(hasLamp(n.kind) && !terminal) c.live++;
-      walk(n.children);
-    });})(h.cli_tree);
+    walkAgentNodes(h.cli_tree, n=>{
+      if(!hasLamp(n.kind)) return;
+      const fam=familyName(n.kind);
+      if(fam==='claude') c.claude++;
+      else if(fam==='grok') c.grok++;
+      else if(fam==='cursor') c.cursor++;
+      c.live++;
+    });
   });
   return c;
 }
@@ -262,7 +307,9 @@ function nodeHTML(n){
   const kids = (n.children&&n.children.length) ? n.children : null;
   const isDisp = !hasLamp(n.kind);
   const tri = kids ? '<span class="tri open" data-node></span>' : '<span class="tri hidden"></span>';
-  const lamp = isDisp ? '' : '<span class="lamp '+(n.state||'quiet')+'"></span>';
+  const lc=resolveLampClass({status:n.status,state:n.state});
+  const si=isStallInvestigator(n.channel,n.label,n.lane);
+  const lamp = isDisp ? '' : '<span class="'+lampSpanClass(lc,si,false)+'"></span>';
   const nm = isDisp
     ? '<span class="name">team-dispatch</span>'+(n.channel||n.lane?' <span class="meta">'+esc(n.channel||n.lane)+'</span>':'')
     : '<span class="name">'+esc(familyName(n.kind))+'</span>';
@@ -281,9 +328,82 @@ function nodeHTML(n){
 const PID_LOG_MS=15*60*1000;
 let LAST_TREE_PIDS={};
 let CLOSED_PID_LOG=[];
-let LAST_SUBS={};
-let DONE_LOG=[];
-let FAIL_LOG=[];
+const TERMINAL_STATUSES={completed:1,cancelled:1,failed:1,error:1};
+const TERMINAL_FIRST_SEEN={};
+let CURRENT_GRID_COLLECTOR=null;
+let CURRENT_HOST_HAS_STATUS=false;
+function isTerminalStatus(st){
+  return TERMINAL_STATUSES[String(st||'').toLowerCase()]||false;
+}
+function hostTreeHasStatus(nodes){
+  let found=false;
+  (function walk(ns){(ns||[]).forEach(n=>{
+    if(!n||typeof n!=='object') return;
+    if(n.status!=null&&n.status!=='') found=true;
+    walk(n.children||n.instances);
+  });})(nodes);
+  return found;
+}
+function terminalNodeKey(hostId,n){
+  const id=n.id||n.subagent_id||n.pid||n.label||n.channel||n.tty;
+  return String(hostId)+'|'+String(id);
+}
+function deepTreeCopy(nodes){
+  if(!Array.isArray(nodes)) return [];
+  return nodes.map(n=>{
+    if(!n||typeof n!=='object') return n;
+    const ch=n.children||n.instances;
+    const c=Object.assign({}, n);
+    if(Array.isArray(ch)) c.children=deepTreeCopy(ch);
+    return c;
+  });
+}
+function treeLooksStamped(nodes){
+  let stamped=false;
+  (function walk(ns){(ns||[]).forEach(n=>{
+    if(!n||typeof n!=='object') return;
+    if(n.state!=null) stamped=true;
+    walk(n.children||n.instances);
+  });})(nodes);
+  return stamped;
+}
+function pruneHostFirstSeen(hostId, activeKeys){
+  const prefix=String(hostId||'')+'|';
+  Object.keys(TERMINAL_FIRST_SEEN).forEach(k=>{
+    if(k.startsWith(prefix)&&!activeKeys.has(k)) delete TERMINAL_FIRST_SEEN[k];
+  });
+}
+function subIdTail(id){
+  const s=String(id||'');
+  if(!s) return '';
+  const p=s.split('-');
+  return p.length>1?p[p.length-1]:s.slice(-8);
+}
+function gridIdent(r){
+  if(r.fallback) return 'pid '+r.pid;
+  if(r.pid!=null&&r.pid!=='') return 'pid '+r.pid;
+  const tail=subIdTail(r.subagent_id);
+  if(tail) return tail;
+  return r.channel||r.label||r.tty||'';
+}
+function endedAgoStr(firstSeen,now){
+  const fs=firstSeen||now;
+  const sec=Math.max(0,Math.round((now-fs)/1000));
+  return sec<90?sec+'s ago':Math.round(sec/60)+'m ago';
+}
+function gridRowHTML(r,now){
+  const fam=familyName(r.kind);
+  const ident=gridIdent(r);
+  const chan=r.channel||r.label||r.tty||'';
+  const stWord=r.fallback?'DIED':String(r.status||'').toUpperCase();
+  const lc=resolveLampClass({status:r.status,fallback:r.fallback?'died':null});
+  const si=isStallInvestigator(r.channel,r.label,r.lane);
+  const ago=r.fallback?fmtDur((now-(r.closedAt||now))/1000)+' ago':endedAgoStr(r.firstSeenTerminal,now);
+  const tip=[ident,fam,chan,stWord,'ended '+ago].filter(Boolean).join(' \u00b7 ');
+  return '<span class="grid-row" title="'+esc(tip)+'"><span class="'+lampSpanClass(lc,si,true)+'"></span>'+
+    esc(ident)+' <span class="stword">'+esc(fam)+'</span>'+(chan?' '+esc(chan):'')+
+    ' <span class="stword">'+esc(stWord)+'</span> ended '+esc(ago)+'</span>';
+}
 function collectTreePids(nodes, acc){
   (nodes||[]).forEach(n=>{
     if(n && n.pid!=null && n.pid!=='') acc[String(n.pid)]=familyName(n.kind);
@@ -301,28 +421,41 @@ function noteClosedPids(tree){
   LAST_TREE_PIDS=cur;
   CLOSED_PID_LOG=CLOSED_PID_LOG.filter(e=>now-e.closedAt<PID_LOG_MS);
 }
-function renderPidLog(){
+function renderTerminalGrid(){
   const el=document.getElementById('pidlog');
   if(!el) return;
   const now=Date.now();
-  CLOSED_PID_LOG=CLOSED_PID_LOG.filter(e=>now-e.closedAt<PID_LOG_MS);
-  if(!CLOSED_PID_LOG.length){ el.hidden=true; el.innerHTML=''; return; }
+  const rows=[];
+  hosts().forEach(h=>{
+    if(h._has_status){
+      (h._terminal_grid||[]).forEach(r=>rows.push(r));
+    }
+  });
+  if(activeHost==='all'||activeHost===LOCAL_HOST_ID){
+    const local=((DOC&&DOC.hosts)||[]).find(x=>x&&x.id===LOCAL_HOST_ID);
+    if(local&&!local._has_status){
+      CLOSED_PID_LOG=CLOSED_PID_LOG.filter(e=>now-e.closedAt<PID_LOG_MS);
+      CLOSED_PID_LOG.forEach(e=>rows.push({fallback:true,pid:e.pid,kind:e.kind,closedAt:e.closedAt}));
+    }
+  }
+  if(!rows.length){ el.hidden=true; el.innerHTML=''; return; }
   el.hidden=false;
-  el.innerHTML=CLOSED_PID_LOG.map(e=>'<span>pid '+esc(e.pid)+' '+esc(e.kind)+' closed '+esc(fmtDur((now-e.closedAt)/1000))+' ago</span>').join('');
+  el.innerHTML=rows.map(r=>gridRowHTML(r,now)).join('');
 }
 function renderCLI(){
   let html='';
   let mbpTree=null;
+  let mbpHasStatus=false;
   hosts().forEach(h=>{
     html+='<div class="host-lab">'+esc((h.label||h.id).toUpperCase())+(h.roaming?' <span class="rm">\u00b7 roaming '+esc(h.roaming)+'s</span>':'')+'</div>';
     const tree=h.cli_tree||[];
-    if(h.id===LOCAL_HOST_ID) mbpTree=tree;
+    if(h.id===LOCAL_HOST_ID){ mbpTree=tree; mbpHasStatus=h._has_status; }
     if(!tree.length){ html+='<div class="host-empty">no CLI sessions</div>'; return; }
     html+=tree.map(n=>'<div class="node">'+nodeHTML(n)+'</div>').join('');
   });
   document.getElementById('clibody').innerHTML=html;
-  if(mbpTree) noteClosedPids(mbpTree);
-  renderPidLog();
+  if(mbpTree&&!mbpHasStatus) noteClosedPids(mbpTree);
+  renderTerminalGrid();
   const k=cliKindCounts();
   const parts=[]; if(k.claude)parts.push('CLAUDE '+k.claude); if(k.grok)parts.push('GROK '+k.grok); if(k.cursor)parts.push('CURSOR '+k.cursor);
   document.getElementById('cliroll').innerHTML=parts.join(' <span style="color:var(--dim)">\u00b7</span> ')+
@@ -337,9 +470,10 @@ function renderTasks(){
       slots.forEach(s=>{ const k=String(s.state||'').toUpperCase(); cnt[k]=(cnt[k]||0)+1; });
       const roll=Object.entries(cnt).map(([s,n])=>n+' '+s).join(' \u00b7 ');
       const inner='<div class="grid">'+slots.map(s=>{
-          const cl=stClass(s.state);
+          const lc=resolveLampClass({state:s.state});
+          const si=isStallInvestigator(s.lane,s.channel);
           const tip=esc(s.lane)+' \u00b7 '+String(s.state||'').toUpperCase()+' \u00b7 '+fmtDur(s.age_s)+(s.channel?' \u00b7 '+esc(s.channel):'');
-          return '<div class="cell" title="'+tip+'"><span class="lamp sm '+cl+'"></span><span class="nm">'+esc(s.lane)+'</span><span class="cage">'+fmtDur(s.age_s)+'</span></div>';
+          return '<div class="cell" title="'+tip+'"><span class="'+lampSpanClass(lc,si,true)+'"></span><span class="nm">'+esc(s.lane)+'</span><span class="cage">'+fmtDur(s.age_s)+'</span></div>';
         }).join('')+'</div>';
       const hostName=(h.label||h.id); const cap=hostName.charAt(0).toUpperCase()+hostName.slice(1);
       html+='<section class="panel"><div class="panel-hd" data-collapse="task-'+esc(h.id)+'-'+esc(t.id)+'">'+
@@ -414,7 +548,16 @@ window.overwatchRender = function(doc){
   DOC = doc||null;
   if(DOC && Array.isArray(DOC.hosts)){
     DOC.hosts.forEach(h=>{
-      if(h && h.cli_tree) h.cli_tree=stampTreeState(h.cli_tree);
+      if(!h || !h.cli_tree) return;
+      const incoming=h.cli_tree;
+      if(!treeLooksStamped(incoming)) h._cli_tree_raw=deepTreeCopy(incoming);
+      else if(!h._cli_tree_raw) h._cli_tree_raw=deepTreeCopy(incoming);
+      const rawCopy=deepTreeCopy(h._cli_tree_raw||incoming);
+      const hostId=h.id||'';
+      const stamped=stampTreeState(rawCopy, hostId, rawCopy);
+      h.cli_tree=stamped.tree;
+      h._terminal_grid=stamped.grid;
+      h._has_status=stamped.hasStatus;
     });
   }
   try{ renderAll(); }catch(e){ /* never throw into the host */ }
@@ -469,18 +612,38 @@ function deriveAgentState(n, kids){
   const st=String(n.status||'').toLowerCase();
   if(st==='failed'||st==='error') return 'fail';
   if(st==='completed'||st==='cancelled') return 'done';
-  if(st==='active'||st==='running') return 'run';
-  if((kids||[]).some(k=>k.state==='run'||k.state==='stall')) return 'run';
+  if(st==='active') return 'run';
+  if(st==='running') return 'quiet';
+  if((kids||[]).some(k=>k.state==='run')) return 'run';
   return 'quiet';
 }
-function convTreeNodes(nodes){
+function convTreeNodes(nodes, hostId){
   if(!Array.isArray(nodes)) return [];
   const out=[];
   nodes.forEach(n=>{
     if(!n||typeof n!=='object') return;
     const kind=n.kind;
-    const kids=convTreeNodes(n.children||n.instances||[]);
+    const kids=convTreeNodes(n.children||n.instances||[], hostId);
     if(WRAP_KINDS[kind] || !KEEP_KINDS[kind]){ out.push.apply(out, kids); return; }
+    if(CURRENT_HOST_HAS_STATUS && isTerminalStatus(n.status)){
+      if(CURRENT_GRID_COLLECTOR){
+        const key=terminalNodeKey(hostId,n);
+        if(!TERMINAL_FIRST_SEEN[key]) TERMINAL_FIRST_SEEN[key]=Date.now();
+        CURRENT_GRID_COLLECTOR.push({
+          kind: kind,
+          pid: (n.pid==null||n.pid==='')?null:n.pid,
+          subagent_id: n.subagent_id||null,
+          label: n.label||null,
+          channel: n.channel||null,
+          tty: n.tty||null,
+          status: n.status,
+          firstSeenTerminal: TERMINAL_FIRST_SEEN[key],
+          _key: key
+        });
+      }
+      out.push.apply(out, kids);
+      return;
+    }
     const node={
       kind: kind,
       role: n.role||null,
@@ -499,33 +662,6 @@ function convTreeNodes(nodes){
   });
   return out;
 }
-function walkRawSubs(nodes, acc){
-  (nodes||[]).forEach(n=>{
-    if(!n||typeof n!=='object') return;
-    if(String(n.kind||'').endsWith('-sub')){
-      const id=String(n.subagent_id||n.label||'');
-      if(id) acc[id]=String(n.status||'running').toLowerCase();
-    }
-    walkRawSubs(n.children||n.instances, acc);
-  });
-}
-function trackSubLifecycle(cli){
-  const roots=(cli&&(cli.roots||cli.instances))||[];
-  if(!Array.isArray(roots)) return;
-  const now=Date.now();
-  const cur={};
-  walkRawSubs(roots, cur);
-  Object.keys(LAST_SUBS).forEach(id=>{
-    if(cur[id]) return;
-    const prev=LAST_SUBS[id];
-    if(prev==='failed'||prev==='error') FAIL_LOG.push({id:id, at:now});
-    else if(prev==='completed'||prev==='cancelled'||prev==='running'||prev==='active'||!prev)
-      DONE_LOG.push({id:id, at:now});
-  });
-  LAST_SUBS=cur;
-  DONE_LOG=DONE_LOG.filter(e=>now-e.at<PID_LOG_MS);
-  FAIL_LOG=FAIL_LOG.filter(e=>now-e.at<PID_LOG_MS);
-}
 function localStatusToTasks(status){
   if(!Array.isArray(status)) return [];
   return status.filter(t=>t && (t.slots||[]).length).map(t=>({
@@ -538,14 +674,21 @@ function localStatusToTasks(status){
     }))
   }));
 }
-function stampTreeState(nodes){
-  return convTreeNodes(Array.isArray(nodes)?nodes:[]);
+function stampTreeState(nodes, hostId, rawRoots){
+  const grid=[];
+  const activeKeys=new Set();
+  CURRENT_GRID_COLLECTOR=grid;
+  CURRENT_HOST_HAS_STATUS=hostTreeHasStatus(rawRoots||nodes);
+  const tree=convTreeNodes(Array.isArray(nodes)?nodes:[], hostId||'');
+  CURRENT_GRID_COLLECTOR=null;
+  grid.forEach(r=>{ if(r._key) activeKeys.add(r._key); });
+  pruneHostFirstSeen(hostId, activeKeys);
+  return {tree, grid, hasStatus: CURRENT_HOST_HAS_STATUS};
 }
 function buildLocalMbp(cli, status){
   cli=cli||{};
   const roots=cli.roots||cli.instances;
   if(!Array.isArray(roots)) return LOCAL_MBP;
-  trackSubLifecycle(cli);
   return {
     id: LOCAL_HOST_ID,
     label: 'MacBook',
@@ -626,7 +769,7 @@ function startFleetHost(){
 }
 
 /* ---- refresh ages every 20s (no network) ---- */
-setInterval(()=>{ if(DOC){ renderAge(); renderPidLog(); renderCounts(); } }, 20000);
+setInterval(()=>{ if(DOC){ renderAge(); renderTerminalGrid(); renderCounts(); } }, 20000);
 
 /* ============================ MOCK (preview / ?mock=1) ============================ */
 function mockDoc(){
@@ -638,23 +781,20 @@ function mockDoc(){
       { id:'mbp', label:'MacBook', online:true, roaming:181, cli:{claude:2,grok:2,cursor:2},
         cli_tree:[
           { kind:'claude', model:'claude-opus-5', mode:'interactive', pid:18434, status:'active', channel:'ttys001', uptime_s:301500, children:[
-            { kind:'team-dispatch', channel:'aidash/cli-tree-hub', uptime_s:1344, children:[
-              { kind:'grok', model:'grok-4.6', mode:'headless', channel:'aidash-cli-tree-hub', uptime_s:1344, children:[] } ]},
-            { kind:'team-dispatch', channel:'aidash/audit-egress', uptime_s:400, children:[
-              { kind:'cursor', model:'composer-2.5', mode:'headless', channel:'aidash-audit-egress', uptime_s:400, children:[
-                { kind:'cursor', model:'composer-2.5', mode:'headless', channel:'aidash-audit-egress', uptime_s:399, children:[] } ]} ]},
-            { kind:'team-dispatch', channel:'aidash/spike-nesting', uptime_s:128, children:[
-              { kind:'grok', model:'grok-4.6', mode:'headless', channel:'aidash-spike-nesting', uptime_s:128, children:[] } ]},
-            { kind:'grok-sub', model:'grok-4.6', mode:'headless', label:'slice-a', status:'running', uptime_s:88, children:[] },
-            { kind:'cursor', model:'composer-2.5', mode:'headless', pid:18801, label:'composer-slave', status:'active', channel:'aidash-nested-cursor', uptime_s:80, children:[] } ]},
-          { kind:'cursor', model:'composer-2.5', mode:'headless', uptime_s:52560, children:[] },
-          { kind:'claude', model:'claude-opus-4-8', mode:'interactive', channel:'ttys000', uptime_s:236580, children:[] }
+            { kind:'grok', model:'grok-4.6', mode:'headless', pid:18440, status:'running', channel:'aidash-live-grok', uptime_s:420, children:[] },
+            { kind:'cursor', model:'composer-2.5', mode:'headless', pid:18850, status:'running', channel:'stall-investigator-live', uptime_s:60, children:[] },
+            { kind:'grok', model:'grok-4.6', mode:'headless', status:'completed', channel:'aidash-ended-parent', uptime_s:null, children:[
+              { kind:'cursor', model:'composer-2.5', mode:'headless', pid:18802, status:'active', label:'reparented-cursor', channel:'aidash-reparented', uptime_s:95, children:[] } ]},
+            { kind:'grok-sub', model:'grok-4.6', mode:'headless', subagent_id:'sub-slice-ended-7f3a', label:'slice-ended', status:'completed', uptime_s:null, children:[] },
+            { kind:'grok-sub', model:'grok-4.6', mode:'headless', subagent_id:'sub-slice-failed-9c2e', label:'slice-failed', status:'failed', uptime_s:null, children:[] },
+            { kind:'cursor', model:'composer-2.5', mode:'headless', pid:19999, label:'grid-only-cursor', status:'cancelled', channel:'aidash-grid-cursor', uptime_s:null, children:[] } ]},
+          { kind:'claude', model:'claude-opus-4-8', mode:'interactive', channel:'ttys000', status:'active', uptime_s:236580, children:[] }
         ],
         tasks:[ { id:'aidash', slots:[
           {lane:'cli-tree-hub', state:'RUNNING', age_s:1344, activity_s:3, exit_code:null, channel:'aidash-cli-tree-hub'},
           {lane:'audit-egress', state:'WORKING_TOOL', age_s:400, activity_s:2, exit_code:null, channel:'aidash-audit-egress'},
           {lane:'spike-nesting', state:'QUIET', age_s:128, activity_s:74, exit_code:null, channel:'aidash-spike-nesting'},
-          {lane:'stall-probe', state:'STALLED', age_s:640, activity_s:410, exit_code:null, channel:'aidash-stall-probe'},
+          {lane:'stall-probe', state:'STALLED', age_s:640, activity_s:410, exit_code:null, channel:'stall-probe-aidash'},
           {lane:'cli-tree-ios', state:'DONE', age_s:1227, activity_s:null, exit_code:0, channel:'aidash-cli-tree-ios'},
           {lane:'named-agents', state:'DONE', age_s:1872, activity_s:null, exit_code:0, channel:'aidash-named-agents'},
           {lane:'regauth-gate', state:'FAILED', age_s:2400, activity_s:null, exit_code:1, channel:'aidash-regauth-gate'}
