@@ -49,7 +49,7 @@
   .cli-chip{border:1px solid var(--border); background:#11151b; border-radius:7px; padding:4px 11px; color:var(--mut); font-size:12px; letter-spacing:.5px}
   .cli-chip b{color:var(--ink)}
 
-  .cols{display:grid; grid-template-columns:1fr 232px; gap:16px; align-items:start; margin-top:14px}
+  .cols{display:grid; grid-template-columns:1fr 190px; gap:16px; align-items:start; margin-top:14px}
   .panel{background:var(--panel); border:1px solid var(--border); border-radius:13px; padding:14px 14px 16px;
          box-shadow:inset 0 1px 0 rgba(255,255,255,.02); margin-bottom:14px}
   .panel-hd{display:flex; align-items:center; justify-content:space-between; gap:10px; margin:2px 2px 12px; cursor:pointer}
@@ -99,11 +99,11 @@
   .up{margin-left:auto; color:var(--mut); font-size:12.5px; letter-spacing:.5px; white-space:nowrap; font-variant-numeric:tabular-nums; padding-left:8px}
 
   /* task panels */
-  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:9px}
-  .cell{display:flex; align-items:center; gap:9px; background:var(--slot); border:1px solid var(--border); border-radius:8px; padding:9px 12px}
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:6px}
+  .cell{display:flex; align-items:center; gap:8px; background:var(--slot); border:1px solid var(--border); border-radius:7px; padding:4px 10px}
   .cell:hover{background:var(--slot-hi)}
   .cell .nm{font-weight:600; letter-spacing:.3px; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
-  .cell .cage{margin-left:auto; color:var(--dim); font-size:11.5px; font-variant-numeric:tabular-nums; padding-left:6px}
+  .cell .cage{margin-left:auto; color:var(--dim); font-size:11px; font-variant-numeric:tabular-nums; padding-left:6px; white-space:nowrap}
   .lamp.sm{width:9px;height:9px}
   /* panel density rows */
   .prow{display:flex; align-items:center; gap:12px; background:var(--slot); border:1px solid var(--border); border-radius:var(--r); padding:11px 14px; margin:7px 0}
@@ -114,10 +114,10 @@
   .prow .pup{margin-left:auto; text-align:right; color:var(--mut); font-size:12px; font-variant-numeric:tabular-nums}
 
   /* right rail */
-  .rail{display:flex; flex-direction:column; gap:10px; position:sticky; top:14px}
-  .tile{background:var(--panel); border:1px solid var(--border); border-radius:11px; padding:12px 14px}
-  .tile .lb{color:var(--mut); font-size:10.5px; letter-spacing:1.6px}
-  .tile .num{font-size:30px; font-weight:700; margin-top:5px; line-height:1; font-variant-numeric:tabular-nums; color:var(--dim)}
+  .rail{display:flex; flex-direction:column; gap:5px; position:sticky; top:14px}
+  .tile{display:flex; align-items:baseline; justify-content:space-between; gap:10px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:6px 11px}
+  .tile .lb{color:var(--mut); font-size:10px; letter-spacing:1.3px}
+  .tile .num{font-size:17px; font-weight:700; margin-top:0; line-height:1; font-variant-numeric:tabular-nums; color:var(--dim)}
   .tile.run .num{color:var(--run)}
   .tile.hot{border-color:#4a2327}
   .tile.hot .num{color:var(--fail)}
