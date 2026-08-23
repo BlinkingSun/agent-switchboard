@@ -617,6 +617,38 @@ function deriveAgentState(n, kids){
   if((kids||[]).some(k=>k.state==='run')) return 'run';
   return 'quiet';
 }
+function routeTerminalToGrid(hostId, n){
+  if(!CURRENT_GRID_COLLECTOR) return;
+  const key=terminalNodeKey(hostId,n);
+  if(!TERMINAL_FIRST_SEEN[key]) TERMINAL_FIRST_SEEN[key]=Date.now();
+  CURRENT_GRID_COLLECTOR.push({
+    kind: n.kind,
+    pid: (n.pid==null||n.pid==='')?null:n.pid,
+    subagent_id: n.subagent_id||null,
+    label: n.label||null,
+    channel: n.channel||null,
+    tty: n.tty||null,
+    status: n.status,
+    firstSeenTerminal: TERMINAL_FIRST_SEEN[key],
+    _key: key
+  });
+}
+function partitionTerminalRoots(roots, hostId){
+  if(!CURRENT_HOST_HAS_STATUS || !Array.isArray(roots)) return Array.isArray(roots)?roots:[];
+  const live=[];
+  roots.forEach(n=>{
+    if(!n||typeof n!=='object') return;
+    const kind=n.kind;
+    if(WRAP_KINDS[kind] || !KEEP_KINDS[kind]){ live.push(n); return; }
+    if(isTerminalStatus(n.status)){
+      routeTerminalToGrid(hostId, n);
+      (n.children||n.instances||[]).forEach(c=>live.push(c));
+      return;
+    }
+    live.push(n);
+  });
+  return live;
+}
 function convTreeNodes(nodes, hostId){
   if(!Array.isArray(nodes)) return [];
   const out=[];
@@ -626,21 +658,7 @@ function convTreeNodes(nodes, hostId){
     const kids=convTreeNodes(n.children||n.instances||[], hostId);
     if(WRAP_KINDS[kind] || !KEEP_KINDS[kind]){ out.push.apply(out, kids); return; }
     if(CURRENT_HOST_HAS_STATUS && isTerminalStatus(n.status)){
-      if(CURRENT_GRID_COLLECTOR){
-        const key=terminalNodeKey(hostId,n);
-        if(!TERMINAL_FIRST_SEEN[key]) TERMINAL_FIRST_SEEN[key]=Date.now();
-        CURRENT_GRID_COLLECTOR.push({
-          kind: kind,
-          pid: (n.pid==null||n.pid==='')?null:n.pid,
-          subagent_id: n.subagent_id||null,
-          label: n.label||null,
-          channel: n.channel||null,
-          tty: n.tty||null,
-          status: n.status,
-          firstSeenTerminal: TERMINAL_FIRST_SEEN[key],
-          _key: key
-        });
-      }
+      routeTerminalToGrid(hostId, n);
       out.push.apply(out, kids);
       return;
     }
@@ -679,7 +697,9 @@ function stampTreeState(nodes, hostId, rawRoots){
   const activeKeys=new Set();
   CURRENT_GRID_COLLECTOR=grid;
   CURRENT_HOST_HAS_STATUS=hostTreeHasStatus(rawRoots||nodes);
-  const tree=convTreeNodes(Array.isArray(nodes)?nodes:[], hostId||'');
+  const rootsIn=Array.isArray(nodes)?nodes:[];
+  const liveRoots=partitionTerminalRoots(rootsIn, hostId||'');
+  const tree=convTreeNodes(liveRoots, hostId||'');
   CURRENT_GRID_COLLECTOR=null;
   grid.forEach(r=>{ if(r._key) activeKeys.add(r._key); });
   pruneHostFirstSeen(hostId, activeKeys);
@@ -788,7 +808,8 @@ function mockDoc(){
             { kind:'grok-sub', model:'grok-4.6', mode:'headless', subagent_id:'sub-slice-ended-7f3a', label:'slice-ended', status:'completed', uptime_s:null, children:[] },
             { kind:'grok-sub', model:'grok-4.6', mode:'headless', subagent_id:'sub-slice-failed-9c2e', label:'slice-failed', status:'failed', uptime_s:null, children:[] },
             { kind:'cursor', model:'composer-2.5', mode:'headless', pid:19999, label:'grid-only-cursor', status:'cancelled', channel:'aidash-grid-cursor', uptime_s:null, children:[] } ]},
-          { kind:'claude', model:'claude-opus-4-8', mode:'interactive', channel:'ttys000', status:'active', uptime_s:236580, children:[] }
+          { kind:'claude', model:'claude-opus-4-8', mode:'interactive', channel:'ttys000', status:'active', uptime_s:236580, children:[] },
+          { kind:'grok', model:'grok-4.6', mode:'headless', pid:57204, status:'completed', uptime_s:null, label:null, channel:null, children:[] }
         ],
         tasks:[ { id:'aidash', slots:[
           {lane:'cli-tree-hub', state:'RUNNING', age_s:1344, activity_s:3, exit_code:null, channel:'aidash-cli-tree-hub'},
@@ -807,6 +828,74 @@ function mockDoc(){
       { id:'cnc', label:'CNC Node', online:false, cli:{claude:0,grok:0,cursor:0}, cli_tree:[], tasks:[] }
     ]
   };
+}
+
+/* ---- tree-root partition fixtures (node: set globalThis.__RUN_TREE_ROOT_FIXTURES__=1) ---- */
+function runTreeRootFixtures(){
+  const chk=(name,cond)=>{ if(!cond) throw new Error('FAIL '+name); };
+  function stamp(roots, hostId){
+    return stampTreeState(roots, hostId||'mbp', roots);
+  }
+  function terminalInTree(tree){
+    const bad=[];
+    (function walk(ns){(ns||[]).forEach(n=>{
+      if(!n) return;
+      const st=String(n.status||'').toLowerCase();
+      if(isTerminalStatus(st)) bad.push(n.pid);
+      walk(n.children);
+    });})(tree);
+    return bad;
+  }
+  function countDone(roots, hostId){
+    const r=stamp(roots, hostId);
+    let done=0;
+    r.grid.forEach(g=>{
+      const st=String(g.status||'').toLowerCase();
+      if(st==='completed'||st==='cancelled') done++;
+    });
+    return {done, r};
+  }
+  // terminal ledger ROOT with null label/channel => grid + DONE + absent from tree
+  {
+    const roots=[
+      {kind:'grok',pid:51866,status:'completed',uptime_s:null,label:null,channel:null,children:[]},
+      {kind:'claude',pid:18434,status:'active',uptime_s:100,channel:'ttys002',children:[]}
+    ];
+    const r=stamp(roots,'mbp');
+    chk('terminal-root-grid', r.grid.some(g=>g.pid===51866&&g.status==='completed'));
+    chk('terminal-root-absent-tree', !terminalInTree(r.tree).includes(51866));
+    chk('terminal-root-done-count', countDone(roots,'mbp').done>=1);
+  }
+  // live root stays in tree
+  {
+    const roots=[{kind:'claude',pid:1,status:'active',uptime_s:50,channel:'ttys001',children:[]}];
+    const r=stamp(roots,'mbp');
+    chk('live-root-in-tree', r.tree.length===1&&r.tree[0].pid===1);
+    chk('live-root-not-grid', !r.grid.some(g=>g.pid===1));
+  }
+  // mixed roots partition correctly
+  {
+    const roots=[
+      {kind:'grok',pid:54634,status:'completed',uptime_s:null,label:null,channel:null,children:[]},
+      {kind:'cursor',pid:64039,status:'running',uptime_s:12,channel:'live-cursor',children:[]},
+      {kind:'grok-sub',subagent_id:'sub-fail-9c2e',status:'failed',uptime_s:null,label:null,children:[]}
+    ];
+    const r=stamp(roots,'mbp');
+    chk('mixed-grid-count', r.grid.length===2);
+    chk('mixed-live-tree', r.tree.length===1&&r.tree[0].pid===64039);
+    chk('mixed-no-terminal-tree', terminalInTree(r.tree).length===0);
+  }
+  return ['PASS terminal-root-grid','PASS live-root-in-tree','PASS mixed-roots-partition'];
+}
+if(typeof globalThis!=='undefined' && globalThis.__RUN_TREE_ROOT_FIXTURES__){
+  try{
+    runTreeRootFixtures().forEach(r=>console.log(r));
+    console.log('VERDICT: pass');
+  }catch(e){
+    console.error(e.message||e);
+    console.log('VERDICT: fail');
+    if(typeof process!=='undefined'&&process.exit) process.exit(1);
+  }
 }
 
 /* boot: never self-fetch.
