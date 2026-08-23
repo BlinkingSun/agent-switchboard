@@ -2357,5 +2357,327 @@ kill "$SRV52B" 2>/dev/null
 wait 2>/dev/null
 rm -rf "$T52_ROOT"
 
+# ---- T53a–T53k reaper safety contract (ports 17955-17959 ONLY) ----
+t53_alive() { kill -0 "$1" 2>/dev/null; }
+t53_kill() { kill -9 "$@" 2>/dev/null || true; }
+t53_confirm() {
+  python3 - "$AGENT_SWITCHBOARD_ROOT" "$1" "$2" "${3:-}" "${4:-}" <<'PY'
+import json, os, sys, time
+root, task, lane = sys.argv[1], sys.argv[2], sys.argv[3]
+rid_ov = sys.argv[4] if len(sys.argv) > 4 else ""
+pb_ov = sys.argv[5] if len(sys.argv) > 5 else ""
+slot = json.load(open(os.path.join(root, task, "slot-%s.json" % lane)))
+doc = {
+    "lane": lane,
+    "run_id": rid_ov or slot["run_id"],
+    "pid": slot["pid"],
+    "prog_base": pb_ov or slot["prog_base"],
+    "confirmed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    "reason": "test",
+}
+path = os.path.join(root, task, "reap-confirm-%s.json" % lane)
+json.dump(doc, open(path, "w"), indent=2)
+print(path)
+PY
+}
+t53_wait_state() {
+  # task lane want [stall_after]
+  _t=$1; _l=$2; _w=$3; _sa=${4:-1}
+  _i=0
+  while [ "$_i" -lt 20 ]; do
+    _st=$(AGENT_SWITCHBOARD_STALL_AFTER="$_sa" "$SB" status --task "$_t" --json | python3 -c "import json,sys; d=json.load(sys.stdin); print([s['state'] for s in d[0]['slots'] if s['lane']==sys.argv[1]][0])" "$_l")
+    [ "$_st" = "$_w" ] && return 0
+    _i=$((_i + 1))
+    sleep 0.3
+  done
+  echo "$_st"
+  return 1
+}
+
+# T53a: gate off => refuse exit 2, no signal, confirm not consumed; no reap HTTP route
+"$SB" serve --port 17955 >/dev/null 2>&1 &
+SRV53A=$!
+sleep 1.5
+HA=$(curl -s "http://127.0.0.1:17955/v1/health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok"))' 2>/dev/null || echo fail)
+ck "$HA" "True" "T53a0 test daemon health on 17955"
+GET53=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:17955/v1/reap")
+POST53=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:17955/v1/reap")
+[ "$GET53" != "200" ] && ck ok ok "T53a GET /v1/reap is non-200 ($GET53)" || ck "$GET53" "non-200" "T53a GET /v1/reap is non-200"
+[ "$POST53" != "200" ] && ck ok ok "T53a POST /v1/reap is non-200 ($POST53)" || ck "$POST53" "non-200" "T53a POST /v1/reap is non-200"
+"$TD" --task t53a --lane stuck --exec /bin/sleep -- 60 >/dev/null 2>&1 &
+WRAP53A=$!
+sleep 0.6
+CHILD53A=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53a','slot-stuck.json')))['pid'])")
+t53_confirm t53a stuck >/dev/null
+unset AGENT_SWITCHBOARD_REAPER || true
+AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" reap --task t53a --lane stuck >/dev/null 2>&1
+RC53A=$?
+ck "$RC53A" "2" "T53a gate off refuses with exit 2"
+t53_alive "$CHILD53A" && ck ok ok "T53a target process untouched" || ck dead alive "T53a target process untouched"
+if [ -f "$AGENT_SWITCHBOARD_ROOT/t53a/reap-confirm-stuck.json" ]; then ck ok ok "T53a confirm not consumed"; else ck missing present "T53a confirm not consumed"; fi
+grep -q '"reason": "disabled"' "$AGENT_SWITCHBOARD_ROOT/t53a/events.jsonl" && ck ok ok "T53a reap_refused reason=disabled" || ck missing logged "T53a reap_refused reason=disabled"
+t53_kill "$CHILD53A" "$WRAP53A"
+kill "$SRV53A" 2>/dev/null
+wait 2>/dev/null
+
+# T53b: confirmed kill of a fake stuck sleeper
+"$TD" --task t53b --lane stuck --exec /bin/sleep -- 60 >/dev/null 2>&1 &
+WRAP53B=$!
+sleep 0.8
+CHILD53B=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53b','slot-stuck.json')))['pid'])")
+t53_wait_state t53b stuck STALLED 1 >/dev/null
+t53_confirm t53b stuck >/dev/null
+AGENT_SWITCHBOARD_REAPER=1 AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" reap --task t53b --lane stuck >/dev/null 2>&1
+RC53B=$?
+ck "$RC53B" "0" "T53b reap exits 0"
+sleep 0.4
+t53_alive "$CHILD53B" && ck alive dead "T53b worker is dead" || ck ok ok "T53b TERM/KILL landed (worker dead)"
+ST53B=$(python3 -c "import json,os; s=json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53b','slot-stuck.json'))); print(s.get('status'), s.get('exit_code'))")
+echo "$ST53B" | grep -q 'exited' && ck ok ok "T53b slot finalized status=exited" || ck "$ST53B" "exited" "T53b slot finalized"
+grep -q '"event": "reap"' "$AGENT_SWITCHBOARD_ROOT/t53b/events.jsonl" && ck ok ok "T53b reap event logged" || ck missing logged "T53b reap event logged"
+grep -q '"ended_source":"reap"' "$AGENT_SWITCHBOARD_ROOT/agents.jsonl" && ck ok ok "T53b ledger end ended_source=reap" || ck missing logged "T53b ledger end ended_source=reap"
+if [ ! -f "$AGENT_SWITCHBOARD_ROOT/t53b/reap-confirm-stuck.json" ] && ls "$AGENT_SWITCHBOARD_ROOT/t53b/history"/reap-confirm-stuck-*.json >/dev/null 2>&1; then
+  ck ok ok "T53b confirm consumed into history/"
+else
+  ck missing history "T53b confirm consumed into history/"
+fi
+t53_kill "$CHILD53B" "$WRAP53B"
+wait "$WRAP53B" 2>/dev/null || true
+
+# T53c: prog_base mismatch => identity_miss, process untouched, confirm consumed
+"$TD" --task t53c --lane stuck --exec /bin/sleep -- 60 >/dev/null 2>&1 &
+WRAP53C=$!
+sleep 0.6
+CHILD53C=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53c','slot-stuck.json')))['pid'])")
+t53_wait_state t53c stuck STALLED 1 >/dev/null
+t53_confirm t53c stuck "" python3 >/dev/null
+AGENT_SWITCHBOARD_REAPER=1 AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" reap --task t53c --lane stuck >/dev/null 2>&1
+RC53C=$?
+ck "$RC53C" "2" "T53c mismatch refuses with exit 2"
+t53_alive "$CHILD53C" && ck ok ok "T53c target process untouched" || ck dead alive "T53c target process untouched"
+grep -q '"event": "identity_miss"' "$AGENT_SWITCHBOARD_ROOT/t53c/events.jsonl" && ck ok ok "T53c identity_miss event" || ck missing logged "T53c identity_miss event"
+if [ ! -f "$AGENT_SWITCHBOARD_ROOT/t53c/reap-confirm-stuck.json" ]; then ck ok ok "T53c confirm consumed"; else ck present consumed "T53c confirm consumed"; fi
+t53_kill "$CHILD53C" "$WRAP53C"
+wait "$WRAP53C" 2>/dev/null || true
+
+# T53d: stale confirm run_id => exit 3, confirm consumed
+"$TD" --task t53d --lane stuck --exec /bin/sleep -- 60 >/dev/null 2>&1 &
+WRAP53D=$!
+sleep 0.6
+CHILD53D=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53d','slot-stuck.json')))['pid'])")
+t53_wait_state t53d stuck STALLED 1 >/dev/null
+t53_confirm t53d stuck STALE_RUN >/dev/null
+AGENT_SWITCHBOARD_REAPER=1 AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" reap --task t53d --lane stuck >/dev/null 2>&1
+RC53D=$?
+ck "$RC53D" "3" "T53d stale run_id exits 3"
+t53_alive "$CHILD53D" && ck ok ok "T53d target process untouched" || ck dead alive "T53d target process untouched"
+if [ ! -f "$AGENT_SWITCHBOARD_ROOT/t53d/reap-confirm-stuck.json" ]; then ck ok ok "T53d confirm consumed"; else ck present consumed "T53d confirm consumed"; fi
+t53_kill "$CHILD53D" "$WRAP53D"
+wait "$WRAP53D" 2>/dev/null || true
+
+# T53e: never-kill stall-* lane
+"$TD" --task t53e --lane stall-keep --exec /bin/sleep -- 60 >/dev/null 2>&1 &
+WRAP53E=$!
+sleep 0.6
+CHILD53E=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53e','slot-stall-keep.json')))['pid'])")
+t53_wait_state t53e stall-keep STALLED 1 >/dev/null
+t53_confirm t53e stall-keep >/dev/null
+AGENT_SWITCHBOARD_REAPER=1 AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" reap --task t53e --lane stall-keep >/dev/null 2>&1
+RC53E=$?
+ck "$RC53E" "2" "T53e stall-* refused with exit 2"
+t53_alive "$CHILD53E" && ck ok ok "T53e stall-* process untouched" || ck dead alive "T53e stall-* process untouched"
+grep -q '"reason": "never_kill"' "$AGENT_SWITCHBOARD_ROOT/t53e/events.jsonl" && ck ok ok "T53e reason=never_kill" || ck missing logged "T53e reason=never_kill"
+t53_kill "$CHILD53E" "$WRAP53E"
+wait "$WRAP53E" 2>/dev/null || true
+
+# T53f: wrapper alive => wrapper finalizes, daemon does not write, exactly one exit event
+"$TD" --task t53f --lane stuck --exec /bin/sleep -- 60 >/dev/null 2>&1 &
+WRAP53F=$!
+sleep 0.6
+CHILD53F=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53f','slot-stuck.json')))['pid'])")
+t53_wait_state t53f stuck STALLED 1 >/dev/null
+t53_confirm t53f stuck >/dev/null
+AGENT_SWITCHBOARD_REAPER=1 AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" reap --task t53f --lane stuck >/dev/null 2>&1
+RC53F=$?
+ck "$RC53F" "0" "T53f reap exits 0"
+wait "$WRAP53F" 2>/dev/null || true
+sleep 0.3
+EX53F=$(grep -c '"event": "exit"' "$AGENT_SWITCHBOARD_ROOT/t53f/events.jsonl" || true)
+ck "$EX53F" "1" "T53f exactly one exit event"
+REAPED53F=$(python3 -c "import json,os; s=json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53f','slot-stuck.json'))); print(s.get('reaped'))")
+ck "$REAPED53F" "None" "T53f daemon did not write reaped=true (wrapper finalized)"
+t53_kill "$CHILD53F" "$WRAP53F"
+
+# T53g: wedged wrapper (SIGSTOP) => daemon finalizes at ~5s with reaped=true;
+# after SIGCONT wrapper does not double-write
+"$TD" --task t53g --lane stuck --exec /bin/sleep -- 60 >/dev/null 2>&1 &
+WRAP53G=$!
+sleep 0.8
+CHILD53G=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53g','slot-stuck.json')))['pid'])")
+t53_wait_state t53g stuck STALLED 1 >/dev/null
+kill -STOP "$WRAP53G" 2>/dev/null
+t53_confirm t53g stuck >/dev/null
+T0G=$(date +%s)
+AGENT_SWITCHBOARD_REAPER=1 AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" reap --task t53g --lane stuck >/dev/null 2>&1
+RC53G=$?
+DTG=$(( $(date +%s) - T0G ))
+ck "$RC53G" "0" "T53g reap exits 0"
+[ "$DTG" -ge 5 ] && ck ok ok "T53g daemon waited ~5s to finalize (dt=${DTG}s)" || ck "$DTG" ">=5" "T53g daemon waited ~5s"
+REAPED53G=$(python3 -c "import json,os; s=json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53g','slot-stuck.json'))); print(s.get('reaped') is True, s.get('ended'))")
+ENDED53G=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53g','slot-stuck.json'))).get('ended'))")
+echo "$REAPED53G" | grep -q '^True ' && ck ok ok "T53g slot reaped=true" || ck "$REAPED53G" "True" "T53g slot reaped=true"
+kill -CONT "$WRAP53G" 2>/dev/null
+wait "$WRAP53G" 2>/dev/null || true
+sleep 0.4
+grep -q '"event": "reap_finalize_skipped"' "$AGENT_SWITCHBOARD_ROOT/t53g/events.jsonl" && ck ok ok "T53g reap_finalize_skipped after SIGCONT" || ck missing logged "T53g reap_finalize_skipped after SIGCONT"
+ENDED53G2=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53g','slot-stuck.json'))).get('ended'))")
+ck "$ENDED53G2" "$ENDED53G" "T53g ended unchanged after wrapper woke"
+t53_kill "$CHILD53G" "$WRAP53G"
+
+# T53h: ORPHAN (wrapper dead, worker alive) => reaped + daemon-finalized, no 5s wait
+"$TD" --task t53h --lane stuck --exec /bin/sleep -- 60 >/dev/null 2>&1 &
+WRAP53H=$!
+sleep 0.8
+CHILD53H=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53h','slot-stuck.json')))['pid'])")
+t53_kill "$WRAP53H"
+sleep 0.3
+t53_wait_state t53h stuck ORPHAN 1 >/dev/null
+ck "$(AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" status --task t53h --json | python3 -c "import json,sys; d=json.load(sys.stdin); print([s['state'] for s in d[0]['slots'] if s['lane']=='stuck'][0])")" "ORPHAN" "T53h derives ORPHAN"
+t53_confirm t53h stuck >/dev/null
+T0H=$(date +%s)
+AGENT_SWITCHBOARD_REAPER=1 AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" reap --task t53h --lane stuck >/dev/null 2>&1
+RC53H=$?
+DTH=$(( $(date +%s) - T0H ))
+ck "$RC53H" "0" "T53h reap exits 0"
+[ "$DTH" -lt 6 ] && ck ok ok "T53h no 5s wait (dt=${DTH}s)" || ck "$DTH" "<6" "T53h no 5s wait"
+REAPED53H=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53h','slot-stuck.json'))).get('reaped') is True)")
+ck "$REAPED53H" "True" "T53h daemon-finalized reaped=true"
+t53_kill "$CHILD53H" "$WRAP53H"
+
+# T53i: knob-off zero-behavior-change + static nt-before-os.kill in reap_lane
+(
+  unset AGENT_SWITCHBOARD_REAPER || true
+  unset AGENT_SWITCHBOARD_INVESTIGATOR || true
+  "$TD" --task t53i --lane ok --exec /bin/bash -- -c 'exit 0' >/dev/null 2>&1
+  echo $? > "$AGENT_SWITCHBOARD_ROOT/t53i-rc1"
+  ST=$( "$SB" status --task t53i --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print([s["state"] for s in d[0]["slots"] if s["lane"]=="ok"][0])' )
+  echo "$ST" > "$AGENT_SWITCHBOARD_ROOT/t53i-st1"
+  "$TD" --task t53i --lane bad --exec /bin/bash -- -c 'exit 7' >/dev/null 2>&1
+  echo $? > "$AGENT_SWITCHBOARD_ROOT/t53i-rc2"
+  ST=$( "$SB" status --task t53i --json | python3 -c 'import json,sys; d=json.load(sys.stdin); s=[s for s in d[0]["slots"] if s["lane"]=="bad"][0]; print(s["state"], s["exit_code"])' )
+  echo "$ST" > "$AGENT_SWITCHBOARD_ROOT/t53i-st2"
+  "$TD" --task t53i --lane cap --exec /bin/bash -- -c 'sleep 15' >/dev/null 2>&1 &
+  echo $! > "$AGENT_SWITCHBOARD_ROOT/t53i-wrap"
+  sleep 0.5
+  "$TD" --task t53i --lane cap --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+  echo $? > "$AGENT_SWITCHBOARD_ROOT/t53i-rc3"
+)
+ck "$(cat "$AGENT_SWITCHBOARD_ROOT/t53i-rc1")" "0" "T53i T1-clone exit 0 with knobs unset"
+ck "$(cat "$AGENT_SWITCHBOARD_ROOT/t53i-st1")" "DONE" "T53i T1-clone derives DONE with knobs unset"
+ck "$(cat "$AGENT_SWITCHBOARD_ROOT/t53i-rc2")" "7" "T53i T2-clone exit 7 with knobs unset"
+ck "$(cat "$AGENT_SWITCHBOARD_ROOT/t53i-st2")" "FAILED 7" "T53i T2-clone derives FAILED 7 with knobs unset"
+ck "$(cat "$AGENT_SWITCHBOARD_ROOT/t53i-rc3")" "2" "T53i T8-clone active same-lane refuse with knobs unset"
+W53I=$(cat "$AGENT_SWITCHBOARD_ROOT/t53i-wrap")
+C53I=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53i','slot-cap.json'))).get('pid') or '')" 2>/dev/null || true)
+t53_kill "$W53I" "$C53I"
+NT53I=$(python3 - "$SB" <<'PY'
+import io, re, sys
+src = open(sys.argv[1]).read()
+m = re.search(r"\ndef reap_lane\(", src)
+if not m:
+    print("NO_REAP_LANE")
+    sys.exit(0)
+rest = src[m.start():]
+m2 = re.search(r"\ndef ", rest[1:])
+body = rest if not m2 else rest[:m2.start()+1]
+nt = body.find('os.name == "nt"')
+# first os.kill in reap_lane that is a real call, not the comment
+kills = [m.start() for m in re.finditer(r"os\.kill\(", body)]
+kill = kills[0] if kills else -1
+if nt >= 0 and kill >= 0 and nt < kill:
+    print("OK")
+else:
+    print("nt=%s kill=%s" % (nt, kill))
+PY
+)
+ck "$NT53I" "OK" "T53i os.name == nt refuse precedes os.kill in reap_lane"
+
+# T53j: lstart persistence + start-time identity
+"$TD" --task t53j --lane stuck --exec /bin/sleep -- 60 >/dev/null 2>&1 &
+WRAP53J=$!
+sleep 0.8
+LS53J=$(python3 - <<'PY'
+import json, os, subprocess, datetime, re
+root = os.environ["AGENT_SWITCHBOARD_ROOT"]
+slot = json.load(open(os.path.join(root, "t53j", "slot-stuck.json")))
+pid = slot["pid"]
+ls = slot.get("lstart")
+out = subprocess.check_output(["ps", "-o", "lstart=", "-p", str(pid)], text=True).strip()
+def ts(s):
+    try:
+        s = re.sub(r"\s+", " ", (s or "").strip())
+        return datetime.datetime.strptime(s, "%a %b %d %H:%M:%S %Y").timestamp()
+    except Exception:
+        return None
+ok = ls is not None and ts(ls) is not None and ts(ls) == ts(out)
+print("OK" if ok else "slot=%r ps=%r" % (ls, out))
+PY
+)
+ck "$LS53J" "OK" "T53j fresh slot lstart is non-null and matches ps"
+t53_wait_state t53j stuck STALLED 1 >/dev/null
+python3 - <<'PY'
+import json, os
+p = os.path.join(os.environ["AGENT_SWITCHBOARD_ROOT"], "t53j", "slot-stuck.json")
+s = json.load(open(p))
+s["lstart"] = "Mon Jan  1 00:00:00 2019"
+json.dump(s, open(p, "w"), indent=2)
+PY
+t53_confirm t53j stuck >/dev/null
+CHILD53J=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53j','slot-stuck.json')))['pid'])")
+AGENT_SWITCHBOARD_REAPER=1 AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" reap --task t53j --lane stuck >/dev/null 2>&1
+RC53J=$?
+ck "$RC53J" "2" "T53j doctored lstart refuses"
+t53_alive "$CHILD53J" && ck ok ok "T53j process untouched on lstart mismatch" || ck dead alive "T53j process untouched on lstart mismatch"
+grep -q '"event": "identity_miss"' "$AGENT_SWITCHBOARD_ROOT/t53j/events.jsonl" && ck ok ok "T53j identity_miss even though pid+prog_base match" || ck missing logged "T53j identity_miss even though pid+prog_base match"
+python3 - <<'PY'
+import json, os
+p = os.path.join(os.environ["AGENT_SWITCHBOARD_ROOT"], "t53j", "slot-stuck.json")
+s = json.load(open(p))
+s.pop("lstart", None)
+json.dump(s, open(p, "w"), indent=2)
+PY
+t53_confirm t53j stuck >/dev/null
+AGENT_SWITCHBOARD_REAPER=1 AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" reap --task t53j --lane stuck >/dev/null 2>&1
+RC53J2=$?
+ck "$RC53J2" "2" "T53j absent lstart refuses exit 2"
+grep -q '"reason": "no_lstart"' "$AGENT_SWITCHBOARD_ROOT/t53j/events.jsonl" && ck ok ok "T53j reason=no_lstart" || ck missing logged "T53j reason=no_lstart"
+t53_alive "$CHILD53J" && ck ok ok "T53j process untouched on no_lstart" || ck dead alive "T53j process untouched on no_lstart"
+t53_kill "$CHILD53J" "$WRAP53J"
+wait "$WRAP53J" 2>/dev/null || true
+
+# T53k: watcher never reaps; CLI reap then kills (port 17956)
+AGENT_SWITCHBOARD_REAPER=1 AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" serve --port 17956 >/dev/null 2>&1 &
+SRV53K=$!
+sleep 1.5
+HK=$(curl -s "http://127.0.0.1:17956/v1/health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok"))' 2>/dev/null || echo fail)
+ck "$HK" "True" "T53k watcher daemon health on 17956"
+"$TD" --task t53k --lane stuck --exec /bin/sleep -- 60 >/dev/null 2>&1 &
+WRAP53K=$!
+sleep 0.8
+CHILD53K=$(python3 -c "import json,os; print(json.load(open(os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'],'t53k','slot-stuck.json')))['pid'])")
+t53_wait_state t53k stuck STALLED 1 >/dev/null
+t53_confirm t53k stuck >/dev/null
+sleep 3.5
+t53_alive "$CHILD53K" && ck ok ok "T53k worker still alive after >=3 watcher ticks" || ck dead alive "T53k worker still alive after >=3 watcher ticks"
+if [ -f "$AGENT_SWITCHBOARD_ROOT/t53k/reap-confirm-stuck.json" ]; then ck ok ok "T53k confirm still present (watcher did not consume)"; else ck missing present "T53k confirm still present (watcher did not consume)"; fi
+AGENT_SWITCHBOARD_REAPER=1 AGENT_SWITCHBOARD_STALL_AFTER=1 "$SB" reap --task t53k --lane stuck >/dev/null 2>&1
+RC53K=$?
+ck "$RC53K" "0" "T53k CLI reap then kills (exit 0)"
+sleep 0.3
+t53_alive "$CHILD53K" && ck alive dead "T53k CLI reap killed the worker" || ck ok ok "T53k CLI reap killed the worker"
+t53_kill "$CHILD53K" "$WRAP53K"
+kill "$SRV53K" 2>/dev/null
+wait 2>/dev/null
+
 echo; echo "RESULT: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

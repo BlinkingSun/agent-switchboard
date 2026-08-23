@@ -2,8 +2,9 @@
 """switchboard — slot registry, event-driven waits, and a background status
 service for AI agent lanes (Agent Switchboard).
 
-OBSERVE/ALERT ONLY. This tool never signals, kills, restarts, or re-dispatches
+OBSERVE/ALERT ONLY by default. This tool never signals, kills, restarts, or re-dispatches
 anything (design rule: no autonomous destructive enforcement).
+Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only (no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes.
 It derives lane state from facts that exist anyway — pids, grok session file
 mtimes, slot records written by agent-dispatch — so workers never have to
 self-report heartbeats.
@@ -44,6 +45,8 @@ Commands:
   switchboard events --task T [-n N]
   switchboard agents [--since DUR] [--live] [--json]
   switchboard serve  [--host 127.0.0.1] [--port 17920]
+  switchboard reap   --task T --lane L
+                     (exit 0 reaped / 2 refused / 3 not confirmed; CLI-only)
 
 wait exit codes: 0 = event occurred (or all watched lanes already terminal),
 3 = timeout with no event. wait returns on transitions to DONE/FAILED/DIED/
@@ -2969,6 +2972,8 @@ def build_advise(task, events, wait_exit, quiet_after=DEFAULT_QUIET_AFTER, snap=
         elif e.get("event") == "refuse":
             refused.append(e)
             next_verbs.append("retry_refuse:%s" % (e.get("lane") or "?"))
+        elif e.get("event") == "reap":
+            next_verbs.append("reaped:%s" % (e.get("lane") or "?"))
         elif e.get("event") == "file":
             next_verbs.append("rescan")
 
@@ -3124,6 +3129,310 @@ def cmd_events(args):
     for e in events:
         sys.stdout.write(json.dumps(e) + "\n")
     return 0
+
+
+# ---------------------------------------------------------------- reap (CLI-only; never HTTP, never the watcher)
+
+_REAP_CONFIRM_KEYS = ("lane", "run_id", "pid", "prog_base", "confirmed_at", "reason")
+_REAP_OK_STATES = frozenset({"STALLED", "ORPHAN"})
+
+
+def _serve_lock_pid():
+    rec = read_json(os.path.join(ROOT, "serve.lock"))
+    if not rec:
+        return None
+    try:
+        return int(rec.get("pid"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _consume_confirm(tdir, lane, src):
+    """Atomic rename into history/ before the first signal (no replay)."""
+    hist = os.path.join(tdir, "history")
+    os.makedirs(hist, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(hist, "reap-confirm-%s-%s.json" % (lane, stamp))
+    n = 0
+    while os.path.exists(dest):
+        n += 1
+        dest = os.path.join(hist, "reap-confirm-%s-%s-%d.json" % (lane, stamp, n))
+    try:
+        os.replace(src, dest)
+        return dest
+    except OSError:
+        return None
+
+
+def _reap_identity_ok(slot, snap):
+    """Triple (pid, prog_base-in-cmdline, lstart). Both lstarts must parse."""
+    pid = slot.get("pid")
+    if pid is None:
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if not snap:
+        return False
+    rec = snap.get(pid)
+    if not isinstance(rec, dict):
+        return False
+    prog_base = slot.get("prog_base")
+    cmd = rec.get("command") or ""
+    if not prog_base or prog_base not in cmd:
+        return False
+    slot_ts = _lstart_ts(slot.get("lstart"))
+    snap_ts = _lstart_ts(rec.get("lstart"))
+    if slot_ts is None or snap_ts is None:
+        return False
+    return slot_ts == snap_ts
+
+
+def _reap_ledger(kind, task, lane, pid, lstart, reason=None):
+    """Every outcome lands in the agents ledger. Success ends with ended_source=reap."""
+    _seed_ledger()
+    now = time.time()
+    rec = {
+        "ev": kind,
+        "ts": _iso_z(now),
+        "task": task,
+        "lane": lane,
+        "pid": pid,
+    }
+    if reason:
+        rec["reason"] = reason
+    if pid is not None:
+        rec["id"] = _ledger_id_os(pid, lstart or "")
+    if kind == "reap":
+        rec["ended_source"] = "reap"
+    _ledger_append(rec)
+    if kind == "reap" and pid is not None:
+        _write_end(rec["id"], "cancelled", "reap", now)
+
+
+def _daemon_finalize_slot(slot_path, run_id, exit_code):
+    """Write exited+reaped under the same-run_id guard. False if skipped."""
+    cur = read_json(slot_path)
+    if cur is None:
+        return False
+    if cur.get("run_id") != run_id:
+        return False
+    if cur.get("status") == "exited":
+        return False
+    cur["status"] = "exited"
+    cur["exit_code"] = exit_code
+    cur["ended"] = time.time()
+    cur["reaped"] = True
+    write_json_atomic(slot_path, cur)
+    return True
+
+
+def reap_lane(task, lane):
+    """CLI-only kill of one confirmed worker. See module header for the gates.
+
+    Exit 0 reaped / 2 refused / 3 not confirmed. Windows is the first gate
+    after the master switch: os.name == "nt" refuses closed (identity is
+    unverifiable because ps_cli_snapshot returns None on nt, and Windows
+    os.kill is TerminateProcess so the TERM-then-KILL cadence cannot be
+    honoured).
+    """
+    env_on = os.environ.get("AGENT_SWITCHBOARD_REAPER") == "1"
+    tdir = task_dir(task)
+    confirm_path = os.path.join(tdir, "reap-confirm-%s.json" % lane)
+    slot_path = os.path.join(tdir, "slot-%s.json" % lane)
+
+    if not env_on:
+        append_event(task, {"event": "reap_refused", "lane": lane, "reason": "disabled"})
+        _reap_ledger("reap_refused", task, lane, None, None, "disabled")
+        print("switchboard reap: refused reason=disabled", file=sys.stderr)
+        return 2
+
+    if os.name == "nt":
+        # First gate after the master switch. Do not consume the confirm;
+        # do not signal. Rationale: ps_cli_snapshot() returns None on nt
+        # so identity is unverifiable, and Windows os.kill is TerminateProcess.
+        append_event(task, {"event": "reap_refused", "lane": lane, "reason": "windows"})
+        _reap_ledger("reap_refused", task, lane, None, None, "windows")
+        print("switchboard reap: refused reason=windows", file=sys.stderr)
+        return 2
+
+    def _refuse(reason, code=2, event="reap_refused", pid=None, lstart=None, run_id=None):
+        ev = {"event": event, "lane": lane, "reason": reason}
+        if run_id:
+            ev["run_id"] = run_id
+        append_event(task, ev)
+        _reap_ledger(event, task, lane, pid, lstart, reason)
+        print("switchboard reap: %s reason=%s" % (
+            "identity_miss" if event == "identity_miss" else "refused", reason
+        ), file=sys.stderr)
+        return code
+
+    if not os.path.isfile(confirm_path):
+        return _refuse("no_confirm", code=3)
+
+    try:
+        with open(confirm_path) as f:
+            confirm = json.load(f)
+    except Exception:
+        _consume_confirm(tdir, lane, confirm_path)
+        return _refuse("malformed", code=3)
+
+    # Gate is on: consume on every outcome, before the first signal.
+    _consume_confirm(tdir, lane, confirm_path)
+
+    if not isinstance(confirm, dict) or any(k not in confirm for k in _REAP_CONFIRM_KEYS):
+        return _refuse("malformed", code=3)
+
+    slot = read_json(slot_path)
+    if not slot or slot.get("corrupt"):
+        return _refuse("no_slot", code=3)
+
+    conf_lane = confirm.get("lane")
+    conf_run = confirm.get("run_id")
+    try:
+        conf_pid = int(confirm.get("pid"))
+    except (TypeError, ValueError):
+        conf_pid = None
+    conf_base = confirm.get("prog_base")
+
+    if conf_lane != lane:
+        return _refuse("lane_mismatch", code=3, run_id=conf_run)
+    if conf_run != slot.get("run_id"):
+        return _refuse("stale_run_id", code=3, pid=slot.get("pid"),
+                       lstart=slot.get("lstart"), run_id=conf_run)
+
+    try:
+        slot_pid = int(slot.get("pid")) if slot.get("pid") is not None else None
+    except (TypeError, ValueError):
+        slot_pid = None
+
+    if slot_pid is None or conf_pid is None or conf_pid != slot_pid:
+        return _refuse("pid", code=2, event="identity_miss", pid=slot_pid,
+                       lstart=slot.get("lstart"), run_id=slot.get("run_id"))
+    if conf_base != slot.get("prog_base"):
+        return _refuse("prog_base", code=2, event="identity_miss", pid=slot_pid,
+                       lstart=slot.get("lstart"), run_id=slot.get("run_id"))
+
+    if lane.startswith("stall-"):
+        return _refuse("never_kill", pid=slot_pid, lstart=slot.get("lstart"),
+                       run_id=slot.get("run_id"))
+    if slot_pid is None:
+        return _refuse("never_kill", pid=None, lstart=slot.get("lstart"),
+                       run_id=slot.get("run_id"))
+    serve_pid = _serve_lock_pid()
+    if serve_pid is not None and slot_pid == serve_pid:
+        return _refuse("never_kill", pid=slot_pid, lstart=slot.get("lstart"),
+                       run_id=slot.get("run_id"))
+    try:
+        wrap_pid = int(slot["wrapper_pid"]) if slot.get("wrapper_pid") is not None else None
+    except (TypeError, ValueError):
+        wrap_pid = None
+    try:
+        launch_pid = (
+            int(slot["launcher_cli_pid"]) if slot.get("launcher_cli_pid") is not None else None
+        )
+    except (TypeError, ValueError):
+        launch_pid = None
+    if wrap_pid is not None and slot_pid == wrap_pid:
+        return _refuse("never_kill", pid=slot_pid, lstart=slot.get("lstart"),
+                       run_id=slot.get("run_id"))
+    if launch_pid is not None and slot_pid == launch_pid:
+        return _refuse("never_kill", pid=slot_pid, lstart=slot.get("lstart"),
+                       run_id=slot.get("run_id"))
+
+    snap = ps_cli_snapshot()
+    state, _ = derive(slot, snap=snap)
+    if state not in _REAP_OK_STATES:
+        return _refuse("wrong_state", pid=slot_pid, lstart=slot.get("lstart"),
+                       run_id=slot.get("run_id"))
+
+    if not slot.get("lstart") or _lstart_ts(slot.get("lstart")) is None:
+        return _refuse("no_lstart", pid=slot_pid, lstart=slot.get("lstart"),
+                       run_id=slot.get("run_id"))
+
+    if not _reap_identity_ok(slot, snap):
+        return _refuse("identity", code=2, event="identity_miss", pid=slot_pid,
+                       lstart=slot.get("lstart"), run_id=slot.get("run_id"))
+
+    run_id = slot.get("run_id")
+    lstart = slot.get("lstart")
+
+    # SIGTERM then ~3s then re-verify then SIGKILL. os.kill only after the
+    # os.name == "nt" gate above.
+    try:
+        os.kill(int(slot_pid), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        return _refuse("identity", code=2, event="identity_miss", pid=slot_pid,
+                       lstart=lstart, run_id=run_id)
+
+    time.sleep(3.0)
+    snap = ps_cli_snapshot()
+    still = _reap_identity_ok(slot, snap)
+    term_sufficed = not still
+    if still:
+        snap_kill = ps_cli_snapshot()
+        if not _reap_identity_ok(slot, snap_kill):
+            return _refuse("identity", code=2, event="identity_miss", pid=slot_pid,
+                           lstart=lstart, run_id=run_id)
+        try:
+            os.kill(int(slot_pid), signal.SIGKILL)
+        except ProcessLookupError:
+            term_sufficed = True
+        except Exception:
+            return _refuse("identity", code=2, event="identity_miss", pid=slot_pid,
+                           lstart=lstart, run_id=run_id)
+        time.sleep(0.2)
+        snap = ps_cli_snapshot()
+        if _reap_identity_ok(slot, snap):
+            return _refuse("still_alive", pid=slot_pid, lstart=lstart, run_id=run_id)
+
+    exit_code = -15 if term_sufficed else -9
+
+    cur = read_json(slot_path)
+    already_exited = bool(cur and cur.get("status") == "exited")
+    wrapper_ok = False
+    if cur is not None:
+        wrapper_ok = proc_alive(
+            cur.get("wrapper_pid"),
+            cur.get("wrapper_base", "agent-dispatch"),
+            snap if snap is not None else ps_cli_snapshot(),
+        )
+
+    wrote = False
+    if already_exited:
+        wrote = False
+    elif wrapper_ok:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            cur = read_json(slot_path)
+            if cur and cur.get("status") == "exited":
+                break
+            time.sleep(0.1)
+        cur = read_json(slot_path)
+        if not (cur and cur.get("status") == "exited"):
+            wrote = _daemon_finalize_slot(slot_path, run_id, exit_code)
+    else:
+        # Wrapper already dead (ORPHAN): finalize immediately, no 5s wait.
+        wrote = _daemon_finalize_slot(slot_path, run_id, exit_code)
+
+    append_event(task, {
+        "event": "reap",
+        "lane": lane,
+        "run_id": run_id,
+        "pid": slot_pid,
+        "exit_code": exit_code,
+        "daemon_wrote": wrote,
+    })
+    _reap_ledger("reap", task, lane, slot_pid, lstart)
+    print("switchboard reap: reaped lane %s pid %s" % (lane, slot_pid), file=sys.stderr)
+    return 0
+
+
+def cmd_reap(args):
+    return reap_lane(args.task, args.lane)
 
 
 # ---------------------------------------------------------------- serve (daemon)
@@ -3636,7 +3945,11 @@ def cmd_serve(args):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Slot registry, event waits, and status service for agent lanes (observe-only)."
+        description=(
+            "OBSERVE/ALERT ONLY by default. Slot registry, event waits, and status "
+            "service for agent lanes. "
+            "Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only (no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes."
+        )
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -3708,12 +4021,25 @@ def main():
     p.add_argument("--quiet-after", type=float, default=DEFAULT_QUIET_AFTER)
     p.set_defaults(fn=cmd_serve)
 
+    p = sub.add_parser(
+        "reap",
+        help="confirmed CLI-only kill of one STALLED or ORPHAN worker (exit 0/2/3)",
+    )
+    p.add_argument("--task", required=True)
+    p.add_argument("--lane", required=True)
+    p.set_defaults(fn=cmd_reap)
+
     args = ap.parse_args()
     if getattr(args, "task", None) is not None and not name_ok(args.task):
         print(f"switchboard: bad task name {args.task!r} (alnum, dash, underscore, dot)",
               file=sys.stderr)
         return 2
-    for lane in getattr(args, "lane", None) or []:
+    raw_lane = getattr(args, "lane", None)
+    if isinstance(raw_lane, str):
+        lanes_check = [raw_lane]
+    else:
+        lanes_check = raw_lane or []
+    for lane in lanes_check:
         if not name_ok(lane):
             print(f"switchboard: bad lane name {lane!r}", file=sys.stderr)
             return 2

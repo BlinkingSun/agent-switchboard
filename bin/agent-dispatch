@@ -513,6 +513,19 @@ def main():
             # load_slots()/status never sees the lane vanish mid-swap.
 
         child = subprocess.Popen([args.prog] + worker_args)
+        # Capture worker lstart immediately after Popen, before find_launcher().
+        # Targeted one-pid query only — do not add lstart to find_launcher's
+        # -axo sweep (that parser is split(None, 2); a 5-token lstart breaks it).
+        lstart = None
+        if os.name != "nt":
+            try:
+                lstart = subprocess.check_output(
+                    ["ps", "-o", "lstart=", "-p", str(child.pid)],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip() or None
+            except Exception:
+                lstart = None
         launcher = find_launcher()
 
         if existing is not False:
@@ -531,6 +544,7 @@ def main():
             "wrapper_pid": os.getpid(),
             "wrapper_base": os.path.basename(sys.argv[0]) or "agent-dispatch",
             "pid": child.pid,
+            "lstart": lstart,
             "prog": args.prog,
             "prog_base": os.path.basename(args.prog),
             "channel": channel,
@@ -558,6 +572,11 @@ def main():
         if cur is not None and cur.get("run_id") != run_id:
             append_event(tdir, {"event": "stale_finalize_skipped", "lane": args.lane,
                                 "run_id": run_id, "exit_code": rc})
+            return
+        if (cur is not None and cur.get("run_id") == run_id
+                and cur.get("status") == "exited" and cur.get("reaped") is True):
+            append_event(tdir, {"event": "reap_finalize_skipped", "lane": args.lane,
+                                "run_id": run_id})
             return
         slot["status"] = "exited"
         slot["exit_code"] = rc

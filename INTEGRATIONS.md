@@ -25,8 +25,8 @@ Plus an HTTP API for tools/UIs on `127.0.0.1:17920` (`switchboard serve`):
 | `GET /v1/advise?task=T` | current advise payload (closed `next` verbs) |
 | `GET /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55]` | long-poll; `gap:true` if cursor behind ring; HTTP 503 + `Retry-After` when wait capacity is full |
 
-Everything is **observe-only**: the switchboard never kills, restarts, or
-re-dispatches — your orchestrator reads the alerts and decides. (The viewer
+Everything is **OBSERVE/ALERT ONLY by default**: the switchboard never kills, restarts, or
+re-dispatches — your orchestrator reads the alerts and decides. Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only (no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes. (The viewer
 **START DAEMON** button and CLI `--ensure` only kickstart the launchd job for
 the daemon itself.) `state/<task>/advise.json` is rewritten on every wait
 return and on lane transitions. A sample Claude `SubagentStop` hook at

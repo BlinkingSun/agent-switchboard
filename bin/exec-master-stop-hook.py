@@ -6,8 +6,8 @@ after it ends its turn. If it returns while switchboard still has ACTIVE
 lanes (or ready-for-audit work), supervision is silently abandoned.
 
 This hook blocks that turn-end when the stopping agent looks like an
-exec-master AND any switchboard slot is still live. Observe-only: it
-never kills or re-dispatches anything.
+exec-master AND any switchboard slot is still live. OBSERVE/ALERT ONLY by default.
+Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only (no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes.
 
 Stdin: Claude Code hook JSON (SubagentStop).
 Stdout: {"decision":"block","reason": "..."} or empty allow.

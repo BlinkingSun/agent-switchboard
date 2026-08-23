@@ -38,8 +38,9 @@ from what the OS already knows:
 | `DIED` | worker **and** wrapper gone without finalizing — the silent kill |
 | `CORRUPT` | slot file unreadable — surfaced, never silently dropped |
 
-**Observe/alert only, by design:** the switchboard never kills, restarts, or
+**OBSERVE/ALERT ONLY by default:** the switchboard never kills, restarts, or
 re-dispatches anything. It tells your orchestrator; your orchestrator decides.
+Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only (no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes.
 
 ## The three verbs
 
