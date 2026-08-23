@@ -4,6 +4,13 @@ You are building the static frontend for **Agent Switchboard**, a read-only
 live dashboard over a fleet of AI agent lanes. It runs inside a Tauri 2
 webview. NO frameworks, NO bundler, NO external assets, NO emojis anywhere.
 
+The packaged UI the desktop shell loads is `dist/switchboard-web/index.html`
+(single file). The three-file `dist/` tree specified below is the original
+viewer and is not what Tauri packages. CLI kinds (claude, grok, cursor, and
+`*-sub`) share one row renderer — same fields, chips, lamp mapping, and
+identity line. Finished-lane / ended-session expiry is daemon-served
+(15 minutes); the UI does not prune by kind.
+
 ## Files you may write (ONLY these)
 - dist/index.html
 - dist/style.css

@@ -105,8 +105,9 @@ DAEMON** button (launchd kickstart only — never kills lanes). The harness
 chips in the top bar and the CLI SESSIONS rollup name only the families that
 currently have a live instance — no `cursor 0` on a machine without Cursor,
 no `grok 0` on a machine without Grok. Finished lanes
-hide from the board after 30 minutes (`ended_s`); the CLI/JSON stay complete
-(presentation-only retention).
+drop from the served board after 15 minutes (`ended_s`); this is 15-min
+served-board retention (daemon-side, all UIs inherit). Slot files stay on
+disk until the 24h cold-archive.
 
 Grab the signed DMG from [Releases](../../releases), or build it yourself:
 
@@ -137,6 +138,7 @@ launch from a shell.
 | `AGENT_SWITCHBOARD_HOST` / `_PORT` | `127.0.0.1` / `17920` | daemon bind / ensure probe |
 | `AGENT_SWITCHBOARD_EVENTS_MAX_BYTES` | `1000000` | events.jsonl rotate threshold |
 | `AGENT_SWITCHBOARD_COLD_AFTER` | `86400` | cold-archive terminal slots (seconds) |
+| `AGENT_SWITCHBOARD_DONE_EXPIRE` | `900` | omit terminal (DONE/FAILED/DIED) rows from served status/board after this many seconds; `0` disables. Slot files stay until `COLD_AFTER` |
 | `AGENT_SWITCHBOARD_BUS_MAXLEN` | `2000` | in-memory event-bus ring size |
 | `AGENT_SWITCHBOARD_CLI_CACHE_TTL` | `5.0` | `/v1/cli` snapshot reuse (seconds) |
 | `AGENT_SWITCHBOARD_IDLE_GRACE` | `300` | idle self-exit grace (seconds) |

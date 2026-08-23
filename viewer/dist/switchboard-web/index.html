@@ -9,16 +9,15 @@
     --pill-border:#33506b; --pill-ink:#9cc6ea;
     --mono:"SF Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
     --r:9px;
-    --rail-w:150px;
   }
   *{box-sizing:border-box}
-  html,body{margin:0;background:var(--page)}
+  html,body{margin:0;background:var(--page); overflow-x:hidden}
   body{
     color:var(--ink); font-family:var(--mono); font-size:14px; line-height:1.35; letter-spacing:.1px;
     -webkit-font-smoothing:antialiased; min-height:100vh;
     padding-top:env(safe-area-inset-top);
   }
-  .wrap{max-width:1180px; margin:0 auto; padding:16px 16px 92px;}
+  .wrap{max-width:1180px; width:100%; min-width:0; margin:0 auto; padding:16px 16px 92px;}
 
   /* header */
   .top{display:flex; align-items:center; justify-content:center; position:relative; margin:4px 0 14px}
@@ -41,22 +40,25 @@
   .seg .chip{padding:5px 15px}
 
   .counts{display:flex; gap:14px 18px; flex-wrap:wrap; align-items:center; margin:10px 0 2px; font-size:12.5px}
+  .counts.cli-line{margin-top:8px; margin-bottom:4px}
   .cnt{color:var(--mut); letter-spacing:.6px; white-space:nowrap}
   .cnt b{font-weight:700; margin-right:5px; font-variant-numeric:tabular-nums; color:var(--dim)}
   .cnt.run b{color:var(--run)} .cnt.work b{color:var(--run)} .cnt.wait b{color:var(--wait)}
   .cnt.quiet b{color:var(--wait)} .cnt.stall b{color:var(--fail)} .cnt.died b{color:var(--fail)} .cnt.fail b{color:var(--fail)}
-  .cnt.on b{}
+  .cnt.done b{color:var(--done)}
+  .cnt.zero{opacity:.5}
   .finished{color:var(--dim); letter-spacing:.4px}
   .cli-chip{border:1px solid var(--border); background:#11151b; border-radius:7px; padding:4px 11px; color:var(--mut); font-size:12px; letter-spacing:.5px}
   .cli-chip b{color:var(--ink)}
 
-  .cols{display:grid; grid-template-columns:1fr var(--rail-w); gap:16px; align-items:start; margin-top:14px}
+  .cols{display:block; margin-top:14px; min-width:0}
+  .main{min-width:0; overflow-x:hidden}
   .panel{background:var(--panel); border:1px solid var(--border); border-radius:13px; padding:14px 14px 16px;
-         box-shadow:inset 0 1px 0 rgba(255,255,255,.02); margin-bottom:14px}
+         box-shadow:inset 0 1px 0 rgba(255,255,255,.02); margin-bottom:14px; min-width:0; max-width:100%}
   .panel-hd{display:flex; align-items:center; justify-content:space-between; gap:10px; margin:2px 2px 12px; cursor:pointer}
   .panel-hd .lt{display:flex; align-items:center; gap:9px}
-  .panel-hd .title{letter-spacing:2px; font-weight:700; font-size:13px}
-  .panel-hd .roll{color:var(--mut); font-size:12px; letter-spacing:.6px; font-variant-numeric:tabular-nums}
+  .panel-hd .title{letter-spacing:2px; font-weight:700; font-size:13px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .panel-hd .roll{color:var(--mut); font-size:12px; letter-spacing:.6px; font-variant-numeric:tabular-nums; flex-shrink:0}
   .panel-hd .roll .live{color:var(--run)}
 
   .tri{width:0;height:0;border-left:6px solid var(--mut); border-top:4.5px solid transparent; border-bottom:4.5px solid transparent;
@@ -69,11 +71,11 @@
   .host-lab:first-child{margin-top:2px}
   .host-empty{color:var(--dim); letter-spacing:.5px; font-size:12.5px; padding:2px 2px 4px 18px}
 
-  .node{position:relative}
-  .kids{position:relative; margin-left:26px}
+  .node{position:relative; min-width:0; max-width:100%}
+  .kids{position:relative; margin-left:26px; min-width:0}
   .kids::before{content:""; position:absolute; left:0; top:-4px; bottom:14px; width:1px; background:var(--border)}
   .row{display:flex; align-items:center; gap:10px; background:var(--slot); border:1px solid var(--border); border-radius:var(--r);
-       padding:9px 13px; margin:7px 0; position:relative;
+       padding:9px 13px; margin:7px 0; position:relative; min-width:0; overflow:hidden;
        box-shadow:inset 0 1px 0 rgba(255,255,255,.015), 0 1px 2px rgba(0,0,0,.25);
        transition:background .12s ease, border-color .12s ease}
   .kids > .node > .row{margin-left:14px}
@@ -91,42 +93,31 @@
   @keyframes pulse{0%,100%{box-shadow:0 0 5px 0 rgba(229,72,77,.35)}50%{box-shadow:0 0 12px 3px rgba(229,72,77,.75)}}
   @media (prefers-reduced-motion:reduce){.lamp.died{animation:none}}
 
-  .name{font-weight:700; letter-spacing:.4px}
-  .pill{border:1px solid var(--border); color:var(--mut); border-radius:6px; padding:2px 8px; font-size:10.5px; letter-spacing:1.2px; white-space:nowrap}
-  .pill.mode{border-color:var(--pill-border); color:var(--pill-ink)}
+  .name{font-weight:700; letter-spacing:.4px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:0 1 auto}
+  .pill{border:1px solid var(--border); color:var(--mut); border-radius:6px; padding:2px 8px; font-size:10.5px; letter-spacing:1.2px; white-space:nowrap; flex-shrink:0}
+  .pill.mode,.pill.status{border-color:var(--pill-border); color:var(--pill-ink)}
   .pill.model{background:#12161c; color:var(--mut); letter-spacing:.6px; font-size:11px}
-  .meta{color:var(--mut); font-size:12.5px; letter-spacing:.3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .pill.pid{background:#12161c; color:var(--mut); letter-spacing:.4px; font-size:11px; font-variant-numeric:tabular-nums}
+  .pidlog{color:var(--dim); font-size:11.5px; letter-spacing:.4px; padding:4px 2px 0 18px}
+  .pidlog span{margin-right:14px; white-space:nowrap}
+  .meta{color:var(--mut); font-size:12.5px; letter-spacing:.3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; flex:1 1 0%}
   .meta .k{color:var(--dim)}
-  .up{margin-left:auto; color:var(--mut); font-size:12.5px; letter-spacing:.5px; white-space:nowrap; font-variant-numeric:tabular-nums; padding-left:8px}
+  .up{margin-left:auto; color:var(--mut); font-size:12.5px; letter-spacing:.5px; white-space:nowrap; font-variant-numeric:tabular-nums; padding-left:8px; flex-shrink:0}
 
   /* task panels */
-  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:6px}
-  .cell{display:flex; align-items:center; gap:8px; background:var(--slot); border:1px solid var(--border); border-radius:7px; padding:4px 10px}
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:6px; min-width:0}
+  .cell{display:flex; align-items:center; gap:8px; background:var(--slot); border:1px solid var(--border); border-radius:7px; padding:4px 10px; min-width:0; overflow:hidden}
   .cell:hover{background:var(--slot-hi)}
-  .cell .nm{font-weight:600; letter-spacing:.3px; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .cell .nm{font-weight:600; letter-spacing:.3px; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0}
   .cell .cage{margin-left:auto; color:var(--dim); font-size:11px; font-variant-numeric:tabular-nums; padding-left:6px; white-space:nowrap}
   .lamp.sm{width:9px;height:9px}
   /* panel density rows */
-  .prow{display:flex; align-items:center; gap:12px; background:var(--slot); border:1px solid var(--border); border-radius:var(--r); padding:11px 14px; margin:7px 0}
+  .prow{display:flex; align-items:center; gap:12px; background:var(--slot); border:1px solid var(--border); border-radius:var(--r); padding:11px 14px; margin:7px 0; min-width:0; overflow:hidden}
   .prow .lamp{width:16px;height:16px}
-  .prow .nm{font-weight:700; font-size:15px; letter-spacing:.3px}
-  .prow .pm{color:var(--mut); font-size:12px; letter-spacing:.3px}
+  .prow .nm{font-weight:700; font-size:15px; letter-spacing:.3px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .prow .pm{color:var(--mut); font-size:12px; letter-spacing:.3px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1 1 0%}
   .prow .pm .k{color:var(--dim)}
   .prow .pup{margin-left:auto; text-align:right; color:var(--mut); font-size:12px; font-variant-numeric:tabular-nums}
-
-  /* right rail */
-  .rail-col{position:relative; min-width:0}
-  .rail-handle{position:absolute; left:-9px; top:0; bottom:0; width:6px; cursor:col-resize; z-index:3; touch-action:none}
-  .rail-handle::before{content:""; position:absolute; left:2px; top:8%; bottom:8%; width:2px; border-radius:1px;
-    background:var(--border); transition:background .15s ease, box-shadow .15s ease}
-  .rail-handle:hover::before,.rail-handle.dragging::before{background:var(--dim); box-shadow:0 0 4px rgba(74,82,97,.45)}
-  .rail{display:flex; flex-direction:column; gap:5px; position:sticky; top:14px}
-  .tile{display:flex; align-items:baseline; justify-content:space-between; gap:10px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:6px 11px}
-  .tile .lb{color:var(--mut); font-size:10px; letter-spacing:1.3px}
-  .tile .num{font-size:17px; font-weight:700; margin-top:0; line-height:1; font-variant-numeric:tabular-nums; color:var(--dim)}
-  .tile.run .num{color:var(--run)}
-  .tile.hot{border-color:#4a2327}
-  .tile.hot .num{color:var(--fail)}
 
   .ticker{position:fixed; left:0; right:0; bottom:0; background:#0a0d11; border-top:1px solid var(--border);
           padding:9px 16px calc(9px + env(safe-area-inset-bottom)); font-size:12px; color:var(--mut); letter-spacing:.4px;
@@ -140,10 +131,6 @@
   .collapsed{display:none}
 
   @media (max-width:760px){
-    .cols{grid-template-columns:1fr}
-    .rail-handle{display:none}
-    .rail{flex-direction:row; overflow-x:auto; position:static; padding-bottom:2px}
-    .tile{min-width:116px; flex:0 0 auto}
     .meta{max-width:42vw}
   }
 </style>
@@ -157,6 +144,7 @@
 
   <div class="chips" id="hostchips"></div>
   <div class="counts" id="counts"></div>
+  <div class="counts cli-line" id="clicounts"></div>
 
   <div class="cols">
     <div class="main">
@@ -166,13 +154,10 @@
           <div class="roll" id="cliroll"></div>
         </div>
         <div class="body" id="clibody"></div>
+        <div class="pidlog" id="pidlog" hidden></div>
       </section>
       <div id="taskpanels"></div>
       <div class="idle" id="idle" style="display:none">waiting for fleet snapshot&#8230;</div>
-    </div>
-    <div class="rail-col" id="railcol">
-      <div class="rail-handle" id="railhandle" role="separator" aria-orientation="vertical" aria-label="Resize status rail"></div>
-      <aside class="rail" id="rail"></aside>
     </div>
   </div>
 </div>
@@ -192,10 +177,10 @@
    Standalone preview: ?mock=1 renders MOCK. No network is ever performed.
    ========================================================================== */
 
-const STATE_CLASS = {RUNNING:'run',WORKING_TOOL:'work',WAITING_INPUT:'wait',QUIET:'quiet',
-                     STALLED:'stall',DIED:'died',FAILED:'fail',DONE:'done',ORPHAN:'orphan',CORRUPT:'fail'};
-const COUNT_ORDER = [['run','RUNNING'],['work','WORKING_TOOL'],['wait','WAITING_INPUT'],['quiet','QUIET'],
-                     ['stall','STALLED'],['died','DIED'],['fail','FAILED'],['done','DONE']];
+const STATE_CLASS = {RUNNING:'run',WORKING_TOOL:'run',WAITING_INPUT:'quiet',QUIET:'quiet',
+                     STALLED:'stall',DIED:'died',FAILED:'fail',DONE:'done',ORPHAN:'quiet',CORRUPT:'fail'};
+const COUNT_ORDER = [['run','RUNNING'],['quiet','QUIET'],['stall','STALLED'],
+                     ['died','DIED'],['fail','FAILED'],['done','DONE']];
 const HOST_ORDER = ['mbp','mini','pc','cnc'];
 
 let DOC = null, activeHost = 'all';
@@ -217,22 +202,46 @@ function agoStr(iso){
   const s=Math.max(0,Math.round((Date.now()-t)/1000));
   return s<90 ? s+'s ago' : Math.round(s/60)+'m ago';
 }
-const stClass = st => STATE_CLASS[String(st||'').toUpperCase()] || 'done';
+const stClass = st => STATE_CLASS[String(st||'').toUpperCase()] || 'quiet';
 const hasLamp = kind => kind!=='team-dispatch' && kind!=='team_dispatch';
 
-/* ---- aggregate slot states across the (filtered) fleet ---- */
-function slotStates(){
-  const c={run:0,work:0,wait:0,quiet:0,stall:0,died:0,fail:0,done:0};
-  hosts().forEach(h=>(h.tasks||[]).forEach(t=>(t.slots||[]).forEach(sl=>{
-    const k=stClass(sl.state); if(c[k]!=null) c[k]++;
-  })));
+/* ---- live agent/subagent counts (CLI tree + recent closed/failed) ---- */
+function emptyAgentCounts(){
+  return {run:0,quiet:0,stall:0,died:0,fail:0,done:0};
+}
+function walkAgentNodes(nodes, fn){
+  (nodes||[]).forEach(n=>{
+    if(!n||typeof n!=='object') return;
+    if(hasLamp(n.kind)) fn(n);
+    walkAgentNodes(n.children, fn);
+  });
+}
+function agentStates(){
+  const c=emptyAgentCounts();
+  hosts().forEach(h=>{
+    walkAgentNodes(h.cli_tree, n=>{
+      const k=n.state||stClass(n.status)||'quiet';
+      if(c[k]!=null) c[k]++;
+    });
+  });
+  const now=Date.now();
+  if(activeHost==='all'||activeHost===LOCAL_HOST_ID){
+    CLOSED_PID_LOG.forEach(e=>{ if(now-e.closedAt<PID_LOG_MS) c.died++; });
+    DONE_LOG.forEach(e=>{ if(now-e.at<PID_LOG_MS) c.done++; });
+    FAIL_LOG.forEach(e=>{ if(now-e.at<PID_LOG_MS) c.fail++; });
+  }
   return c;
 }
 function cliKindCounts(){
   const c={claude:0,grok:0,cursor:0,live:0};
   hosts().forEach(h=>{
     if(h.cli){ c.claude+=h.cli.claude||0; c.grok+=h.cli.grok||0; c.cursor+=h.cli.cursor||0; }
-    (function walk(ns){(ns||[]).forEach(n=>{ if(hasLamp(n.kind)) c.live++; walk(n.children); });})(h.cli_tree);
+    (function walk(ns){(ns||[]).forEach(n=>{
+      const st=String(n.status||'').toLowerCase();
+      const terminal=st==='completed'||st==='cancelled'||st==='failed'||st==='error';
+      if(hasLamp(n.kind) && !terminal) c.live++;
+      walk(n.children);
+    });})(h.cli_tree);
   });
   return c;
 }
@@ -243,32 +252,77 @@ function hosts(){
 }
 
 /* ---- CLI spawn-tree node (patch-panel box) ---- */
+function familyName(kind){
+  if(kind==='grok-sub'||kind==='grok') return 'grok';
+  if(kind==='cursor-sub'||kind==='cursor') return 'cursor';
+  if(kind==='claude-sub'||kind==='claude') return 'claude';
+  return kind||'?';
+}
 function nodeHTML(n){
   const kids = (n.children&&n.children.length) ? n.children : null;
   const isDisp = !hasLamp(n.kind);
   const tri = kids ? '<span class="tri open" data-node></span>' : '<span class="tri hidden"></span>';
-  const lamp = isDisp ? '' : '<span class="lamp run"></span>';
+  const lamp = isDisp ? '' : '<span class="lamp '+(n.state||'quiet')+'"></span>';
   const nm = isDisp
     ? '<span class="name">team-dispatch</span>'+(n.channel||n.lane?' <span class="meta">'+esc(n.channel||n.lane)+'</span>':'')
-    : '<span class="name">'+esc(n.kind)+'</span>';
+    : '<span class="name">'+esc(familyName(n.kind))+'</span>';
   const mode = (!isDisp&&n.mode) ? '<span class="pill mode">'+esc(String(n.mode).toUpperCase())+'</span>' : '';
+  const status = (!isDisp&&n.status!=null&&n.status!=='') ? '<span class="pill status">'+esc(String(n.status).toUpperCase())+'</span>' : '';
   const model = (!isDisp&&n.model) ? '<span class="pill model">'+esc(n.model)+'</span>' : '';
-  const chan = (!isDisp&&n.channel) ? '<span class="meta"><span class="k">channel</span> '+esc(n.channel)+'</span>' : '';
-  const tip = [n.kind,n.model,n.mode,n.channel].filter(Boolean).join(' \u00b7 ')+' \u00b7 UP '+fmtDur(n.uptime_s);
-  const row = '<div class="row" title="'+esc(tip)+'">'+tri+lamp+nm+mode+model+chan+'<span class="up">UP '+fmtDur(n.uptime_s)+'</span></div>';
+  const pid = (!isDisp&&n.pid!=null&&n.pid!=='') ? '<span class="pill pid">pid '+esc(n.pid)+'</span>' : '';
+  const ident = n.tty || n.channel || n.label;
+  const chan = (!isDisp&&ident) ? '<span class="meta">'+esc(ident)+'</span>' : '';
+  const tip = [familyName(n.kind),n.model,n.mode,n.pid!=null?'pid '+n.pid:'',n.tty,n.channel,n.label,n.status].filter(Boolean).join(' \u00b7 ')+' \u00b7 UP '+fmtDur(n.uptime_s);
+  const row = '<div class="row" title="'+esc(tip)+'">'+tri+lamp+nm+mode+status+model+pid+chan+'<span class="up">UP '+fmtDur(n.uptime_s)+'</span></div>';
   const children = kids ? '<div class="kids">'+kids.map(c=>'<div class="node">'+nodeHTML(c)+'</div>').join('')+'</div>' : '';
   return row+children;
 }
 
+const PID_LOG_MS=15*60*1000;
+let LAST_TREE_PIDS={};
+let CLOSED_PID_LOG=[];
+let LAST_SUBS={};
+let DONE_LOG=[];
+let FAIL_LOG=[];
+function collectTreePids(nodes, acc){
+  (nodes||[]).forEach(n=>{
+    if(n && n.pid!=null && n.pid!=='') acc[String(n.pid)]=familyName(n.kind);
+    collectTreePids(n.children, acc);
+  });
+}
+function noteClosedPids(tree){
+  if(!Array.isArray(tree)) return;
+  const now=Date.now();
+  const cur={};
+  collectTreePids(tree, cur);
+  Object.keys(LAST_TREE_PIDS).forEach(pid=>{
+    if(!cur[pid]) CLOSED_PID_LOG.push({pid:pid, kind:LAST_TREE_PIDS[pid], closedAt:now});
+  });
+  LAST_TREE_PIDS=cur;
+  CLOSED_PID_LOG=CLOSED_PID_LOG.filter(e=>now-e.closedAt<PID_LOG_MS);
+}
+function renderPidLog(){
+  const el=document.getElementById('pidlog');
+  if(!el) return;
+  const now=Date.now();
+  CLOSED_PID_LOG=CLOSED_PID_LOG.filter(e=>now-e.closedAt<PID_LOG_MS);
+  if(!CLOSED_PID_LOG.length){ el.hidden=true; el.innerHTML=''; return; }
+  el.hidden=false;
+  el.innerHTML=CLOSED_PID_LOG.map(e=>'<span>pid '+esc(e.pid)+' '+esc(e.kind)+' closed '+esc(fmtDur((now-e.closedAt)/1000))+' ago</span>').join('');
+}
 function renderCLI(){
   let html='';
+  let mbpTree=null;
   hosts().forEach(h=>{
     html+='<div class="host-lab">'+esc((h.label||h.id).toUpperCase())+(h.roaming?' <span class="rm">\u00b7 roaming '+esc(h.roaming)+'s</span>':'')+'</div>';
     const tree=h.cli_tree||[];
+    if(h.id===LOCAL_HOST_ID) mbpTree=tree;
     if(!tree.length){ html+='<div class="host-empty">no CLI sessions</div>'; return; }
     html+=tree.map(n=>'<div class="node">'+nodeHTML(n)+'</div>').join('');
   });
   document.getElementById('clibody').innerHTML=html;
+  if(mbpTree) noteClosedPids(mbpTree);
+  renderPidLog();
   const k=cliKindCounts();
   const parts=[]; if(k.claude)parts.push('CLAUDE '+k.claude); if(k.grok)parts.push('GROK '+k.grok); if(k.cursor)parts.push('CURSOR '+k.cursor);
   document.getElementById('cliroll').innerHTML=parts.join(' <span style="color:var(--dim)">\u00b7</span> ')+
@@ -298,24 +352,17 @@ function renderTasks(){
 }
 
 function renderCounts(){
-  const c=(DOC&&DOC.summary)?normSummary(DOC.summary):slotStates();
+  const c=agentStates();
+  document.getElementById('counts').innerHTML=COUNT_ORDER.map(([s,l])=>
+    '<span class="cnt '+s+(c[s]?' on':' zero')+'"><b>'+c[s]+'</b>'+l+'</span>'
+  ).join('');
   const k=cliKindCounts();
-  let html=COUNT_ORDER.map(([s,l])=>'<span class="cnt '+s+(c[s]?' on':' zero')+'"><b>'+c[s]+'</b>'+l+'</span>').join('');
-  html+='<span class="cli-chip">CLI: claude <b>'+k.claude+'</b></span>';
-  if(k.grok) html+='<span class="cli-chip">grok <b>'+k.grok+'</b></span>';
-  if(k.cursor) html+='<span class="cli-chip">cursor <b>'+k.cursor+'</b></span>';
-  document.getElementById('counts').innerHTML=html;
-}
-function normSummary(s){
-  return {run:s.running||0,work:s.working_tool||0,wait:s.waiting_input||0,quiet:s.quiet||0,
-          stall:s.stalled||0,died:s.died||0,fail:s.failed||0,done:s.done||0};
-}
-function renderRail(){
-  const c=(DOC&&DOC.summary)?normSummary(DOC.summary):slotStates();
-  document.getElementById('rail').innerHTML=COUNT_ORDER.map(([s,l])=>{
-    const hot=(s==='died'||s==='fail'||s==='stall')&&c[s]>0;
-    return '<div class="tile '+(s==='run'?'run':'')+' '+(hot?'hot':'')+'"><div class="lb">'+l+'</div><div class="num">'+c[s]+'</div></div>';
-  }).join('');
+  const line=document.getElementById('clicounts');
+  if(line){
+    line.innerHTML=[['claude',k.claude],['grok',k.grok],['cursor',k.cursor]].map(function(pair){
+      return '<span class="cnt'+(pair[1]?' on':' zero')+'"><b>'+pair[1]+'</b>'+pair[0]+'</span>';
+    }).join('');
+  }
 }
 function renderChips(){
   const present=new Set(((DOC&&DOC.hosts)||[]).map(h=>h.id));
@@ -358,12 +405,20 @@ function renderAll(){
   if(!DOC){ document.getElementById('idle').style.display='block'; document.getElementById('clipanel').style.display='none'; return; }
   document.getElementById('idle').style.display='none';
   document.getElementById('clipanel').style.display='';
-  renderChips(); renderCounts(); renderCLI(); renderTasks(); renderRail(); renderTicker(); renderAge();
+  renderChips(); renderCounts(); renderCLI(); renderTasks(); renderTicker(); renderAge();
   applyCollapseState();
 }
 
 /* ---- public entry point (native app calls this on load + each refresh) ---- */
-window.overwatchRender = function(doc){ DOC = doc||null; try{ renderAll(); }catch(e){ /* never throw into the host */ } };
+window.overwatchRender = function(doc){
+  DOC = doc||null;
+  if(DOC && Array.isArray(DOC.hosts)){
+    DOC.hosts.forEach(h=>{
+      if(h && h.cli_tree) h.cli_tree=stampTreeState(h.cli_tree);
+    });
+  }
+  try{ renderAll(); }catch(e){ /* never throw into the host */ }
+};
 
 /* ---- interactions ---- */
 document.addEventListener('click', e=>{
@@ -374,12 +429,19 @@ document.addEventListener('click', e=>{
   if(hd){ const body=hd.parentElement.querySelector('.body'), tri=hd.querySelector('.tri');
     const key='ow_col_'+hd.getAttribute('data-collapse'); const now=!body.classList.contains('collapsed');
     body.classList.toggle('collapsed',now); tri.classList.toggle('open',!now); lsSet(key,now?'1':'0'); return; }
-  const hc=e.target.closest('#hostchips .chip'); if(hc&&!hc.classList.contains('ghost')){ activeHost=hc.dataset.host; renderChips(); renderCLI(); renderTasks(); renderCounts(); renderRail(); return; }
+  const hc=e.target.closest('#hostchips .chip'); if(hc&&!hc.classList.contains('ghost')){ activeHost=hc.dataset.host; renderChips(); renderCLI(); renderTasks(); renderCounts(); return; }
 });
 document.addEventListener('keydown', e=>{ if((e.key==='Enter'||e.key===' ')&&e.target.classList&&e.target.classList.contains('chip')){ e.preventDefault(); e.target.click(); } });
 
-/* ---- Tauri fleet host (desktop shell) ---- */
+/* ---- Tauri host: this-machine from local daemon; other hosts from Halus/LAN ---- */
 const FLEET_REFRESH_MS = 30000;
+const LOCAL_WAIT_TIMEOUT_S = 25;
+const LOCAL_HOST_ID = 'mbp';
+const KEEP_KINDS = {claude:1, grok:1, cursor:1, 'claude-sub':1, 'grok-sub':1, 'cursor-sub':1};
+const WRAP_KINDS = {team_dispatch:1, 'team-dispatch':1, agent_dispatch:1, python:1};
+let FLEET_DOC = null;
+let LOCAL_MBP = null;
+let localCursor = 0;
 function tauriInvoke(cmd, args){
   if(window.__TAURI__&&window.__TAURI__.core&&window.__TAURI__.core.invoke) return window.__TAURI__.core.invoke(cmd,args||{});
   if(window.__TAURI_INTERNALS__&&window.__TAURI_INTERNALS__.invoke) return window.__TAURI_INTERNALS__.invoke(cmd,args||{});
@@ -391,66 +453,180 @@ function hasTauri(){
            !!(window.__TAURI_INTERNALS__&&window.__TAURI_INTERNALS__.invoke);
   }catch(e){ return false; }
 }
+function famCount(v){
+  if(v && typeof v==='object') return (v.interactive||0)+(v.headless||0);
+  const n=Number(v); return Number.isFinite(n)?n:0;
+}
+function flattenCliCounts(counts){
+  counts=counts||{};
+  return {
+    claude: famCount(counts.claude),
+    grok: famCount(counts.grok)+famCount(counts.grok_subagents),
+    cursor: famCount(counts.cursor)+famCount(counts.cursor_subagents)
+  };
+}
+function deriveAgentState(n, kids){
+  const st=String(n.status||'').toLowerCase();
+  if(st==='failed'||st==='error') return 'fail';
+  if(st==='completed'||st==='cancelled') return 'done';
+  if(st==='active'||st==='running') return 'run';
+  if((kids||[]).some(k=>k.state==='run'||k.state==='stall')) return 'run';
+  return 'quiet';
+}
+function convTreeNodes(nodes){
+  if(!Array.isArray(nodes)) return [];
+  const out=[];
+  nodes.forEach(n=>{
+    if(!n||typeof n!=='object') return;
+    const kind=n.kind;
+    const kids=convTreeNodes(n.children||n.instances||[]);
+    if(WRAP_KINDS[kind] || !KEEP_KINDS[kind]){ out.push.apply(out, kids); return; }
+    const node={
+      kind: kind,
+      role: n.role||null,
+      model: n.model||null,
+      mode: n.mode||null,
+      pid: (n.pid==null||n.pid==='')?null:n.pid,
+      tty: n.tty||null,
+      channel: n.channel||null,
+      label: n.label||null,
+      status: n.status||null,
+      uptime_s: n.uptime_s,
+      children: kids
+    };
+    node.state=deriveAgentState(node, kids);
+    out.push(node);
+  });
+  return out;
+}
+function walkRawSubs(nodes, acc){
+  (nodes||[]).forEach(n=>{
+    if(!n||typeof n!=='object') return;
+    if(String(n.kind||'').endsWith('-sub')){
+      const id=String(n.subagent_id||n.label||'');
+      if(id) acc[id]=String(n.status||'running').toLowerCase();
+    }
+    walkRawSubs(n.children||n.instances, acc);
+  });
+}
+function trackSubLifecycle(cli){
+  const roots=(cli&&(cli.roots||cli.instances))||[];
+  if(!Array.isArray(roots)) return;
+  const now=Date.now();
+  const cur={};
+  walkRawSubs(roots, cur);
+  Object.keys(LAST_SUBS).forEach(id=>{
+    if(cur[id]) return;
+    const prev=LAST_SUBS[id];
+    if(prev==='failed'||prev==='error') FAIL_LOG.push({id:id, at:now});
+    else if(prev==='completed'||prev==='cancelled'||prev==='running'||prev==='active'||!prev)
+      DONE_LOG.push({id:id, at:now});
+  });
+  LAST_SUBS=cur;
+  DONE_LOG=DONE_LOG.filter(e=>now-e.at<PID_LOG_MS);
+  FAIL_LOG=FAIL_LOG.filter(e=>now-e.at<PID_LOG_MS);
+}
+function localStatusToTasks(status){
+  if(!Array.isArray(status)) return [];
+  return status.filter(t=>t && (t.slots||[]).length).map(t=>({
+    id: t.task,
+    slots: (t.slots||[]).map(s=>({
+      lane: s.lane, state: s.state, role: s.role||null, kind: s.kind||null,
+      mode: s.mode||null, model: s.model||null, started_at: s.started||null,
+      age_s: s.age_s, activity_s: s.activity_s, ended_s: s.ended_s,
+      exit_code: s.exit_code, channel: s.channel||null
+    }))
+  }));
+}
+function stampTreeState(nodes){
+  return convTreeNodes(Array.isArray(nodes)?nodes:[]);
+}
+function buildLocalMbp(cli, status){
+  cli=cli||{};
+  const roots=cli.roots||cli.instances;
+  if(!Array.isArray(roots)) return LOCAL_MBP;
+  trackSubLifecycle(cli);
+  return {
+    id: LOCAL_HOST_ID,
+    label: 'MacBook',
+    online: true,
+    roaming: false,
+    cli: flattenCliCounts(cli.counts),
+    cli_sessions: [],
+    cli_tree: Array.isArray(roots)?roots:[],
+    tasks: localStatusToTasks(status)
+  };
+}
+function mergeAndRender(){
+  let doc;
+  if(FLEET_DOC && typeof FLEET_DOC==='object'){
+    try{ doc=JSON.parse(JSON.stringify(FLEET_DOC)); }catch(e){ doc={v:1, hosts:[]}; }
+  } else {
+    doc={v:1, hosts:[]};
+  }
+  const incoming=doc.hosts||[];
+  const rest=incoming.filter(h=>h && h.id!==LOCAL_HOST_ID);
+  if(LOCAL_MBP) rest.unshift(LOCAL_MBP);
+  else {
+    const fleetMbp=incoming.find(h=>h && h.id===LOCAL_HOST_ID);
+    if(fleetMbp) rest.unshift(fleetMbp);
+  }
+  doc.hosts=rest;
+  if(LOCAL_MBP) doc.generated_at=new Date().toISOString();
+  const counts={claude:0,grok:0,cursor:0};
+  let online=0;
+  rest.forEach(h=>{
+    if(h.online) online++;
+    const c=h.cli||{};
+    counts.claude+=c.claude||0; counts.grok+=c.grok||0; counts.cursor+=c.cursor||0;
+  });
+  doc.fleet=Object.assign({}, doc.fleet||{}, {
+    hosts_total: rest.length,
+    online: online,
+    cli_live: counts.claude+counts.grok+counts.cursor,
+    counts: counts
+  });
+  window.overwatchRender(doc);
+}
+async function refreshLocalMbp(){
+  const cli=await tauriInvoke('fetch_local_cli');
+  if(!cli || typeof cli!=='object' || !Array.isArray(cli.roots||cli.instances)) return;
+  let status=[];
+  try{ status=await tauriInvoke('fetch_local_status'); }catch(e){ status=[]; }
+  LOCAL_MBP=buildLocalMbp(cli, status);
+  mergeAndRender();
+}
+async function localWaitLoop(){
+  try{
+    const h=await tauriInvoke('fetch_local_health');
+    if(h && typeof h.cursor==='number') localCursor=h.cursor;
+  }catch(e){}
+  while(true){
+    try{
+      await refreshLocalMbp();
+      const w=await tauriInvoke('wait_local', {cursor: localCursor, timeout: LOCAL_WAIT_TIMEOUT_S});
+      if(w && typeof w.cursor==='number') localCursor=w.cursor;
+    }catch(e){
+      await new Promise(r=>setTimeout(r, 2000));
+    }
+  }
+}
 async function fleetRefreshTick(){
   try{
-    const doc = await tauriInvoke('fetch_fleet_dashboard');
-    window.overwatchRender(doc);
-  }catch(e){ /* keep last snapshot; STALE badge handles age */ }
+    const doc=await tauriInvoke('fetch_fleet_dashboard');
+    FLEET_DOC=doc;
+    mergeAndRender();
+  }catch(e){ /* keep last remotes; local overlay is independent */ }
 }
 function startFleetHost(){
   window.__hosted = 1;
+  localWaitLoop();
   fleetRefreshTick();
   setInterval(fleetRefreshTick, FLEET_REFRESH_MS);
 }
 
-/* ---- right-rail width (drag handle) ---- */
-const RAIL_MIN=96, RAIL_MAX=340, RAIL_DEF=150, RAIL_LS='ow_rail_w';
-function clampRail(w){ return Math.min(RAIL_MAX, Math.max(RAIL_MIN, Math.round(w))); }
-function setRailW(px){
-  const w=clampRail(px);
-  document.documentElement.style.setProperty('--rail-w', w+'px');
-  return w;
-}
-(function initRailResize(){
-  const handle=document.getElementById('railhandle'), col=document.getElementById('railcol');
-  if(!handle||!col) return;
-  const raw=lsGet(RAIL_LS,''), n=parseInt(raw,10);
-  let railW=setRailW(Number.isFinite(n)?n:RAIL_DEF);
-  const mql=window.matchMedia('(max-width:760px)');
-  function syncMobile(){
-    if(mql.matches) document.documentElement.style.removeProperty('--rail-w');
-    else setRailW(railW);
-  }
-  mql.addEventListener('change', syncMobile);
-  syncMobile();
-  let drag=false, railRight=0;
-  function endDrag(e){
-    if(!drag) return;
-    drag=false; handle.classList.remove('dragging');
-    try{ handle.releasePointerCapture(e.pointerId); }catch(err){}
-    document.body.style.userSelect=''; document.body.style.cursor='';
-    lsSet(RAIL_LS, String(railW));
-  }
-  handle.addEventListener('pointerdown', e=>{
-    if(mql.matches) return;
-    e.preventDefault(); drag=true; railRight=col.getBoundingClientRect().right;
-    handle.classList.add('dragging'); handle.setPointerCapture(e.pointerId);
-    document.body.style.userSelect='none'; document.body.style.cursor='col-resize';
-  });
-  handle.addEventListener('pointermove', e=>{
-    if(!drag) return;
-    railW=setRailW(railRight-e.clientX);
-  });
-  handle.addEventListener('pointerup', endDrag);
-  handle.addEventListener('pointercancel', endDrag);
-  handle.addEventListener('dblclick', ()=>{
-    if(mql.matches) return;
-    railW=setRailW(RAIL_DEF); lsSet(RAIL_LS, String(railW));
-  });
-})();
-
 /* ---- refresh ages every 20s (no network) ---- */
-setInterval(()=>{ if(DOC) renderAge(); }, 20000);
+setInterval(()=>{ if(DOC){ renderAge(); renderPidLog(); renderCounts(); } }, 20000);
 
 /* ============================ MOCK (preview / ?mock=1) ============================ */
 function mockDoc(){
@@ -461,14 +637,16 @@ function mockDoc(){
     hosts: [
       { id:'mbp', label:'MacBook', online:true, roaming:181, cli:{claude:2,grok:2,cursor:2},
         cli_tree:[
-          { kind:'claude', model:'claude-opus-5', mode:'interactive', channel:'ttys001', uptime_s:301500, children:[
+          { kind:'claude', model:'claude-opus-5', mode:'interactive', pid:18434, status:'active', channel:'ttys001', uptime_s:301500, children:[
             { kind:'team-dispatch', channel:'aidash/cli-tree-hub', uptime_s:1344, children:[
               { kind:'grok', model:'grok-4.6', mode:'headless', channel:'aidash-cli-tree-hub', uptime_s:1344, children:[] } ]},
             { kind:'team-dispatch', channel:'aidash/audit-egress', uptime_s:400, children:[
               { kind:'cursor', model:'composer-2.5', mode:'headless', channel:'aidash-audit-egress', uptime_s:400, children:[
                 { kind:'cursor', model:'composer-2.5', mode:'headless', channel:'aidash-audit-egress', uptime_s:399, children:[] } ]} ]},
             { kind:'team-dispatch', channel:'aidash/spike-nesting', uptime_s:128, children:[
-              { kind:'grok', model:'grok-4.6', mode:'headless', channel:'aidash-spike-nesting', uptime_s:128, children:[] } ]} ]},
+              { kind:'grok', model:'grok-4.6', mode:'headless', channel:'aidash-spike-nesting', uptime_s:128, children:[] } ]},
+            { kind:'grok-sub', model:'grok-4.6', mode:'headless', label:'slice-a', status:'running', uptime_s:88, children:[] },
+            { kind:'cursor', model:'composer-2.5', mode:'headless', pid:18801, label:'composer-slave', status:'active', channel:'aidash-nested-cursor', uptime_s:80, children:[] } ]},
           { kind:'cursor', model:'composer-2.5', mode:'headless', uptime_s:52560, children:[] },
           { kind:'claude', model:'claude-opus-4-8', mode:'interactive', channel:'ttys000', uptime_s:236580, children:[] }
         ],

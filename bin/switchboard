@@ -54,8 +54,10 @@ GET /v1/advise?task=T, and long-poll
 
 Status rows carry ended_s for terminal lanes (seconds since finish; source:
 slot 'ended', else last terminal transition in events.jsonl, else slot file
-mtime). The viewer uses it to hide finished lanes after 30 min — the CLI and
-JSON stay complete; retention is presentation-only.
+mtime). Served status/board output omits terminal slots (DONE/FAILED/DIED)
+once ended_s is past AGENT_SWITCHBOARD_DONE_EXPIRE (default 900s); slot
+files stay on disk until COLD_AFTER. 15-min served-board retention
+(daemon-side, all UIs inherit).
 
 PID-reuse hardening: on POSIX every liveness pass takes ONE `ps` snapshot and
 requires the recorded program name to still appear in the pid's command line;
@@ -88,6 +90,9 @@ ROOT = os.environ.get(
 GROK_SESS_ROOT = os.environ.get(
     "AGENT_SWITCHBOARD_GROK_SESSIONS", os.path.expanduser("~/.grok/sessions")
 )
+GROK_ACTIVE_SESSIONS = os.environ.get(
+    "AGENT_SWITCHBOARD_GROK_ACTIVE", os.path.expanduser("~/.grok/active_sessions.json")
+)
 GROK_CONFIG_PATH = os.environ.get(
     "AGENT_SWITCHBOARD_GROK_CONFIG", os.path.expanduser("~/.grok/config.toml")
 )
@@ -116,6 +121,9 @@ DEFAULT_STALL_INTERACTIVE = float(os.environ.get("AGENT_SWITCHBOARD_STALL_INTERA
 DEFAULT_PORT = 17920
 EVENTS_MAX_BYTES = int(os.environ.get("AGENT_SWITCHBOARD_EVENTS_MAX_BYTES", 1_000_000))
 COLD_AFTER = float(os.environ.get("AGENT_SWITCHBOARD_COLD_AFTER", 86400))
+# Board-omit window for terminal (DONE/FAILED/DIED) rows in task_status.
+# Import-time fallback only; live reads go through _done_expire(). 0 disables.
+DONE_EXPIRE_S = float(os.environ.get("AGENT_SWITCHBOARD_DONE_EXPIRE", 900))
 BUS_MAXLEN = int(os.environ.get("AGENT_SWITCHBOARD_BUS_MAXLEN", 2000))
 CLI_CACHE_TTL = float(os.environ.get("AGENT_SWITCHBOARD_CLI_CACHE_TTL", 5.0))
 
@@ -776,18 +784,54 @@ def grok_session_model(cwd, sid):
     return mid if mid else None
 
 
+def _grok_sid_from_active_sessions(pid):
+    """pid → (session_id, cwd) from grok's live TUI map. (None, None) if missing."""
+    if pid is None:
+        return None, None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None, None
+    data = read_json(GROK_ACTIVE_SESSIONS)
+    if not isinstance(data, list):
+        return None, None
+    hits = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            if int(row.get("pid")) != pid:
+                continue
+        except (TypeError, ValueError):
+            continue
+        sid = row.get("session_id")
+        if sid and name_ok(str(sid)):
+            cwd = row.get("cwd")
+            hits.append((str(sid), cwd if isinstance(cwd, str) else None))
+    if len(hits) == 1:
+        return hits[0]
+    return None, None
+
+
 def resolve_grok_sid(command, rec, cwd_arg, started_ts):
-    """Sid for a grok process: --resume, else unique cwd+created_at match.
+    """Sid for a grok process: --resume, else active_sessions.json, else cwd match.
 
     Ambiguous (several sessions in the start window, or none) → (None, cwd).
     Never guesses the newest session in a shared cwd.
     """
     sid = _grok_resume_sid(command)
     cwd = cwd_arg
+    if sid:
+        if not cwd and rec:
+            cwd = _proc_cwd(rec.get("pid"))
+        return sid, cwd
+    mapped_sid, mapped_cwd = _grok_sid_from_active_sessions(
+        rec.get("pid") if rec else None
+    )
+    if mapped_sid:
+        return mapped_sid, cwd or mapped_cwd
     if not cwd and rec:
         cwd = _proc_cwd(rec.get("pid"))
-    if sid:
-        return sid, cwd
     if not cwd:
         return None, None
     root = _grok_cwd_root(cwd)
@@ -1590,6 +1634,21 @@ def _stall_budget(explicit=None):
     return DEFAULT_STALL_AFTER
 
 
+def _done_expire():
+    """Seconds after which terminal slots are omitted from served status.
+
+    Read env on every call so `AGENT_SWITCHBOARD_DONE_EXPIRE=1 switchboard status`
+    works (import-time DONE_EXPIRE_S is only the documented default). 0 disables.
+    """
+    raw = os.environ.get("AGENT_SWITCHBOARD_DONE_EXPIRE")
+    if raw is not None and raw != "":
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return 900.0
+
+
 def derive(slot, quiet_after=DEFAULT_QUIET_AFTER, snap=None, stall_after=None):
     """-> (STATE, activity_age_or_None)"""
     stall_after = _stall_budget(stall_after)
@@ -1786,6 +1845,15 @@ def task_status(task, quiet_after=DEFAULT_QUIET_AFTER, snap=None, stall_after=No
             if endings is None:
                 endings = terminal_endings(task)
             ended = endings.get(lane) or slot.get("_mtime")
+        # Serving-layer filter only: slot files and events.jsonl stay complete.
+        expire = _done_expire()
+        if (
+            state in TERMINAL_STATES
+            and ended is not None
+            and expire > 0
+            and (time.time() - ended) >= expire
+        ):
+            continue
         hb = {} if slot.get("corrupt") or slot.get("status") == "exited" else heartbeat(slot)
         rows.append(
             {
@@ -2239,9 +2307,10 @@ def archived_terminal_state(tdir, lane, run_id):
 
 def cold_archive(tdir, lane, slot):
     """Move a long-finished slot out of the hot task dir into history/ so
-    load_slots() (status + watcher) stops reloading it every tick (F2). The
-    viewer's own 30-min finished-lane retention is presentation-only and
-    unaffected — COLD_AFTER defaults to 24h, far past that window."""
+    load_slots() (status + watcher) stops reloading it every tick (F2).
+    15-min served-board omit of terminal rows is a publish filter in
+    task_status (DONE_EXPIRE); it is not this 24h file-move. COLD_AFTER
+    defaults to 86400s."""
     os.makedirs(os.path.join(tdir, "history"), exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     run_id8 = (slot.get("run_id") or "cold")[:8]
@@ -2498,6 +2567,7 @@ def cmd_serve(args):
                 elif u.path == "/v1/tasks":
                     self._json(list_tasks())
                 elif u.path == "/v1/status":
+                    # Board expiry (DONE_EXPIRE) lives in task_status.
                     tasks = [q["task"]] if q.get("task") else list_tasks()
                     snap = ps_snapshot()
                     self._json([task_status(t, args.quiet_after, snap) for t in tasks])

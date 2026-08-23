@@ -296,8 +296,8 @@ kill "$SRVB2" 2>/dev/null
 wait 2>/dev/null
 
 # T22: cold-archive moves long-finished slots to history/ on a watcher pass;
-# status/watcher exclude them afterward (viewer's own 30-min retention is
-# a separate, presentation-only concern and is unaffected by this).
+# status/watcher exclude them afterward (T41 is the 15-min served-board
+# filter — files stay; this test is the 24h file-move).
 AGENT_SWITCHBOARD_COLD_AFTER=1 $SB serve --port 17996 >/dev/null 2>&1 &
 SRVC=$!
 sleep 1.5
@@ -1102,6 +1102,41 @@ assert sb._toml_models_default('[models]\ndefault = "grok-4.6"\n') == "grok-4.6"
 assert sb._toml_models_default('[ui]\nfork_secondary_model = "x"\n') is None
 print("PASS_UNIT T35h _toml_models_default")
 
+# T35l: two grok TUIs, shared cwd, no --resume — active_sessions.json maps pid→sid
+active_path = os.path.join(tmp, "active_sessions.json")
+sb.GROK_ACTIVE_SESSIONS = active_path
+sid_a = "019ff000-0000-0000-0000-0000000000aa"
+sid_b = "019ff000-0000-0000-0000-0000000000bb"
+shared_cwd = "/tmp/lane-model"
+enc_shared = __import__("urllib.parse").parse.quote(shared_cwd, safe="")
+for sid_x, desc in ((sid_a, "slice-a"), (sid_b, "slice-b")):
+    sdir_x = os.path.join(sess, enc_shared, sid_x)
+    os.makedirs(os.path.join(sdir_x, "subagents", "sub-x"), exist_ok=True)
+    json.dump({"created_at": created, "current_model_id": "grok-4.6"}, open(os.path.join(sdir_x, "summary.json"), "w"))
+    json.dump({
+        "subagent_id": "sub-x",
+        "parent_session_id": sid_x,
+        "status": "running",
+        "started_at": created,
+        "description": desc,
+    }, open(os.path.join(sdir_x, "subagents", "sub-x", "meta.json"), "w"))
+json.dump([
+    {"session_id": sid_a, "pid": 42607, "cwd": shared_cwd},
+    {"session_id": sid_b, "pid": 50908, "cwd": shared_cwd},
+], open(active_path, "w"))
+forest = sb.build_cli_forest({
+    42607: rec(42607, 1, "ttys001", "/home/user/.grok/bin/grok"),
+    50908: rec(50908, 1, "ttys003", "/home/user/.grok/bin/grok"),
+}, now=NOW)
+na = find(forest["roots"], lambda n: n["pid"]==42607)
+nb = find(forest["roots"], lambda n: n["pid"]==50908)
+sa = [c for c in (na["children"] if na else []) if c.get("kind")=="grok-sub"]
+sb_ = [c for c in (nb["children"] if nb else []) if c.get("kind")=="grok-sub"]
+assert len(sa)==1 and sa[0].get("label")=="slice-a", (na, sa)
+assert len(sb_)==1 and sb_[0].get("label")=="slice-b", (nb, sb_)
+print("PASS_UNIT T35l active_sessions.json pid map grafts two shared-cwd groks")
+sb.GROK_ACTIVE_SESSIONS = os.path.join(tmp, "no-such-active-sessions.json")
+
 # T35i: reattach agent_dispatch via launcher_cli_pid
 sb.ROOT = tmp
 os.makedirs(os.path.join(tmp, "demo"), exist_ok=True)
@@ -1175,6 +1210,7 @@ if [ $? -eq 0 ]; then
   ck ok ok "T35i launcher reattach"
   ck ok ok "T35j stale launcher stays root"
   ck ok ok "T35k last_active sid match for long-lived TUI"
+  ck ok ok "T35l active_sessions.json pid map"
 else
   ck fail ok "T35 v0.3.0 unit block"
 fi
@@ -1432,6 +1468,46 @@ print("ALLOW", ok, p.stdout[:80])
 sys.exit(0 if ok else 1)
 EOF
 if [ $? -eq 0 ]; then ck ok ok "T39a stop hook allows non-exec-master"; else ck fail ok "T39a stop hook allows non-exec-master"; fi
+
+# T41: DONE rows drop from /v1/status after DONE_EXPIRE, slot file remains
+# (cold-archive / T22 is the 24h file-move; this is the 15-min board filter).
+# Ports 17970-17974 (T10/T21/T22 own 17995-17999; T23 comment reserves 17985-17989).
+AGENT_SWITCHBOARD_DONE_EXPIRE=1 $SB serve --port 17974 >/dev/null 2>&1 &
+SRV41=$!
+sleep 1.5
+$TD --task t41 --lane done --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+LANES=$(curl -s "http://127.0.0.1:17974/v1/status?task=t41" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"]+":"+s["state"] for s in d[0]["slots"]))')
+ck "$LANES" "done:DONE" "T41a freshly DONE row still listed on /v1/status"
+sleep 2   # past DONE_EXPIRE=1s, across a watcher tick
+# Pin ended well past expire so the drop is not racy against curl/dispatch.
+python3 -c "
+import json, time, os
+p = os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'], 't41', 'slot-done.json')
+d = json.load(open(p))
+d['ended'] = time.time() - 5
+json.dump(d, open(p, 'w'))
+"
+$TD --task t41 --lane fresh --exec /bin/bash -- -c 'true' >/dev/null 2>&1
+LANES=$(curl -s "http://127.0.0.1:17974/v1/status?task=t41" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"]+":"+s["state"] for s in d[0]["slots"]))')
+ck "$LANES" "fresh:DONE" "T41b expired DONE omitted; fresher DONE stays"
+if [ -f "$AGENT_SWITCHBOARD_ROOT/t41/slot-done.json" ]; then ck ok ok "T41c expired DONE slot file remains on disk"; else ck absent present "T41c expired DONE slot file remains on disk"; fi
+HIST=$(ls "$AGENT_SWITCHBOARD_ROOT/t41/history" 2>/dev/null | grep -c '^done-' || true)
+ck "${HIST:-0}" "0" "T41d history/ has no done-* (not cold-archived)"
+CLI=$(AGENT_SWITCHBOARD_DONE_EXPIRE=1 $SB status --task t41 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"] for s in d[0]["slots"]))')
+ck "$CLI" "fresh" "T41e CLI status --json uses the same task_status omit"
+kill "$SRV41" 2>/dev/null
+wait 2>/dev/null
+
+# T41f: DONE_EXPIRE=0 disables the filter (stale DONE stays listed)
+python3 -c "
+import json, time, os
+p = os.path.join(os.environ['AGENT_SWITCHBOARD_ROOT'], 't41', 'slot-done.json')
+d = json.load(open(p))
+d['ended'] = time.time() - 10
+json.dump(d, open(p, 'w'))
+"
+CLI0=$(AGENT_SWITCHBOARD_DONE_EXPIRE=0 $SB status --task t41 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(s["lane"] for s in d[0]["slots"] if s["lane"]=="done"))')
+ck "$CLI0" "done" "T41f DONE_EXPIRE=0 keeps stale DONE listed"
 
 echo; echo "RESULT: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]
