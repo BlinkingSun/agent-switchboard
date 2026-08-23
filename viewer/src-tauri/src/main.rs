@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod crypto;
+mod network;
 mod spawn;
 
 use std::process::Command;
@@ -17,6 +18,12 @@ use serde_json::Value;
 #[tauri::command]
 fn edge_config_available() -> bool {
     spawn::load_edge_config().is_some()
+}
+
+/// On/off fleet network: local IPv4 in gitignored fleet_subnet, or daemon reachability fallback.
+#[tauri::command]
+fn network_scope() -> network::NetworkScope {
+    network::compute_network_scope()
 }
 
 /// True when device secret + edge device_id are provisioned (spawn dormant until then).
@@ -35,6 +42,8 @@ fn fetch_edge_dashboard() -> Result<Value, String> {
     }
     let url = format!("{base}/v1/dashboard");
     let client = reqwest::blocking::Client::builder()
+        // Explicit browser-like UA: Cloudflare 403s default library UAs (error 1010).
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
@@ -122,6 +131,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             start_daemon,
             edge_config_available,
+            network_scope,
             fetch_edge_dashboard,
             spawn_pairing_available,
             submit_spawn,

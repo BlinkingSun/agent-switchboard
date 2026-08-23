@@ -1,5 +1,7 @@
 {
   "url": "https://api.halus.ai",
   "bearer": "YOUR_DEVICE_BEARER_FROM_PAIRING",
-  "device_id": "YOUR_DEVICE_ID_FROM_PAIRING"
+  "device_id": "YOUR_DEVICE_ID_FROM_PAIRING",
+  "_comment_fleet_subnet": "When this Mac has an IPv4 in fleet_subnet, viewer uses LOCAL daemon; otherwise FLEET (halus). Real subnet only in gitignored edge.json.",
+  "fleet_subnet": "10.0.0.0/24"
 }

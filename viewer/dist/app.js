@@ -1377,6 +1377,37 @@
     return false;
   }
 
+  async function fetchNetworkScope() {
+    if (!hasTauriApi()) {
+      return { edge_config_available: false, fleet_subnet_configured: false, on_fleet_network: true };
+    }
+    try {
+      return await tauriInvoke("network_scope");
+    } catch (e) {
+      return { edge_config_available: false, fleet_subnet_configured: false, on_fleet_network: true };
+    }
+  }
+
+  async function shouldUseFleet() {
+    var scope = await fetchNetworkScope();
+    if (!scope.edge_config_available) return false;
+    return !scope.on_fleet_network;
+  }
+
+  async function tryReturnToLocalMode() {
+    try {
+      await initialLoad();
+      enterLocalMode();
+      if (!state.localLoopsRunning) startLocalLoops();
+      return true;
+    } catch (e) {
+      enterLocalMode();
+      setOffline(true);
+      renderAll();
+      return false;
+    }
+  }
+
   /* ── Spawn sheet (Rust crypto; dormant until paired) ─ */
 
   var SPAWN_AGENTS = ["claude", "grok", "cursor"];
@@ -1804,6 +1835,10 @@
     while (state.dataSource === "edge") {
       await sleep(STATUS_INTERVAL_MS);
       if (state.dataSource !== "edge") return;
+      if (!(await shouldUseFleet())) {
+        await tryReturnToLocalMode();
+        return;
+      }
       try {
         var doc = await fetchEdgeDashboard();
         updateSpawnHostsFromDoc(doc);
@@ -1818,40 +1853,28 @@
     while (state.dataSource === "edge") {
       await sleep(15000);
       if (state.dataSource !== "edge") return;
-      try {
-        await fetchJson(BASE + "/v1/health");
-        await initialLoad();
-        enterLocalMode();
-        if (!state.localLoopsRunning) {
-          state.localLoopsRunning = true;
-          waitLoop();
-          statusTickLoop();
-        }
+      if (!(await shouldUseFleet())) {
+        await tryReturnToLocalMode();
         return;
-      } catch (e) {
-        /* stay on fleet view */
       }
     }
   }
 
   async function offlineRecoveryLoop() {
-    while (state.dataSource !== "local") {
+    while (state.dataSource !== "local" || state.offline) {
       await sleep(state.backoff);
-      try {
-        await initialLoad();
-        enterLocalMode();
-        if (!state.localLoopsRunning) {
-          state.localLoopsRunning = true;
-          waitLoop();
-          statusTickLoop();
-        }
-        return;
-      } catch (e) {
-        /* still down */
-      }
-      if (state.dataSource !== "edge") {
+      if (await shouldUseFleet()) {
         var ok = await tryEnterEdgeMode();
         if (ok) return;
+      } else {
+        try {
+          await initialLoad();
+          enterLocalMode();
+          if (!state.localLoopsRunning) startLocalLoops();
+          if (!state.offline) return;
+        } catch (e) {
+          /* still down */
+        }
       }
       state.backoff = Math.min(BACKOFF_MAX, state.backoff + 1000);
     }
@@ -2181,7 +2204,7 @@
       }
       await refreshStatus();
     } catch (e) {
-      if (state.dataSource === "local") {
+      if (await shouldUseFleet()) {
         var edgeOk = await tryEnterEdgeMode();
         if (edgeOk) return;
       }
@@ -2255,15 +2278,16 @@
     while (state.dataSource === "local") {
       await sleep(STATUS_INTERVAL_MS);
       if (state.mock) continue;
+      if (await shouldUseFleet()) {
+        await tryEnterEdgeMode();
+        continue;
+      }
       try {
         // 30s tick also refreshes /v1/cli (T4)
         await refreshStatus();
       } catch (e) {
         setOffline(true);
         renderAll();
-        if (state.dataSource === "local") {
-          await tryEnterEdgeMode();
-        }
       }
     }
   }
@@ -2350,17 +2374,25 @@
       return;
     }
 
+    if (await shouldUseFleet()) {
+      var fleetOk = await tryEnterEdgeMode();
+      if (!fleetOk) {
+        setOffline(true);
+        renderAll();
+        offlineRecoveryLoop();
+      }
+      return;
+    }
+
     try {
       await initialLoad();
       enterLocalMode();
       startLocalLoops();
     } catch (e) {
-      var edgeOk = await tryEnterEdgeMode();
-      if (!edgeOk) {
-        setOffline(true);
-        renderAll();
-        offlineRecoveryLoop();
-      }
+      enterLocalMode();
+      setOffline(true);
+      renderAll();
+      offlineRecoveryLoop();
     }
   }
 

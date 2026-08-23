@@ -24,6 +24,9 @@ pub struct EdgeConfig {
     pub bearer: String,
     #[serde(default)]
     pub device_id: Option<String>,
+    /// When set, viewer uses LOCAL daemon if any local IPv4 is in this subnet (e.g. "10.0.0.0/24").
+    #[serde(default)]
+    pub fleet_subnet: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -205,6 +208,9 @@ fn build_spawn_cmd(host: &str, agent: &str, workdir_id: &str, prompt: &str) -> R
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
+        // Explicit browser-like UA: Cloudflare returns 403 "error code: 1010"
+        // for default library User-Agents before the Worker is even reached.
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("http client: {e}"))

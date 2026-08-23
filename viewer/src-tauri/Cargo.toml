@@ -21,6 +21,7 @@ ulid = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rand = "0.8"
 hex = "0.4"
+get_if_addrs = "0.5"
 
 [profile.release]
 strip = true
