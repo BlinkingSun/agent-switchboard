@@ -2,18 +2,8 @@
 
 use std::net::Ipv4Addr;
 use std::str::FromStr;
-use std::time::Duration;
-
-use serde::Serialize;
 
 use crate::spawn;
-
-#[derive(Debug, Serialize)]
-pub struct NetworkScope {
-    pub edge_config_available: bool,
-    pub fleet_subnet_configured: bool,
-    pub on_fleet_network: bool,
-}
 
 fn parse_ipv4_u32(s: &str) -> Option<u32> {
     let addr = Ipv4Addr::from_str(s.trim()).ok()?;
@@ -63,49 +53,20 @@ fn any_local_ip_in_subnet(subnet: &str) -> bool {
         .any(|ip| ip_in_subnet(*ip, net, mask))
 }
 
-fn local_daemon_reachable() -> bool {
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
+/// True when edge config has fleet_subnet and any local IPv4 is in that subnet.
+pub fn on_fleet_network() -> bool {
+    let cfg = match spawn::load_edge_config() {
+        Some(c) => c,
+        None => return false,
     };
-    client
-        .get("http://127.0.0.1:17920/v1/health")
-        .header("Cache-Control", "no-store")
-        .send()
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
-}
-
-pub fn compute_network_scope() -> NetworkScope {
-    let cfg = spawn::load_edge_config();
-    if cfg.is_none() {
-        return NetworkScope {
-            edge_config_available: false,
-            fleet_subnet_configured: false,
-            on_fleet_network: true,
-        };
-    }
-    let cfg = cfg.unwrap();
-    let subnet = cfg
+    let subnet = match cfg
         .fleet_subnet
         .as_ref()
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
-    if let Some(subnet) = subnet {
-        let on_net = any_local_ip_in_subnet(subnet);
-        NetworkScope {
-            edge_config_available: true,
-            fleet_subnet_configured: true,
-            on_fleet_network: on_net,
-        }
-    } else {
-        NetworkScope {
-            edge_config_available: true,
-            fleet_subnet_configured: false,
-            on_fleet_network: local_daemon_reachable(),
-        }
-    }
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => s,
+        None => return false,
+    };
+    any_local_ip_in_subnet(subnet)
 }

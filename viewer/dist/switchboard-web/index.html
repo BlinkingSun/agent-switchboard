@@ -9,6 +9,7 @@
     --pill-border:#33506b; --pill-ink:#9cc6ea;
     --mono:"SF Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
     --r:9px;
+    --rail-w:150px;
   }
   *{box-sizing:border-box}
   html,body{margin:0;background:var(--page)}
@@ -49,7 +50,7 @@
   .cli-chip{border:1px solid var(--border); background:#11151b; border-radius:7px; padding:4px 11px; color:var(--mut); font-size:12px; letter-spacing:.5px}
   .cli-chip b{color:var(--ink)}
 
-  .cols{display:grid; grid-template-columns:1fr 190px; gap:16px; align-items:start; margin-top:14px}
+  .cols{display:grid; grid-template-columns:1fr var(--rail-w); gap:16px; align-items:start; margin-top:14px}
   .panel{background:var(--panel); border:1px solid var(--border); border-radius:13px; padding:14px 14px 16px;
          box-shadow:inset 0 1px 0 rgba(255,255,255,.02); margin-bottom:14px}
   .panel-hd{display:flex; align-items:center; justify-content:space-between; gap:10px; margin:2px 2px 12px; cursor:pointer}
@@ -114,6 +115,11 @@
   .prow .pup{margin-left:auto; text-align:right; color:var(--mut); font-size:12px; font-variant-numeric:tabular-nums}
 
   /* right rail */
+  .rail-col{position:relative; min-width:0}
+  .rail-handle{position:absolute; left:-9px; top:0; bottom:0; width:6px; cursor:col-resize; z-index:3; touch-action:none}
+  .rail-handle::before{content:""; position:absolute; left:2px; top:8%; bottom:8%; width:2px; border-radius:1px;
+    background:var(--border); transition:background .15s ease, box-shadow .15s ease}
+  .rail-handle:hover::before,.rail-handle.dragging::before{background:var(--dim); box-shadow:0 0 4px rgba(74,82,97,.45)}
   .rail{display:flex; flex-direction:column; gap:5px; position:sticky; top:14px}
   .tile{display:flex; align-items:baseline; justify-content:space-between; gap:10px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:6px 11px}
   .tile .lb{color:var(--mut); font-size:10px; letter-spacing:1.3px}
@@ -135,6 +141,7 @@
 
   @media (max-width:760px){
     .cols{grid-template-columns:1fr}
+    .rail-handle{display:none}
     .rail{flex-direction:row; overflow-x:auto; position:static; padding-bottom:2px}
     .tile{min-width:116px; flex:0 0 auto}
     .meta{max-width:42vw}
@@ -149,11 +156,6 @@
   </div>
 
   <div class="chips" id="hostchips"></div>
-  <div class="seg" id="density">
-    <span class="chip" data-d="auto" tabindex="0">AUTO</span>
-    <span class="chip" data-d="panel" tabindex="0">PANEL</span>
-    <span class="chip on" data-d="grid" tabindex="0">GRID</span>
-  </div>
   <div class="counts" id="counts"></div>
 
   <div class="cols">
@@ -168,7 +170,10 @@
       <div id="taskpanels"></div>
       <div class="idle" id="idle" style="display:none">waiting for fleet snapshot&#8230;</div>
     </div>
-    <aside class="rail" id="rail"></aside>
+    <div class="rail-col" id="railcol">
+      <div class="rail-handle" id="railhandle" role="separator" aria-orientation="vertical" aria-label="Resize status rail"></div>
+      <aside class="rail" id="rail"></aside>
+    </div>
   </div>
 </div>
 <div class="ticker empty" id="ticker"></div>
@@ -194,7 +199,6 @@ const COUNT_ORDER = [['run','RUNNING'],['work','WORKING_TOOL'],['wait','WAITING_
 const HOST_ORDER = ['mbp','mini','pc','cnc'];
 
 let DOC = null, activeHost = 'all';
-let density = lsGet('ow_density','grid');
 
 function lsGet(k,d){ try{ const v=localStorage.getItem(k); return v==null?d:v; }catch(e){ return d; } }
 function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
@@ -278,25 +282,11 @@ function renderTasks(){
       const slots=t.slots||[]; const cnt={};
       slots.forEach(s=>{ const k=String(s.state||'').toUpperCase(); cnt[k]=(cnt[k]||0)+1; });
       const roll=Object.entries(cnt).map(([s,n])=>n+' '+s).join(' \u00b7 ');
-      const usePanel = density==='panel' || (density==='auto' && slots.length<=15);
-      let inner;
-      if(usePanel){
-        inner=slots.map(s=>{
-          const cl=stClass(s.state);
-          const bits=[];
-          if(s.activity_s!=null) bits.push('<span class="k">activity</span> '+fmtDur(s.activity_s)+' ago');
-          if(s.exit_code!=null) bits.push('<span class="k">EXIT</span> '+esc(s.exit_code));
-          if(s.channel) bits.push(esc(s.channel));
-          return '<div class="prow"><span class="lamp '+cl+'"></span><span class="nm">'+esc(s.lane)+'</span>'+
-                 '<span class="pm">'+bits.join(' &nbsp; ')+'</span><span class="pup">UP '+fmtDur(s.age_s)+'</span></div>';
-        }).join('');
-      } else {
-        inner='<div class="grid">'+slots.map(s=>{
+      const inner='<div class="grid">'+slots.map(s=>{
           const cl=stClass(s.state);
           const tip=esc(s.lane)+' \u00b7 '+String(s.state||'').toUpperCase()+' \u00b7 '+fmtDur(s.age_s)+(s.channel?' \u00b7 '+esc(s.channel):'');
           return '<div class="cell" title="'+tip+'"><span class="lamp sm '+cl+'"></span><span class="nm">'+esc(s.lane)+'</span><span class="cage">'+fmtDur(s.age_s)+'</span></div>';
         }).join('')+'</div>';
-      }
       const hostName=(h.label||h.id); const cap=hostName.charAt(0).toUpperCase()+hostName.slice(1);
       html+='<section class="panel"><div class="panel-hd" data-collapse="task-'+esc(h.id)+'-'+esc(t.id)+'">'+
             '<div class="lt"><span class="tri open"></span><span class="title" style="letter-spacing:1px">'+esc(cap)+
@@ -385,13 +375,79 @@ document.addEventListener('click', e=>{
     const key='ow_col_'+hd.getAttribute('data-collapse'); const now=!body.classList.contains('collapsed');
     body.classList.toggle('collapsed',now); tri.classList.toggle('open',!now); lsSet(key,now?'1':'0'); return; }
   const hc=e.target.closest('#hostchips .chip'); if(hc&&!hc.classList.contains('ghost')){ activeHost=hc.dataset.host; renderChips(); renderCLI(); renderTasks(); renderCounts(); renderRail(); return; }
-  const dc=e.target.closest('#density .chip'); if(dc){ density=dc.dataset.d; lsSet('ow_density',density);
-    document.querySelectorAll('#density .chip').forEach(x=>x.classList.toggle('on',x===dc)); renderTasks(); return; }
 });
 document.addEventListener('keydown', e=>{ if((e.key==='Enter'||e.key===' ')&&e.target.classList&&e.target.classList.contains('chip')){ e.preventDefault(); e.target.click(); } });
 
-/* density chip reflects persisted default */
-document.querySelectorAll('#density .chip').forEach(x=>x.classList.toggle('on',x.dataset.d===density));
+/* ---- Tauri fleet host (desktop shell) ---- */
+const FLEET_REFRESH_MS = 30000;
+function tauriInvoke(cmd, args){
+  if(window.__TAURI__&&window.__TAURI__.core&&window.__TAURI__.core.invoke) return window.__TAURI__.core.invoke(cmd,args||{});
+  if(window.__TAURI_INTERNALS__&&window.__TAURI_INTERNALS__.invoke) return window.__TAURI_INTERNALS__.invoke(cmd,args||{});
+  return Promise.reject(new Error('no tauri'));
+}
+function hasTauri(){
+  try{
+    return !!(window.__TAURI__&&window.__TAURI__.core&&window.__TAURI__.core.invoke)||
+           !!(window.__TAURI_INTERNALS__&&window.__TAURI_INTERNALS__.invoke);
+  }catch(e){ return false; }
+}
+async function fleetRefreshTick(){
+  try{
+    const doc = await tauriInvoke('fetch_fleet_dashboard');
+    window.overwatchRender(doc);
+  }catch(e){ /* keep last snapshot; STALE badge handles age */ }
+}
+function startFleetHost(){
+  window.__hosted = 1;
+  fleetRefreshTick();
+  setInterval(fleetRefreshTick, FLEET_REFRESH_MS);
+}
+
+/* ---- right-rail width (drag handle) ---- */
+const RAIL_MIN=96, RAIL_MAX=340, RAIL_DEF=150, RAIL_LS='ow_rail_w';
+function clampRail(w){ return Math.min(RAIL_MAX, Math.max(RAIL_MIN, Math.round(w))); }
+function setRailW(px){
+  const w=clampRail(px);
+  document.documentElement.style.setProperty('--rail-w', w+'px');
+  return w;
+}
+(function initRailResize(){
+  const handle=document.getElementById('railhandle'), col=document.getElementById('railcol');
+  if(!handle||!col) return;
+  const raw=lsGet(RAIL_LS,''), n=parseInt(raw,10);
+  let railW=setRailW(Number.isFinite(n)?n:RAIL_DEF);
+  const mql=window.matchMedia('(max-width:760px)');
+  function syncMobile(){
+    if(mql.matches) document.documentElement.style.removeProperty('--rail-w');
+    else setRailW(railW);
+  }
+  mql.addEventListener('change', syncMobile);
+  syncMobile();
+  let drag=false, railRight=0;
+  function endDrag(e){
+    if(!drag) return;
+    drag=false; handle.classList.remove('dragging');
+    try{ handle.releasePointerCapture(e.pointerId); }catch(err){}
+    document.body.style.userSelect=''; document.body.style.cursor='';
+    lsSet(RAIL_LS, String(railW));
+  }
+  handle.addEventListener('pointerdown', e=>{
+    if(mql.matches) return;
+    e.preventDefault(); drag=true; railRight=col.getBoundingClientRect().right;
+    handle.classList.add('dragging'); handle.setPointerCapture(e.pointerId);
+    document.body.style.userSelect='none'; document.body.style.cursor='col-resize';
+  });
+  handle.addEventListener('pointermove', e=>{
+    if(!drag) return;
+    railW=setRailW(railRight-e.clientX);
+  });
+  handle.addEventListener('pointerup', endDrag);
+  handle.addEventListener('pointercancel', endDrag);
+  handle.addEventListener('dblclick', ()=>{
+    if(mql.matches) return;
+    railW=setRailW(RAIL_DEF); lsSet(RAIL_LS, String(railW));
+  });
+})();
 
 /* ---- refresh ages every 20s (no network) ---- */
 setInterval(()=>{ if(DOC) renderAge(); }, 20000);
@@ -442,7 +498,8 @@ function mockDoc(){
    - bare preview link -> idle now, then fall back to mock after ~1.2s if nothing arrived. */
 (function boot(){
   if(/[?&]mock=1\b/.test(location.search)){ window.overwatchRender(mockDoc()); return; }
-  renderAll(); // idle until the host calls overwatchRender
+  if(hasTauri()){ startFleetHost(); return; }
+  renderAll();
   setTimeout(()=>{ if(!DOC && !window.__hosted) window.overwatchRender(mockDoc()); }, 1200);
 })();
 </script>

@@ -24,9 +24,12 @@ pub struct EdgeConfig {
     pub bearer: String,
     #[serde(default)]
     pub device_id: Option<String>,
-    /// When set, viewer uses LOCAL daemon if any local IPv4 is in this subnet (e.g. "10.0.0.0/24").
+    /// When set and this Mac has an IPv4 in the subnet, fleet dashboard prefers lan_url.
     #[serde(default)]
     pub fleet_subnet: Option<String>,
+    /// Optional mini LAN base URL (e.g. http://192.168.x.x:PORT). Used on-fleet only; halus fallback.
+    #[serde(default)]
+    pub lan_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

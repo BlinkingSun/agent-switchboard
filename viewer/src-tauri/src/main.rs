@@ -1,8 +1,5 @@
-// Agent Switchboard viewer — thin Tauri 2 shell around the static dashboard.
-// Data comes from the switchboard daemon (127.0.0.1:17920). Observe-only for
-// worker processes; start_daemon only kickstarts the launchd job for the
-// daemon itself (never kills lanes). Off-LAN fleet view reads a gitignored
-// edge config and fetches the published dashboard shape (read-only).
+// Agent Switchboard viewer — thin Tauri 2 shell around the fleet dashboard frontend.
+// Rust fetches the published dashboard shape (LAN-direct on-fleet, else halus).
 // Spawn uses Rust-side envelope crypto; device secret never enters the webview.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -14,42 +11,26 @@ use std::process::Command;
 
 use serde_json::Value;
 
-/// True when a local edge config file exists with url + bearer (no network).
-#[tauri::command]
-fn edge_config_available() -> bool {
-    spawn::load_edge_config().is_some()
-}
+const VIEWER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
-/// On/off fleet network: local IPv4 in gitignored fleet_subnet, or daemon reachability fallback.
-#[tauri::command]
-fn network_scope() -> network::NetworkScope {
-    network::compute_network_scope()
-}
-
-/// True when device secret + edge device_id are provisioned (spawn dormant until then).
-#[tauri::command]
-fn spawn_pairing_available() -> bool {
-    spawn::spawn_pairing_available()
-}
-
-/// GET {url}/v1/dashboard with the configured device bearer (read-only).
-#[tauri::command]
-fn fetch_edge_dashboard() -> Result<Value, String> {
-    let cfg = spawn::load_edge_config().ok_or_else(|| "edge config not found".to_string())?;
-    let base = cfg.url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return Err("edge url is empty".to_string());
-    }
-    let url = format!("{base}/v1/dashboard");
-    let client = reqwest::blocking::Client::builder()
-        // Explicit browser-like UA: Cloudflare 403s default library UAs (error 1010).
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+fn dashboard_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .user_agent(VIEWER_UA)
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("http client: {e}"))?;
+        .map_err(|e| format!("http client: {e}"))
+}
+
+fn get_dashboard(base: &str, bearer: &str) -> Result<Value, String> {
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("dashboard base url is empty".to_string());
+    }
+    let url = format!("{base}/v1/dashboard");
+    let client = dashboard_client()?;
     let resp = client
         .get(&url)
-        .header("Authorization", format!("Bearer {}", cfg.bearer.trim()))
+        .header("Authorization", format!("Bearer {}", bearer.trim()))
         .header("Cache-Control", "no-store")
         .send()
         .map_err(|e| format!("fetch {url}: {e}"))?;
@@ -58,6 +39,36 @@ fn fetch_edge_dashboard() -> Result<Value, String> {
     }
     resp.json::<Value>()
         .map_err(|e| format!("parse dashboard JSON: {e}"))
+}
+
+/// Fleet dashboard: LAN (lan_url) when on fleet subnet, else halus; LAN failure falls back to halus.
+#[tauri::command]
+fn fetch_fleet_dashboard() -> Result<Value, String> {
+    let cfg = spawn::load_edge_config().ok_or_else(|| "edge config not found".to_string())?;
+    let bearer = cfg.bearer.trim();
+    let halus = cfg.url.trim().trim_end_matches('/');
+
+    let lan_base = cfg
+        .lan_url
+        .as_ref()
+        .map(|s| s.trim().trim_end_matches('/'))
+        .filter(|s| !s.is_empty());
+
+    if network::on_fleet_network() {
+        if let Some(lan) = lan_base {
+            if let Ok(doc) = get_dashboard(lan, bearer) {
+                return Ok(doc);
+            }
+        }
+    }
+
+    get_dashboard(halus, bearer)
+}
+
+/// True when device secret + edge device_id are provisioned (spawn dormant until then).
+#[tauri::command]
+fn spawn_pairing_available() -> bool {
+    spawn::spawn_pairing_available()
 }
 
 /// Build signed envelope, POST /v1/command. Returns not paired if secret absent.
@@ -97,8 +108,6 @@ fn current_uid() -> Result<u32, String> {
 }
 
 /// Kickstart the launchd switchboard job: gui/<uid>/com.agent-switchboard.
-/// No -k (do not kill a healthy daemon). B1 owns ensure semantics; this is the
-/// viewer START affordance only.
 #[tauri::command]
 fn start_daemon() -> Result<String, String> {
     let uid = current_uid()?;
@@ -130,9 +139,7 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             start_daemon,
-            edge_config_available,
-            network_scope,
-            fetch_edge_dashboard,
+            fetch_fleet_dashboard,
             spawn_pairing_available,
             submit_spawn,
             fetch_spawn_result,

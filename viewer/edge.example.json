@@ -2,6 +2,8 @@
   "url": "https://api.halus.ai",
   "bearer": "YOUR_DEVICE_BEARER_FROM_PAIRING",
   "device_id": "YOUR_DEVICE_ID_FROM_PAIRING",
-  "_comment_fleet_subnet": "When this Mac has an IPv4 in fleet_subnet, viewer uses LOCAL daemon; otherwise FLEET (halus). Real subnet only in gitignored edge.json.",
+  "_comment_lan_url": "On fleet_subnet, viewer fetches fleet from this LAN base first (e.g. http://192.168.x.x:PORT). Falls back to url (halus) on failure or when off-subnet. Real host only in gitignored edge.json.",
+  "lan_url": "http://MINI_LAN_HOST:PORT",
+  "_comment_fleet_subnet": "When this Mac has an IPv4 in fleet_subnet, viewer prefers lan_url; otherwise uses halus (url). Real subnet only in gitignored edge.json.",
   "fleet_subnet": "10.0.0.0/24"
 }
