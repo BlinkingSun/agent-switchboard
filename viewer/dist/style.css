@@ -994,3 +994,237 @@ body {
     font-size: 10px;
   }
 }
+
+/* ── Spawn sheet (mirrors iOS SpawnSheet) ───────────── */
+
+.spawn-open-btn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--slot);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color var(--ease), border-color var(--ease), background var(--ease);
+}
+
+.spawn-open-btn:hover {
+  border-color: #3a4454;
+  background: #1f2630;
+}
+
+.spawn-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.spawn-modal[hidden] {
+  display: none !important;
+}
+
+.spawn-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(5, 7, 10, 0.72);
+}
+
+.spawn-sheet {
+  position: relative;
+  width: min(480px, 100%);
+  max-height: min(90vh, 720px);
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+}
+
+.spawn-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.spawn-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+}
+
+.spawn-close {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.spawn-body {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.spawn-status {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.spawn-status-warn {
+  color: var(--quiet);
+}
+
+.spawn-status-error {
+  color: var(--danger);
+}
+
+.spawn-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+}
+
+.spawn-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.spawn-chip {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--slot);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color var(--ease), background var(--ease), border-color var(--ease);
+}
+
+.spawn-chip:hover {
+  border-color: #3a4454;
+}
+
+.spawn-chip.active {
+  background: var(--text);
+  color: var(--bg);
+  border-color: var(--text);
+}
+
+.spawn-input,
+.spawn-textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--slot);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  resize: vertical;
+}
+
+.spawn-input:disabled,
+.spawn-textarea:disabled {
+  opacity: 0.55;
+}
+
+.spawn-result {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--slot);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.spawn-result-row {
+  display: flex;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.spawn-result-k {
+  flex: 0 0 64px;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.spawn-sig-ok {
+  color: var(--running);
+}
+
+.spawn-sig-bad {
+  color: var(--danger);
+}
+
+.spawn-sig-warn {
+  color: var(--quiet);
+}
+
+.spawn-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.spawn-submit,
+.spawn-cancel,
+.spawn-done {
+  appearance: none;
+  border: 0;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  min-height: 44px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.spawn-submit {
+  background: var(--quiet);
+  color: var(--bg);
+}
+
+.spawn-submit.confirming {
+  background: var(--running);
+}
+
+.spawn-submit:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.spawn-cancel,
+.spawn-done {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}

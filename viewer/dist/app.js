@@ -364,6 +364,17 @@
     main: document.getElementById("main"),
     rail: document.getElementById("rail"),
     tickerInner: document.getElementById("ticker-inner"),
+    spawnOpenBtn: document.getElementById("spawn-open-btn"),
+    spawnModal: document.getElementById("spawn-modal"),
+    spawnStatus: document.getElementById("spawn-status"),
+    spawnHosts: document.getElementById("spawn-hosts"),
+    spawnAgents: document.getElementById("spawn-agents"),
+    spawnWorkdir: document.getElementById("spawn-workdir"),
+    spawnPrompt: document.getElementById("spawn-prompt"),
+    spawnResult: document.getElementById("spawn-result"),
+    spawnSubmitBtn: document.getElementById("spawn-submit-btn"),
+    spawnCancelBtn: document.getElementById("spawn-cancel-btn"),
+    spawnDoneBtn: document.getElementById("spawn-done-btn"),
   };
 
   var state = {
@@ -391,6 +402,19 @@
     lastAppliedSeq: 0,
     bootId: null,
     startBusy: false,
+    spawnPaired: false,
+    spawnHostIds: ["mbp", "mini", "pc", "cnc"],
+    spawn: {
+      open: false,
+      host: "mbp",
+      agent: "claude",
+      confirming: false,
+      phase: "idle",
+      commandId: null,
+      result: null,
+      error: null,
+      busy: false,
+    },
   };
 
   /* ── localStorage helpers ─────────────────────────── */
@@ -1353,6 +1377,310 @@
     return false;
   }
 
+  /* ── Spawn sheet (Rust crypto; dormant until paired) ─ */
+
+  var SPAWN_AGENTS = ["claude", "grok", "cursor"];
+  var SPAWN_HOST_LABELS = { mbp: "MBP", mini: "MINI", pc: "PC", cnc: "CNC" };
+
+  function spawnHostLabel(id) {
+    return SPAWN_HOST_LABELS[id] || String(id || "").toUpperCase();
+  }
+
+  function updateSpawnHostsFromDoc(doc) {
+    if (!doc || !Array.isArray(doc.hosts) || !doc.hosts.length) return;
+    var ids = [];
+    for (var i = 0; i < doc.hosts.length; i++) {
+      var h = doc.hosts[i];
+      if (h && h.id) ids.push(String(h.id));
+    }
+    if (ids.length) state.spawnHostIds = ids;
+    if (state.spawn.open) renderSpawnSheet();
+  }
+
+  async function refreshSpawnPairing() {
+    if (!hasTauriApi()) {
+      state.spawnPaired = false;
+      updateSpawnButton();
+      return;
+    }
+    try {
+      state.spawnPaired = !!(await tauriInvoke("spawn_pairing_available"));
+    } catch (e) {
+      state.spawnPaired = false;
+    }
+    updateSpawnButton();
+    if (state.spawn.open) renderSpawnSheet();
+  }
+
+  function updateSpawnButton() {
+    if (!els.spawnOpenBtn) return;
+    if (!hasTauriApi()) {
+      els.spawnOpenBtn.hidden = true;
+      els.spawnOpenBtn.setAttribute("hidden", "");
+      return;
+    }
+    els.spawnOpenBtn.hidden = false;
+    els.spawnOpenBtn.removeAttribute("hidden");
+  }
+
+  function openSpawnSheet() {
+    if (!els.spawnModal) return;
+    state.spawn.open = true;
+    state.spawn.confirming = false;
+    state.spawn.phase = "idle";
+    state.spawn.commandId = null;
+    state.spawn.result = null;
+    state.spawn.error = null;
+    state.spawn.busy = false;
+    els.spawnModal.hidden = false;
+    els.spawnModal.removeAttribute("hidden");
+    els.spawnModal.setAttribute("aria-hidden", "false");
+    renderSpawnSheet();
+    refreshSpawnPairing();
+  }
+
+  function closeSpawnSheet() {
+    if (!els.spawnModal) return;
+    state.spawn.open = false;
+    els.spawnModal.hidden = true;
+    els.spawnModal.setAttribute("hidden", "");
+    els.spawnModal.setAttribute("aria-hidden", "true");
+  }
+
+  function renderSpawnChips(container, items, selected, attr) {
+    if (!container) return;
+    var html = "";
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var on = item === selected;
+      html +=
+        '<button type="button" class="spawn-chip' +
+        (on ? " active" : "") +
+        '" data-' +
+        attr +
+        '="' +
+        escapeHtml(item) +
+        '">' +
+        escapeHtml(attr === "spawn-host" ? spawnHostLabel(item) : item.toUpperCase()) +
+        "</button>";
+    }
+    container.innerHTML = html;
+  }
+
+  function renderSpawnResult(result) {
+    if (!els.spawnResult) return;
+    if (!result) {
+      els.spawnResult.hidden = true;
+      els.spawnResult.setAttribute("hidden", "");
+      els.spawnResult.innerHTML = "";
+      return;
+    }
+    var sigClass =
+      result.display_state === "verified"
+        ? "spawn-sig-ok"
+        : result.display_state === "bad_signature"
+          ? "spawn-sig-bad"
+          : "spawn-sig-warn";
+    var lines =
+      '<div class="spawn-result-row"><span class="spawn-result-k">STATUS</span><span>' +
+      escapeHtml(result.status || "") +
+      "</span></div>";
+    if (result.reason) {
+      lines +=
+        '<div class="spawn-result-row"><span class="spawn-result-k">REASON</span><span>' +
+        escapeHtml(result.reason) +
+        "</span></div>";
+    }
+    if (result.job_ref) {
+      lines +=
+        '<div class="spawn-result-row"><span class="spawn-result-k">JOB</span><span>' +
+        escapeHtml(result.job_ref) +
+        "</span></div>";
+    }
+    lines +=
+      '<div class="spawn-result-row ' +
+      sigClass +
+      '"><span class="spawn-result-k">SIG</span><span>' +
+      escapeHtml(result.display_state) +
+      "</span></div>";
+    els.spawnResult.innerHTML = lines;
+    els.spawnResult.hidden = false;
+    els.spawnResult.removeAttribute("hidden");
+  }
+
+  function renderSpawnSheet() {
+    var sp = state.spawn;
+    renderSpawnChips(els.spawnHosts, state.spawnHostIds, sp.host, "spawn-host");
+    renderSpawnChips(els.spawnAgents, SPAWN_AGENTS, sp.agent, "spawn-agent");
+
+    if (els.spawnWorkdir) {
+      els.spawnWorkdir.disabled = !state.spawnPaired || sp.phase === "pending" || sp.busy;
+    }
+    if (els.spawnPrompt) {
+      els.spawnPrompt.disabled = !state.spawnPaired || sp.phase === "pending" || sp.busy;
+    }
+
+    if (els.spawnStatus) {
+      if (!state.spawnPaired) {
+        els.spawnStatus.textContent =
+          "Pairing required — provision ~/.config/agent-switchboard/device-secret and device_id in edge.json before sending commands.";
+        els.spawnStatus.className = "spawn-status spawn-status-warn";
+      } else if (sp.error) {
+        els.spawnStatus.textContent = sp.error;
+        els.spawnStatus.className = "spawn-status spawn-status-error";
+      } else if (sp.phase === "pending") {
+        els.spawnStatus.textContent = "Command accepted — waiting for hub result.";
+        els.spawnStatus.className = "spawn-status";
+      } else {
+        els.spawnStatus.textContent = "Encrypted spawn posts to the edge when you confirm.";
+        els.spawnStatus.className = "spawn-status";
+      }
+    }
+
+    if (sp.host === "cnc" && els.spawnStatus && state.spawnPaired && !sp.error && sp.phase !== "pending") {
+      els.spawnStatus.textContent =
+        "This node has no agent CLIs installed. Spawn will be refused until one is present.";
+    }
+
+    if (sp.phase === "pending" || sp.phase === "result") {
+      renderSpawnResult(sp.result);
+    } else {
+      renderSpawnResult(null);
+    }
+
+    var canSend = state.spawnPaired && sp.phase !== "pending" && !sp.busy;
+    if (els.spawnSubmitBtn) {
+      if (sp.phase === "pending") {
+        els.spawnSubmitBtn.hidden = true;
+        els.spawnSubmitBtn.setAttribute("hidden", "");
+      } else {
+        els.spawnSubmitBtn.hidden = false;
+        els.spawnSubmitBtn.removeAttribute("hidden");
+        els.spawnSubmitBtn.disabled = !canSend;
+        els.spawnSubmitBtn.textContent = sp.confirming ? "CONFIRM SPAWN" : "SPAWN";
+        els.spawnSubmitBtn.classList.toggle("confirming", !!sp.confirming && canSend);
+      }
+    }
+    if (els.spawnCancelBtn) {
+      var showCancel = sp.confirming && sp.phase !== "pending" && !sp.busy;
+      els.spawnCancelBtn.hidden = !showCancel;
+      if (showCancel) els.spawnCancelBtn.removeAttribute("hidden");
+      else els.spawnCancelBtn.setAttribute("hidden", "");
+    }
+    if (els.spawnDoneBtn) {
+      var showDone = sp.phase === "pending" || sp.phase === "result";
+      els.spawnDoneBtn.hidden = !showDone;
+      if (showDone) els.spawnDoneBtn.removeAttribute("hidden");
+      else els.spawnDoneBtn.setAttribute("hidden", "");
+    }
+  }
+
+  function submitErrorMessage(err) {
+    var s = String(err || "");
+    if (s.indexOf("duplicate") !== -1) return "Duplicate command id.";
+    if (s.indexOf("expired") !== -1) return "Command expired — check device clock.";
+    if (s.indexOf("pending_cap") !== -1) return "Too many pending commands.";
+    if (s.indexOf("malformed_envelope") !== -1) return "Malformed envelope.";
+    if (s.indexOf("device_mismatch") !== -1) return "Device mismatch.";
+    if (s.indexOf("unauthorized") !== -1 || s.indexOf("401") !== -1) return "Unauthorized.";
+    if (s.indexOf("not paired") !== -1) return "Pairing required.";
+    if (s.indexOf("invalid prompt") !== -1) return "Prompt is invalid.";
+    return "Send failed.";
+  }
+
+  async function pollSpawnResult(commandId) {
+    for (var i = 0; i < 12; i++) {
+      try {
+        var fetched = await tauriInvoke("fetch_spawn_result", { command_id: commandId });
+        if (fetched) {
+          state.spawn.result = fetched;
+          state.spawn.phase = "result";
+          renderSpawnSheet();
+          return;
+        }
+      } catch (e) { /* keep polling */ }
+      await sleep(2000);
+    }
+    state.spawn.phase = "result";
+    renderSpawnSheet();
+  }
+
+  async function onSpawnSubmit() {
+    var sp = state.spawn;
+    if (!state.spawnPaired || sp.phase === "pending" || sp.busy) return;
+    if (!sp.confirming) {
+      sp.confirming = true;
+      renderSpawnSheet();
+      return;
+    }
+    sp.error = null;
+    sp.busy = true;
+    sp.phase = "pending";
+    renderSpawnSheet();
+    var workdir = els.spawnWorkdir ? els.spawnWorkdir.value : "";
+    var prompt = els.spawnPrompt ? els.spawnPrompt.value : "";
+    try {
+      var resp = await tauriInvoke("submit_spawn", {
+        host: sp.host,
+        agent: sp.agent,
+        workdir_id: workdir,
+        prompt: prompt,
+      });
+      sp.commandId = resp && resp.command_id ? resp.command_id : null;
+      await pollSpawnResult(sp.commandId);
+    } catch (err) {
+      sp.error = submitErrorMessage(err);
+      sp.phase = "idle";
+      sp.confirming = false;
+      renderSpawnSheet();
+    } finally {
+      sp.busy = false;
+      renderSpawnSheet();
+    }
+  }
+
+  function onSpawnClick(e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+
+    if (t.id === "spawn-open-btn" || (t.closest && t.closest("#spawn-open-btn"))) {
+      openSpawnSheet();
+      return;
+    }
+    if (t.closest && t.closest("[data-spawn-close]")) {
+      closeSpawnSheet();
+      return;
+    }
+    if (t.id === "spawn-submit-btn" || (t.closest && t.closest("#spawn-submit-btn"))) {
+      onSpawnSubmit();
+      return;
+    }
+    if (t.id === "spawn-cancel-btn" || (t.closest && t.closest("#spawn-cancel-btn"))) {
+      state.spawn.confirming = false;
+      renderSpawnSheet();
+      return;
+    }
+    if (t.id === "spawn-done-btn" || (t.closest && t.closest("#spawn-done-btn"))) {
+      closeSpawnSheet();
+      return;
+    }
+    var hostChip = t.closest ? t.closest("[data-spawn-host]") : null;
+    if (hostChip) {
+      state.spawn.host = hostChip.getAttribute("data-spawn-host") || state.spawn.host;
+      state.spawn.confirming = false;
+      renderSpawnSheet();
+      return;
+    }
+    var agentChip = t.closest ? t.closest("[data-spawn-agent]") : null;
+    if (agentChip) {
+      state.spawn.agent = agentChip.getAttribute("data-spawn-agent") || state.spawn.agent;
+      state.spawn.confirming = false;
+      renderSpawnSheet();
+    }
+  }
+
+  document.addEventListener("click", onSpawnClick);
+
   function invokeStartDaemon() {
     return tauriInvoke("start_daemon");
   }
@@ -1445,6 +1773,7 @@
     if (!hasTauriApi()) return false;
     try {
       var payload = doc != null ? doc : await fetchEdgeDashboard();
+      updateSpawnHostsFromDoc(payload);
       await ensureEdgeFrameReady();
       if (!renderEdgeDoc(payload)) {
         await sleep(50);
@@ -1477,6 +1806,7 @@
       if (state.dataSource !== "edge") return;
       try {
         var doc = await fetchEdgeDashboard();
+        updateSpawnHostsFromDoc(doc);
         renderEdgeDoc(doc);
       } catch (e) {
         /* keep last snapshot; overwatch STALE badge handles age */
@@ -2000,6 +2330,8 @@
     renderDensity();
     renderTicker();
     updateStartButton();
+    updateSpawnButton();
+    refreshSpawnPairing();
 
     // Auto-run pure self-test once at boot (result on __sbTest.lastRun)
     try {

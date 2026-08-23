@@ -8,3 +8,5 @@ node_modules/
 state/
 viewer/edge.json
 viewer/edge.local.json
+viewer/device-secret
+viewer/device-secret.local

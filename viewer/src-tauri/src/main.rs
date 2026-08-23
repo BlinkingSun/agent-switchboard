@@ -3,68 +3,32 @@
 // worker processes; start_daemon only kickstarts the launchd job for the
 // daemon itself (never kills lanes). Off-LAN fleet view reads a gitignored
 // edge config and fetches the published dashboard shape (read-only).
+// Spawn uses Rust-side envelope crypto; device secret never enters the webview.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::{Path, PathBuf};
+mod crypto;
+mod spawn;
+
 use std::process::Command;
 
-use serde::Deserialize;
 use serde_json::Value;
-
-#[derive(Debug, Deserialize)]
-struct EdgeConfig {
-    url: String,
-    bearer: String,
-}
-
-/// Resolve ~/.config/agent-switchboard/edge.json (never committed).
-fn edge_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("agent-switchboard")
-            .join("edge.json")
-    })
-}
-
-/// Optional viewer-local override (gitignored): viewer/edge.local.json next to dist.
-fn viewer_local_edge_config_path() -> Option<PathBuf> {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let local = manifest
-        .parent()
-        .map(|p| p.join("edge.local.json"));
-    local.filter(|p| p.is_file())
-}
-
-fn load_edge_config() -> Option<EdgeConfig> {
-    let candidates: Vec<PathBuf> = viewer_local_edge_config_path()
-        .into_iter()
-        .chain(edge_config_path())
-        .collect();
-    for path in candidates {
-        if !path.is_file() {
-            continue;
-        }
-        let raw = std::fs::read_to_string(&path).ok()?;
-        if let Ok(cfg) = serde_json::from_str::<EdgeConfig>(&raw) {
-            if !cfg.url.trim().is_empty() && !cfg.bearer.trim().is_empty() {
-                return Some(cfg);
-            }
-        }
-    }
-    None
-}
 
 /// True when a local edge config file exists with url + bearer (no network).
 #[tauri::command]
 fn edge_config_available() -> bool {
-    load_edge_config().is_some()
+    spawn::load_edge_config().is_some()
+}
+
+/// True when device secret + edge device_id are provisioned (spawn dormant until then).
+#[tauri::command]
+fn spawn_pairing_available() -> bool {
+    spawn::spawn_pairing_available()
 }
 
 /// GET {url}/v1/dashboard with the configured device bearer (read-only).
 #[tauri::command]
 fn fetch_edge_dashboard() -> Result<Value, String> {
-    let cfg = load_edge_config().ok_or_else(|| "edge config not found".to_string())?;
+    let cfg = spawn::load_edge_config().ok_or_else(|| "edge config not found".to_string())?;
     let base = cfg.url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err("edge url is empty".to_string());
@@ -85,6 +49,23 @@ fn fetch_edge_dashboard() -> Result<Value, String> {
     }
     resp.json::<Value>()
         .map_err(|e| format!("parse dashboard JSON: {e}"))
+}
+
+/// Build signed envelope, POST /v1/command. Returns not paired if secret absent.
+#[tauri::command]
+fn submit_spawn(
+    host: String,
+    agent: String,
+    workdir_id: String,
+    prompt: String,
+) -> Result<spawn::SubmitSpawnResponse, String> {
+    spawn::submit_spawn(host, agent, workdir_id, prompt)
+}
+
+/// GET /v1/command/result?id= and verify hub signature.
+#[tauri::command]
+fn fetch_spawn_result(command_id: String) -> Result<Option<spawn::SpawnResultPayload>, String> {
+    spawn::fetch_spawn_result(command_id)
 }
 
 /// Resolve current user id via `id -u` (never hard-code 501; live domain is gui/<uid>).
@@ -141,7 +122,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             start_daemon,
             edge_config_available,
-            fetch_edge_dashboard
+            fetch_edge_dashboard,
+            spawn_pairing_available,
+            submit_spawn,
+            fetch_spawn_result,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Agent Switchboard");

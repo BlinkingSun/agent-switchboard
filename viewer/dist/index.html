@@ -21,6 +21,7 @@
         <nav class="task-chips" id="task-chips" aria-label="Task filter"></nav>
       </div>
       <div class="header-right">
+        <button type="button" id="spawn-open-btn" class="spawn-open-btn" hidden>SPAWN</button>
         <div class="density-toggle" id="density-toggle" role="group" aria-label="Density">
           <button type="button" data-density="AUTO" class="density-btn">AUTO</button>
           <button type="button" data-density="PANEL" class="density-btn">PANEL</button>
@@ -43,6 +44,39 @@
     <footer class="ticker" id="ticker" aria-live="polite" aria-label="Event ticker">
       <span class="ticker-inner" id="ticker-inner"></span>
     </footer>
+  </div>
+
+  <div id="spawn-modal" class="spawn-modal" hidden aria-hidden="true">
+    <div class="spawn-backdrop" data-spawn-close></div>
+    <div class="spawn-sheet" role="dialog" aria-labelledby="spawn-title" aria-modal="true">
+      <header class="spawn-head">
+        <h2 id="spawn-title" class="spawn-title">SPAWN</h2>
+        <button type="button" class="spawn-close" data-spawn-close aria-label="Close">CLOSE</button>
+      </header>
+      <div class="spawn-body">
+        <p id="spawn-status" class="spawn-status">Encrypted spawn posts to the edge when you confirm.</p>
+
+        <label class="spawn-label">MACHINE</label>
+        <div class="spawn-chips" id="spawn-hosts" role="group" aria-label="Host"></div>
+
+        <label class="spawn-label">AGENT</label>
+        <div class="spawn-chips" id="spawn-agents" role="group" aria-label="Agent"></div>
+
+        <label class="spawn-label" for="spawn-workdir">WORKDIR (optional)</label>
+        <input type="text" id="spawn-workdir" class="spawn-input" placeholder="desktop" autocomplete="off" spellcheck="false" />
+
+        <label class="spawn-label" for="spawn-prompt">PROMPT</label>
+        <textarea id="spawn-prompt" class="spawn-textarea" placeholder="optional" rows="4" spellcheck="false"></textarea>
+
+        <div id="spawn-result" class="spawn-result" hidden></div>
+
+        <div class="spawn-actions">
+          <button type="button" id="spawn-submit-btn" class="spawn-submit">SPAWN</button>
+          <button type="button" id="spawn-cancel-btn" class="spawn-cancel" hidden>CANCEL</button>
+          <button type="button" id="spawn-done-btn" class="spawn-done" hidden>DONE</button>
+        </div>
+      </div>
+    </div>
   </div>
   <script src="app.js"></script>
 </body>

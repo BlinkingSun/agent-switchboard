@@ -1,4 +1,5 @@
 {
   "url": "https://api.halus.ai",
-  "bearer": "YOUR_DEVICE_BEARER_FROM_PAIRING"
+  "bearer": "YOUR_DEVICE_BEARER_FROM_PAIRING",
+  "device_id": "YOUR_DEVICE_ID_FROM_PAIRING"
 }
