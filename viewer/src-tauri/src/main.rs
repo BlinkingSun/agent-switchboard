@@ -200,7 +200,7 @@ fn start_daemon() -> Result<String, String> {
     Err(format!("kickstart {}: {last_err}", labels.join(" then ")))
 }
 
-fn main() {
+fn main() { // viewer revive: instant tauri boot
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             start_daemon,

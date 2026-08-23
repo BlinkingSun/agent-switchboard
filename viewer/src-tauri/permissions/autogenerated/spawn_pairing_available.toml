@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-spawn-pairing-available"
+description = "Enables the spawn_pairing_available command without any pre-configured scope."
+commands.allow = ["spawn_pairing_available"]
+
+[[permission]]
+identifier = "deny-spawn-pairing-available"
+description = "Denies the spawn_pairing_available command without any pre-configured scope."
+commands.deny = ["spawn_pairing_available"]

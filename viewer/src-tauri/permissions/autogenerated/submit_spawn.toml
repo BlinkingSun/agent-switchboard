@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-submit-spawn"
+description = "Enables the submit_spawn command without any pre-configured scope."
+commands.allow = ["submit_spawn"]
+
+[[permission]]
+identifier = "deny-submit-spawn"
+description = "Denies the submit_spawn command without any pre-configured scope."
+commands.deny = ["submit_spawn"]

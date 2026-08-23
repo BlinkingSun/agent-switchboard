@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fetch-local-cli"
+description = "Enables the fetch_local_cli command without any pre-configured scope."
+commands.allow = ["fetch_local_cli"]
+
+[[permission]]
+identifier = "deny-fetch-local-cli"
+description = "Denies the fetch_local_cli command without any pre-configured scope."
+commands.deny = ["fetch_local_cli"]

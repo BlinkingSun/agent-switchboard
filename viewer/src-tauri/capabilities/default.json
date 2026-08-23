@@ -2,5 +2,16 @@
   "identifier": "default",
   "description": "Read-only dashboard window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "allow-start-daemon",
+    "allow-fetch-fleet-dashboard",
+    "allow-fetch-local-cli",
+    "allow-fetch-local-status",
+    "allow-fetch-local-health",
+    "allow-wait-local",
+    "allow-spawn-pairing-available",
+    "allow-submit-spawn",
+    "allow-fetch-spawn-result"
+  ]
 }

@@ -9,6 +9,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Agent Switchboard",
         "width": 1180,
         "height": 760,
@@ -19,8 +20,9 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.halus.ai; frame-src 'self'"
-    }
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost https://api.halus.ai; frame-src 'self'"
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,

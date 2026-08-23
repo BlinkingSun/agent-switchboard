@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wait-local"
+description = "Enables the wait_local command without any pre-configured scope."
+commands.allow = ["wait_local"]
+
+[[permission]]
+identifier = "deny-wait-local"
+description = "Denies the wait_local command without any pre-configured scope."
+commands.deny = ["wait_local"]

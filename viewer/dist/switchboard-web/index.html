@@ -1,3 +1,7 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
 <title>Overwatch Switchboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <style>
@@ -140,6 +144,8 @@
     .meta{max-width:42vw}
   }
 </style>
+</head>
+<body>
 
 <div class="wrap">
   <div class="top"><div class="brand">AGENT&nbsp;SWITCHBOARD</div></div>
@@ -585,15 +591,33 @@ const WRAP_KINDS = {team_dispatch:1, 'team-dispatch':1, agent_dispatch:1, python
 let FLEET_DOC = null;
 let LOCAL_MBP = null;
 let localCursor = 0;
+function resolveTauriInvoke(){
+  try{
+    const t=window.__TAURI__;
+    if(t&&t.core&&typeof t.core.invoke==='function') return (cmd,args)=>t.core.invoke(cmd,args||{});
+    const i=window.__TAURI_INTERNALS__;
+    if(i&&typeof i.invoke==='function') return (cmd,args)=>i.invoke(cmd,args||{});
+  }catch(e){}
+  return null;
+}
 function tauriInvoke(cmd, args){
-  if(window.__TAURI__&&window.__TAURI__.core&&window.__TAURI__.core.invoke) return window.__TAURI__.core.invoke(cmd,args||{});
-  if(window.__TAURI_INTERNALS__&&window.__TAURI_INTERNALS__.invoke) return window.__TAURI_INTERNALS__.invoke(cmd,args||{});
-  return Promise.reject(new Error('no tauri'));
+  const inv=resolveTauriInvoke();
+  if(inv) return inv(cmd,args);
+  return new Promise(function(resolve,reject){
+    let n=0;
+    (function poll(){
+      const fn=resolveTauriInvoke();
+      if(fn){ fn(cmd,args).then(resolve,reject); return; }
+      if(++n>400){ reject(new Error('no tauri')); return; }
+      setTimeout(poll,25);
+    })();
+  });
 }
 function hasTauri(){
   try{
-    return !!(window.__TAURI__&&window.__TAURI__.core&&window.__TAURI__.core.invoke)||
-           !!(window.__TAURI_INTERNALS__&&window.__TAURI_INTERNALS__.invoke);
+    if(window.isTauri) return true;
+    if(window.__TAURI__) return true;
+    return !!resolveTauriInvoke();
   }catch(e){ return false; }
 }
 function famCount(v){
@@ -783,6 +807,8 @@ async function fleetRefreshTick(){
 }
 function startFleetHost(){
   window.__hosted = 1;
+  document.getElementById('idle').style.display='none';
+  document.getElementById('clipanel').style.display='';
   localWaitLoop();
   fleetRefreshTick();
   setInterval(fleetRefreshTick, FLEET_REFRESH_MS);
@@ -903,10 +929,25 @@ if(typeof globalThis!=='undefined' && globalThis.__RUN_TREE_ROOT_FIXTURES__){
    - embedded -> native host calls overwatchRender(doc); set window.__hosted=1 (before load
                 or immediately) to suppress the preview fallback so no mock flash appears.
    - bare preview link -> idle now, then fall back to mock after ~1.2s if nothing arrived. */
-(function boot(){
+function tauriContext(){
+  try{
+    if(window.isTauri) return true;
+    const p=location.protocol||'';
+    const h=location.hostname||'';
+    return p==='tauri:'||h==='tauri.localhost'||/\.tauri\.localhost$/.test(h);
+  }catch(e){ return false; }
+}
+function boot(){
   if(/[?&]mock=1\b/.test(location.search)){ window.overwatchRender(mockDoc()); return; }
-  if(hasTauri()){ startFleetHost(); return; }
+  if(window.isTauri || tauriContext() || resolveTauriInvoke()){
+    startFleetHost();
+    return;
+  }
   renderAll();
   setTimeout(()=>{ if(!DOC && !window.__hosted) window.overwatchRender(mockDoc()); }, 1200);
-})();
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', boot);
+else boot();
 </script>
+</body>
+</html>

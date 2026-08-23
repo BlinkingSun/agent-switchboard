@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fetch-fleet-dashboard"
+description = "Enables the fetch_fleet_dashboard command without any pre-configured scope."
+commands.allow = ["fetch_fleet_dashboard"]
+
+[[permission]]
+identifier = "deny-fetch-fleet-dashboard"
+description = "Denies the fetch_fleet_dashboard command without any pre-configured scope."
+commands.deny = ["fetch_fleet_dashboard"]
