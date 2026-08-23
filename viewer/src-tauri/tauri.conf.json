@@ -19,7 +19,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src http://127.0.0.1:17920"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src http://127.0.0.1:17920 https://api.halus.ai; frame-src 'self'"
     }
   },
   "bundle": {

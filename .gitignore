@@ -6,3 +6,5 @@ viewer/src-tauri/gen/
 viewer/src-tauri/Cargo.lock
 node_modules/
 state/
+viewer/edge.json
+viewer/edge.local.json

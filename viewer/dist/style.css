@@ -67,6 +67,49 @@ body {
   white-space: nowrap;
 }
 
+.source-badge {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 2px 8px;
+  border: 1px solid #24563b;
+  border-radius: 5px;
+  color: var(--running);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  vertical-align: middle;
+}
+
+.source-badge.source-fleet {
+  border-color: #33506b;
+  color: #9cc6ea;
+}
+
+.edge-host {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background: #0b0e12;
+}
+
+.edge-host[hidden] {
+  display: none !important;
+}
+
+.edge-source-bar {
+  flex: 0 0 auto;
+  padding: 8px 16px 0;
+  text-align: center;
+}
+
+.edge-frame {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  background: #0b0e12;
+}
+
 .header-center {
   flex: 1 1 auto;
   min-width: 0;

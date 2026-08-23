@@ -352,6 +352,10 @@
   var BACKOFF_MAX = 10000;
 
   var els = {
+    app: document.getElementById("app"),
+    edgeHost: document.getElementById("edge-host"),
+    edgeFrame: document.getElementById("edge-frame"),
+    sourceBadge: document.getElementById("source-badge"),
     chips: document.getElementById("task-chips"),
     totals: document.getElementById("global-totals"),
     density: document.getElementById("density-toggle"),
@@ -365,6 +369,9 @@
   var state = {
     mock: false,
     fixture: false,
+    dataSource: "none", // "local" | "edge" | "none"
+    edgeFrameReady: false,
+    localLoopsRunning: false,
     cursor: 0,
     status: [],
     events: [],
@@ -1321,7 +1328,17 @@
     updateStartButton();
   }
 
-  /* ── Tauri START DAEMON ───────────────────────────── */
+  /* ── Tauri START DAEMON + edge fallback ───────────── */
+
+  function tauriInvoke(cmd, args) {
+    if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+      return window.__TAURI__.core.invoke(cmd, args || {});
+    }
+    if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
+      return window.__TAURI_INTERNALS__.invoke(cmd, args || {});
+    }
+    return Promise.reject(new Error("no tauri api"));
+  }
 
   function hasTauriApi() {
     try {
@@ -1337,13 +1354,184 @@
   }
 
   function invokeStartDaemon() {
-    if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
-      return window.__TAURI__.core.invoke("start_daemon");
+    return tauriInvoke("start_daemon");
+  }
+
+  function updateSourceBadge() {
+    if (!els.sourceBadge) return;
+    if (state.dataSource === "local") {
+      els.sourceBadge.textContent = "LOCAL";
+      els.sourceBadge.classList.remove("source-fleet");
+      els.sourceBadge.hidden = false;
+      els.sourceBadge.removeAttribute("hidden");
+    } else if (state.dataSource === "edge") {
+      els.sourceBadge.hidden = true;
+      els.sourceBadge.setAttribute("hidden", "");
+    } else {
+      els.sourceBadge.hidden = true;
+      els.sourceBadge.setAttribute("hidden", "");
     }
-    if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
-      return window.__TAURI_INTERNALS__.invoke("start_daemon", {});
+  }
+
+  function showLocalChrome() {
+    if (els.app) {
+      els.app.hidden = false;
+      els.app.removeAttribute("hidden");
     }
-    return Promise.reject(new Error("no tauri api"));
+    if (els.edgeHost) {
+      els.edgeHost.hidden = true;
+      els.edgeHost.setAttribute("hidden", "");
+    }
+    updateSourceBadge();
+  }
+
+  function showEdgeChrome() {
+    if (els.app) {
+      els.app.hidden = true;
+      els.app.setAttribute("hidden", "");
+    }
+    if (els.edgeHost) {
+      els.edgeHost.hidden = false;
+      els.edgeHost.removeAttribute("hidden");
+    }
+    updateSourceBadge();
+  }
+
+  function renderEdgeDoc(doc) {
+    if (!els.edgeFrame || !els.edgeFrame.contentWindow) return false;
+    var win = els.edgeFrame.contentWindow;
+    if (typeof win.overwatchRender !== "function") return false;
+    try {
+      win.overwatchRender(doc);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function ensureEdgeFrameReady() {
+    if (state.edgeFrameReady) return Promise.resolve();
+    if (!els.edgeFrame) return Promise.reject(new Error("no edge frame"));
+    return new Promise(function (resolve, reject) {
+      function onLoad() {
+        state.edgeFrameReady = true;
+        try {
+          if (els.edgeFrame.contentWindow) {
+            els.edgeFrame.contentWindow.__hosted = 1;
+          }
+        } catch (e) { /* cross-origin guard */ }
+        resolve();
+      }
+      if (els.edgeFrame.contentDocument && els.edgeFrame.contentDocument.readyState === "complete") {
+        onLoad();
+        return;
+      }
+      els.edgeFrame.addEventListener("load", onLoad, { once: true });
+      els.edgeFrame.addEventListener(
+        "error",
+        function () {
+          reject(new Error("edge frame load failed"));
+        },
+        { once: true }
+      );
+    });
+  }
+
+  async function fetchEdgeDashboard() {
+    return tauriInvoke("fetch_edge_dashboard");
+  }
+
+  async function tryEnterEdgeMode(doc) {
+    if (!hasTauriApi()) return false;
+    try {
+      var payload = doc != null ? doc : await fetchEdgeDashboard();
+      await ensureEdgeFrameReady();
+      if (!renderEdgeDoc(payload)) {
+        await sleep(50);
+        if (!renderEdgeDoc(payload)) return false;
+      }
+      state.dataSource = "edge";
+      state.localLoopsRunning = false;
+      setOffline(false);
+      showEdgeChrome();
+      edgePollLoop();
+      localProbeLoop();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function enterLocalMode() {
+    if (state.dataSource === "edge") {
+      state.localLoopsRunning = false;
+    }
+    state.dataSource = "local";
+    showLocalChrome();
+    setOffline(false);
+  }
+
+  async function edgePollLoop() {
+    while (state.dataSource === "edge") {
+      await sleep(STATUS_INTERVAL_MS);
+      if (state.dataSource !== "edge") return;
+      try {
+        var doc = await fetchEdgeDashboard();
+        renderEdgeDoc(doc);
+      } catch (e) {
+        /* keep last snapshot; overwatch STALE badge handles age */
+      }
+    }
+  }
+
+  async function localProbeLoop() {
+    while (state.dataSource === "edge") {
+      await sleep(15000);
+      if (state.dataSource !== "edge") return;
+      try {
+        await fetchJson(BASE + "/v1/health");
+        await initialLoad();
+        enterLocalMode();
+        if (!state.localLoopsRunning) {
+          state.localLoopsRunning = true;
+          waitLoop();
+          statusTickLoop();
+        }
+        return;
+      } catch (e) {
+        /* stay on fleet view */
+      }
+    }
+  }
+
+  async function offlineRecoveryLoop() {
+    while (state.dataSource !== "local") {
+      await sleep(state.backoff);
+      try {
+        await initialLoad();
+        enterLocalMode();
+        if (!state.localLoopsRunning) {
+          state.localLoopsRunning = true;
+          waitLoop();
+          statusTickLoop();
+        }
+        return;
+      } catch (e) {
+        /* still down */
+      }
+      if (state.dataSource !== "edge") {
+        var ok = await tryEnterEdgeMode();
+        if (ok) return;
+      }
+      state.backoff = Math.min(BACKOFF_MAX, state.backoff + 1000);
+    }
+  }
+
+  function startLocalLoops() {
+    if (state.localLoopsRunning) return;
+    state.localLoopsRunning = true;
+    waitLoop();
+    statusTickLoop();
   }
 
   function updateStartButton() {
@@ -1353,8 +1541,8 @@
       els.startBtn.setAttribute("hidden", "");
       return;
     }
-    // Show only when offline (banner visible)
-    if (state.offline) {
+    // Show only when offline on local path (not fleet fallback)
+    if (state.offline && state.dataSource !== "edge") {
       els.startBtn.hidden = false;
       els.startBtn.removeAttribute("hidden");
       els.startBtn.disabled = !!state.startBusy;
@@ -1376,6 +1564,8 @@
         await sleep(500);
         try {
           await initialLoad();
+          enterLocalMode();
+          if (!state.localLoopsRunning) startLocalLoops();
           if (!state.offline) break;
         } catch (e) { /* keep trying */ }
       }
@@ -1661,13 +1851,17 @@
       }
       await refreshStatus();
     } catch (e) {
+      if (state.dataSource === "local") {
+        var edgeOk = await tryEnterEdgeMode();
+        if (edgeOk) return;
+      }
       setOffline(true);
       renderAll();
     }
   }
 
   async function waitLoop() {
-    while (true) {
+    while (state.dataSource === "local") {
       try {
         var url =
           BASE +
@@ -1728,7 +1922,7 @@
   }
 
   async function statusTickLoop() {
-    while (true) {
+    while (state.dataSource === "local") {
       await sleep(STATUS_INTERVAL_MS);
       if (state.mock) continue;
       try {
@@ -1737,6 +1931,9 @@
       } catch (e) {
         setOffline(true);
         renderAll();
+        if (state.dataSource === "local") {
+          await tryEnterEdgeMode();
+        }
       }
     }
   }
@@ -1823,14 +2020,16 @@
 
     try {
       await initialLoad();
-      // If /v1/cli missing, leave state.cli null until it appears
+      enterLocalMode();
+      startLocalLoops();
     } catch (e) {
-      setOffline(true);
-      renderAll();
+      var edgeOk = await tryEnterEdgeMode();
+      if (!edgeOk) {
+        setOffline(true);
+        renderAll();
+        offlineRecoveryLoop();
+      }
     }
-
-    waitLoop();
-    statusTickLoop();
   }
 
   if (document.readyState === "loading") {

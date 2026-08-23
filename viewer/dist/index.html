@@ -7,10 +7,15 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <div id="edge-host" class="edge-host" hidden>
+    <div class="edge-source-bar"><span class="source-badge source-fleet">FLEET (halus)</span></div>
+    <iframe id="edge-frame" class="edge-frame" src="switchboard-web/index.html" title="Fleet dashboard"></iframe>
+  </div>
   <div id="app">
     <header class="header" id="header">
       <div class="header-left">
         <h1 class="brand">AGENT SWITCHBOARD</h1>
+        <span id="source-badge" class="source-badge" hidden>LOCAL</span>
       </div>
       <div class="header-center">
         <nav class="task-chips" id="task-chips" aria-label="Task filter"></nav>

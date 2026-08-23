@@ -1,0 +1,448 @@
+<title>Overwatch Switchboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+  /* Agent Switchboard viewer aesthetic \u2014 tokens verbatim from viewer/SPEC-UI.md */
+  :root{
+    --page:#0b0e12; --panel:#14181f; --slot:#1b212a; --slot-hi:#20272f;
+    --border:#262d38; --ink:#e8ecf2; --mut:#8b93a1; --dim:#4a5261;
+    --run:#35d07a; --wait:#e0a52e; --fail:#e5484d; --done:#4a5261;
+    --pill-border:#33506b; --pill-ink:#9cc6ea;
+    --mono:"SF Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
+    --r:9px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--page)}
+  body{
+    color:var(--ink); font-family:var(--mono); font-size:14px; line-height:1.35; letter-spacing:.1px;
+    -webkit-font-smoothing:antialiased; min-height:100vh;
+    padding-top:env(safe-area-inset-top);
+  }
+  .wrap{max-width:1180px; margin:0 auto; padding:16px 16px 92px;}
+
+  /* header */
+  .top{display:flex; align-items:center; justify-content:center; position:relative; margin:4px 0 14px}
+  .brand{font-weight:700; letter-spacing:3px; font-size:15px; text-align:center}
+  .snap{display:flex; align-items:center; justify-content:space-between; margin:0 2px 12px; font-size:12px}
+  .snaplab{color:var(--mut); letter-spacing:1.5px}
+  .live-badge{border:1px solid #24563b; color:var(--run); border-radius:6px; padding:2px 9px; font-size:11px; letter-spacing:1.5px; margin-left:9px}
+  .age{color:var(--mut); letter-spacing:.5px; display:flex; align-items:center; gap:7px}
+  .age .pip{width:8px;height:8px;border-radius:50%;background:var(--run);box-shadow:0 0 7px 1px rgba(53,208,122,.6)}
+
+  .chips{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:9px}
+  .chip{border:1px solid var(--border); background:#11151b; color:var(--mut); padding:5px 12px; border-radius:7px;
+        font-size:12px; letter-spacing:1px; cursor:pointer; user-select:none; font-family:inherit;
+        transition:background .15s ease,color .15s ease,border-color .15s ease}
+  .chip:hover{color:var(--ink); border-color:#33404e}
+  .chip.on{background:#1d232c; color:var(--ink); border-color:#3a4756}
+  .chip.ghost{opacity:.45; cursor:default}
+  .chip:focus-visible{outline:2px solid var(--pill-ink); outline-offset:2px}
+  .seg{display:flex; gap:6px; margin-bottom:12px}
+  .seg .chip{padding:5px 15px}
+
+  .counts{display:flex; gap:14px 18px; flex-wrap:wrap; align-items:center; margin:10px 0 2px; font-size:12.5px}
+  .cnt{color:var(--mut); letter-spacing:.6px; white-space:nowrap}
+  .cnt b{font-weight:700; margin-right:5px; font-variant-numeric:tabular-nums; color:var(--dim)}
+  .cnt.run b{color:var(--run)} .cnt.work b{color:var(--run)} .cnt.wait b{color:var(--wait)}
+  .cnt.quiet b{color:var(--wait)} .cnt.stall b{color:var(--fail)} .cnt.died b{color:var(--fail)} .cnt.fail b{color:var(--fail)}
+  .cnt.on b{}
+  .finished{color:var(--dim); letter-spacing:.4px}
+  .cli-chip{border:1px solid var(--border); background:#11151b; border-radius:7px; padding:4px 11px; color:var(--mut); font-size:12px; letter-spacing:.5px}
+  .cli-chip b{color:var(--ink)}
+
+  .cols{display:grid; grid-template-columns:1fr 232px; gap:16px; align-items:start; margin-top:14px}
+  .panel{background:var(--panel); border:1px solid var(--border); border-radius:13px; padding:14px 14px 16px;
+         box-shadow:inset 0 1px 0 rgba(255,255,255,.02); margin-bottom:14px}
+  .panel-hd{display:flex; align-items:center; justify-content:space-between; gap:10px; margin:2px 2px 12px; cursor:pointer}
+  .panel-hd .lt{display:flex; align-items:center; gap:9px}
+  .panel-hd .title{letter-spacing:2px; font-weight:700; font-size:13px}
+  .panel-hd .roll{color:var(--mut); font-size:12px; letter-spacing:.6px; font-variant-numeric:tabular-nums}
+  .panel-hd .roll .live{color:var(--run)}
+
+  .tri{width:0;height:0;border-left:6px solid var(--mut); border-top:4.5px solid transparent; border-bottom:4.5px solid transparent;
+       transition:transform .15s ease; flex:0 0 auto; cursor:pointer}
+  .tri.open{transform:rotate(90deg)}
+  .tri.hidden{visibility:hidden}
+
+  .host-lab{color:var(--mut); letter-spacing:2px; font-size:11.5px; font-weight:700; margin:15px 2px 8px; display:flex; align-items:baseline; gap:9px}
+  .host-lab .rm{color:var(--dim); font-weight:400; letter-spacing:.5px; font-size:11px}
+  .host-lab:first-child{margin-top:2px}
+  .host-empty{color:var(--dim); letter-spacing:.5px; font-size:12.5px; padding:2px 2px 4px 18px}
+
+  .node{position:relative}
+  .kids{position:relative; margin-left:26px}
+  .kids::before{content:""; position:absolute; left:0; top:-4px; bottom:14px; width:1px; background:var(--border)}
+  .row{display:flex; align-items:center; gap:10px; background:var(--slot); border:1px solid var(--border); border-radius:var(--r);
+       padding:9px 13px; margin:7px 0; position:relative;
+       box-shadow:inset 0 1px 0 rgba(255,255,255,.015), 0 1px 2px rgba(0,0,0,.25);
+       transition:background .12s ease, border-color .12s ease}
+  .kids > .node > .row{margin-left:14px}
+  .kids > .node > .row::before{content:""; position:absolute; left:-14px; width:14px; height:1px; background:var(--border); top:50%}
+  .row:hover{background:var(--slot-hi); border-color:#31404e}
+
+  .lamp{width:12px;height:12px;border-radius:50%; flex:0 0 auto}
+  .lamp.run,.lamp.work{background:radial-gradient(circle at 35% 32%, #7ff0b4, var(--run) 62%); box-shadow:0 0 8px 1px rgba(53,208,122,.5)}
+  .lamp.wait,.lamp.quiet{background:radial-gradient(circle at 35% 32%, #f6d688, var(--wait) 62%); box-shadow:0 0 8px 1px rgba(224,165,46,.5)}
+  .lamp.done{background:radial-gradient(circle at 35% 32%, #6a7484, var(--done) 64%)}
+  .lamp.fail{background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%); box-shadow:0 0 8px 1px rgba(229,72,77,.5)}
+  .lamp.stall{background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%); box-shadow:0 0 8px 1px rgba(229,72,77,.45)}
+  .lamp.died{background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%); animation:pulse 1.5s ease-in-out infinite}
+  .lamp.orphan{background:transparent; border:2px solid var(--wait)}
+  @keyframes pulse{0%,100%{box-shadow:0 0 5px 0 rgba(229,72,77,.35)}50%{box-shadow:0 0 12px 3px rgba(229,72,77,.75)}}
+  @media (prefers-reduced-motion:reduce){.lamp.died{animation:none}}
+
+  .name{font-weight:700; letter-spacing:.4px}
+  .pill{border:1px solid var(--border); color:var(--mut); border-radius:6px; padding:2px 8px; font-size:10.5px; letter-spacing:1.2px; white-space:nowrap}
+  .pill.mode{border-color:var(--pill-border); color:var(--pill-ink)}
+  .pill.model{background:#12161c; color:var(--mut); letter-spacing:.6px; font-size:11px}
+  .meta{color:var(--mut); font-size:12.5px; letter-spacing:.3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .meta .k{color:var(--dim)}
+  .up{margin-left:auto; color:var(--mut); font-size:12.5px; letter-spacing:.5px; white-space:nowrap; font-variant-numeric:tabular-nums; padding-left:8px}
+
+  /* task panels */
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:9px}
+  .cell{display:flex; align-items:center; gap:9px; background:var(--slot); border:1px solid var(--border); border-radius:8px; padding:9px 12px}
+  .cell:hover{background:var(--slot-hi)}
+  .cell .nm{font-weight:600; letter-spacing:.3px; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .cell .cage{margin-left:auto; color:var(--dim); font-size:11.5px; font-variant-numeric:tabular-nums; padding-left:6px}
+  .lamp.sm{width:9px;height:9px}
+  /* panel density rows */
+  .prow{display:flex; align-items:center; gap:12px; background:var(--slot); border:1px solid var(--border); border-radius:var(--r); padding:11px 14px; margin:7px 0}
+  .prow .lamp{width:16px;height:16px}
+  .prow .nm{font-weight:700; font-size:15px; letter-spacing:.3px}
+  .prow .pm{color:var(--mut); font-size:12px; letter-spacing:.3px}
+  .prow .pm .k{color:var(--dim)}
+  .prow .pup{margin-left:auto; text-align:right; color:var(--mut); font-size:12px; font-variant-numeric:tabular-nums}
+
+  /* right rail */
+  .rail{display:flex; flex-direction:column; gap:10px; position:sticky; top:14px}
+  .tile{background:var(--panel); border:1px solid var(--border); border-radius:11px; padding:12px 14px}
+  .tile .lb{color:var(--mut); font-size:10.5px; letter-spacing:1.6px}
+  .tile .num{font-size:30px; font-weight:700; margin-top:5px; line-height:1; font-variant-numeric:tabular-nums; color:var(--dim)}
+  .tile.run .num{color:var(--run)}
+  .tile.hot{border-color:#4a2327}
+  .tile.hot .num{color:var(--fail)}
+
+  .ticker{position:fixed; left:0; right:0; bottom:0; background:#0a0d11; border-top:1px solid var(--border);
+          padding:9px 16px calc(9px + env(safe-area-inset-bottom)); font-size:12px; color:var(--mut); letter-spacing:.4px;
+          white-space:nowrap; overflow:hidden; text-overflow:ellipsis; z-index:5}
+  .ticker.empty{display:none}
+  .ticker .ts{color:var(--dim); font-variant-numeric:tabular-nums}
+  .ticker .sep{color:var(--dim); margin:0 10px}
+  .ticker .to.run,.ticker .to.work{color:var(--run)} .ticker .to.done{color:var(--done)} .ticker .to.fail,.ticker .to.died{color:var(--fail)}
+
+  .idle{color:var(--dim); text-align:center; padding:60px 20px; letter-spacing:.5px; font-size:13px}
+  .collapsed{display:none}
+
+  @media (max-width:760px){
+    .cols{grid-template-columns:1fr}
+    .rail{flex-direction:row; overflow-x:auto; position:static; padding-bottom:2px}
+    .tile{min-width:116px; flex:0 0 auto}
+    .meta{max-width:42vw}
+  }
+</style>
+
+<div class="wrap">
+  <div class="top"><div class="brand">AGENT&nbsp;SWITCHBOARD</div></div>
+  <div class="snap">
+    <span><span class="snaplab">SNAPSHOT</span><span class="live-badge" id="livebadge">LIVE</span></span>
+    <span class="age" id="age"></span>
+  </div>
+
+  <div class="chips" id="hostchips"></div>
+  <div class="seg" id="density">
+    <span class="chip" data-d="auto" tabindex="0">AUTO</span>
+    <span class="chip" data-d="panel" tabindex="0">PANEL</span>
+    <span class="chip on" data-d="grid" tabindex="0">GRID</span>
+  </div>
+  <div class="counts" id="counts"></div>
+
+  <div class="cols">
+    <div class="main">
+      <section class="panel" id="clipanel">
+        <div class="panel-hd" data-collapse="cli">
+          <div class="lt"><span class="tri open"></span><span class="title">CLI SESSIONS</span></div>
+          <div class="roll" id="cliroll"></div>
+        </div>
+        <div class="body" id="clibody"></div>
+      </section>
+      <div id="taskpanels"></div>
+      <div class="idle" id="idle" style="display:none">waiting for fleet snapshot&#8230;</div>
+    </div>
+    <aside class="rail" id="rail"></aside>
+  </div>
+</div>
+<div class="ticker empty" id="ticker"></div>
+
+<script>
+"use strict";
+/* ============================================================================
+   Overwatch Switchboard frontend \u2014 SPEC-UI.md aesthetic, WKWebView data contract.
+   Render entry point: window.overwatchRender(doc)
+     doc = published Overwatch dashboard shape:
+       { generated_at, summary?:{running,working_tool,...}, events?:[[ts,lane,from,to]],
+         hosts:[ { id,label,online,roaming,stale_s,
+                   cli:{claude,grok,cursor}, cli_sessions:[{kind,channel}],
+                   cli_tree:[{kind,role,model,mode,channel,uptime_s,children:[...]}],
+                   tasks:[{ id, slots:[{lane,state,age_s,activity_s,exit_code,role,model,mode,channel}] }] } ] }
+   Standalone preview: ?mock=1 renders MOCK. No network is ever performed.
+   ========================================================================== */
+
+const STATE_CLASS = {RUNNING:'run',WORKING_TOOL:'work',WAITING_INPUT:'wait',QUIET:'quiet',
+                     STALLED:'stall',DIED:'died',FAILED:'fail',DONE:'done',ORPHAN:'orphan',CORRUPT:'fail'};
+const COUNT_ORDER = [['run','RUNNING'],['work','WORKING_TOOL'],['wait','WAITING_INPUT'],['quiet','QUIET'],
+                     ['stall','STALLED'],['died','DIED'],['fail','FAILED'],['done','DONE']];
+const HOST_ORDER = ['mbp','mini','pc','cnc'];
+
+let DOC = null, activeHost = 'all';
+let density = lsGet('ow_density','grid');
+
+function lsGet(k,d){ try{ const v=localStorage.getItem(k); return v==null?d:v; }catch(e){ return d; } }
+function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function fmtDur(sec){
+  if(sec==null||isNaN(sec)) return '\u2014';
+  sec=Math.max(0,Math.floor(sec)); const h=Math.floor(sec/3600), m=Math.floor(sec%3600/60), s=sec%60;
+  if(h>0) return h+'h '+String(m).padStart(2,'0')+'m';
+  if(m>0) return m+'m '+String(s).padStart(2,'0')+'s';
+  return s+'s';
+}
+function agoStr(iso){
+  if(!iso) return '';
+  const t=Date.parse(iso); if(isNaN(t)) return '';
+  const s=Math.max(0,Math.round((Date.now()-t)/1000));
+  return s<90 ? s+'s ago' : Math.round(s/60)+'m ago';
+}
+const stClass = st => STATE_CLASS[String(st||'').toUpperCase()] || 'done';
+const hasLamp = kind => kind!=='team-dispatch' && kind!=='team_dispatch';
+
+/* ---- aggregate slot states across the (filtered) fleet ---- */
+function slotStates(){
+  const c={run:0,work:0,wait:0,quiet:0,stall:0,died:0,fail:0,done:0};
+  hosts().forEach(h=>(h.tasks||[]).forEach(t=>(t.slots||[]).forEach(sl=>{
+    const k=stClass(sl.state); if(c[k]!=null) c[k]++;
+  })));
+  return c;
+}
+function cliKindCounts(){
+  const c={claude:0,grok:0,cursor:0,live:0};
+  hosts().forEach(h=>{
+    if(h.cli){ c.claude+=h.cli.claude||0; c.grok+=h.cli.grok||0; c.cursor+=h.cli.cursor||0; }
+    (function walk(ns){(ns||[]).forEach(n=>{ if(hasLamp(n.kind)) c.live++; walk(n.children); });})(h.cli_tree);
+  });
+  return c;
+}
+function hosts(){
+  const hs=(DOC&&DOC.hosts)||[];
+  const ordered=[...hs].sort((a,b)=>HOST_ORDER.indexOf(a.id)-HOST_ORDER.indexOf(b.id));
+  return activeHost==='all' ? ordered : ordered.filter(h=>h.id===activeHost);
+}
+
+/* ---- CLI spawn-tree node (patch-panel box) ---- */
+function nodeHTML(n){
+  const kids = (n.children&&n.children.length) ? n.children : null;
+  const isDisp = !hasLamp(n.kind);
+  const tri = kids ? '<span class="tri open" data-node></span>' : '<span class="tri hidden"></span>';
+  const lamp = isDisp ? '' : '<span class="lamp run"></span>';
+  const nm = isDisp
+    ? '<span class="name">team-dispatch</span>'+(n.channel||n.lane?' <span class="meta">'+esc(n.channel||n.lane)+'</span>':'')
+    : '<span class="name">'+esc(n.kind)+'</span>';
+  const mode = (!isDisp&&n.mode) ? '<span class="pill mode">'+esc(String(n.mode).toUpperCase())+'</span>' : '';
+  const model = (!isDisp&&n.model) ? '<span class="pill model">'+esc(n.model)+'</span>' : '';
+  const chan = (!isDisp&&n.channel) ? '<span class="meta"><span class="k">channel</span> '+esc(n.channel)+'</span>' : '';
+  const tip = [n.kind,n.model,n.mode,n.channel].filter(Boolean).join(' \u00b7 ')+' \u00b7 UP '+fmtDur(n.uptime_s);
+  const row = '<div class="row" title="'+esc(tip)+'">'+tri+lamp+nm+mode+model+chan+'<span class="up">UP '+fmtDur(n.uptime_s)+'</span></div>';
+  const children = kids ? '<div class="kids">'+kids.map(c=>'<div class="node">'+nodeHTML(c)+'</div>').join('')+'</div>' : '';
+  return row+children;
+}
+
+function renderCLI(){
+  let html='';
+  hosts().forEach(h=>{
+    html+='<div class="host-lab">'+esc((h.label||h.id).toUpperCase())+(h.roaming?' <span class="rm">\u00b7 roaming '+esc(h.roaming)+'s</span>':'')+'</div>';
+    const tree=h.cli_tree||[];
+    if(!tree.length){ html+='<div class="host-empty">no CLI sessions</div>'; return; }
+    html+=tree.map(n=>'<div class="node">'+nodeHTML(n)+'</div>').join('');
+  });
+  document.getElementById('clibody').innerHTML=html;
+  const k=cliKindCounts();
+  const parts=[]; if(k.claude)parts.push('CLAUDE '+k.claude); if(k.grok)parts.push('GROK '+k.grok); if(k.cursor)parts.push('CURSOR '+k.cursor);
+  document.getElementById('cliroll').innerHTML=parts.join(' <span style="color:var(--dim)">\u00b7</span> ')+
+    (parts.length?' <span style="color:var(--dim)">\u00b7</span> ':'')+'<span class="live">'+k.live+' live</span>';
+}
+
+function renderTasks(){
+  let html='';
+  hosts().forEach(h=>{
+    (h.tasks||[]).forEach(t=>{
+      const slots=t.slots||[]; const cnt={};
+      slots.forEach(s=>{ const k=String(s.state||'').toUpperCase(); cnt[k]=(cnt[k]||0)+1; });
+      const roll=Object.entries(cnt).map(([s,n])=>n+' '+s).join(' \u00b7 ');
+      const usePanel = density==='panel' || (density==='auto' && slots.length<=15);
+      let inner;
+      if(usePanel){
+        inner=slots.map(s=>{
+          const cl=stClass(s.state);
+          const bits=[];
+          if(s.activity_s!=null) bits.push('<span class="k">activity</span> '+fmtDur(s.activity_s)+' ago');
+          if(s.exit_code!=null) bits.push('<span class="k">EXIT</span> '+esc(s.exit_code));
+          if(s.channel) bits.push(esc(s.channel));
+          return '<div class="prow"><span class="lamp '+cl+'"></span><span class="nm">'+esc(s.lane)+'</span>'+
+                 '<span class="pm">'+bits.join(' &nbsp; ')+'</span><span class="pup">UP '+fmtDur(s.age_s)+'</span></div>';
+        }).join('');
+      } else {
+        inner='<div class="grid">'+slots.map(s=>{
+          const cl=stClass(s.state);
+          const tip=esc(s.lane)+' \u00b7 '+String(s.state||'').toUpperCase()+' \u00b7 '+fmtDur(s.age_s)+(s.channel?' \u00b7 '+esc(s.channel):'');
+          return '<div class="cell" title="'+tip+'"><span class="lamp sm '+cl+'"></span><span class="nm">'+esc(s.lane)+'</span><span class="cage">'+fmtDur(s.age_s)+'</span></div>';
+        }).join('')+'</div>';
+      }
+      const hostName=(h.label||h.id); const cap=hostName.charAt(0).toUpperCase()+hostName.slice(1);
+      html+='<section class="panel"><div class="panel-hd" data-collapse="task-'+esc(h.id)+'-'+esc(t.id)+'">'+
+            '<div class="lt"><span class="tri open"></span><span class="title" style="letter-spacing:1px">'+esc(cap)+
+            ' <span style="color:var(--dim)">&rsaquo;</span> '+esc(t.id)+'</span></div><div class="roll">'+esc(roll)+'</div></div>'+
+            '<div class="body">'+inner+'</div></section>';
+    });
+  });
+  document.getElementById('taskpanels').innerHTML=html;
+}
+
+function renderCounts(){
+  const c=(DOC&&DOC.summary)?normSummary(DOC.summary):slotStates();
+  const k=cliKindCounts();
+  let html=COUNT_ORDER.map(([s,l])=>'<span class="cnt '+s+(c[s]?' on':' zero')+'"><b>'+c[s]+'</b>'+l+'</span>').join('');
+  html+='<span class="cli-chip">CLI: claude <b>'+k.claude+'</b></span>';
+  if(k.grok) html+='<span class="cli-chip">grok <b>'+k.grok+'</b></span>';
+  if(k.cursor) html+='<span class="cli-chip">cursor <b>'+k.cursor+'</b></span>';
+  document.getElementById('counts').innerHTML=html;
+}
+function normSummary(s){
+  return {run:s.running||0,work:s.working_tool||0,wait:s.waiting_input||0,quiet:s.quiet||0,
+          stall:s.stalled||0,died:s.died||0,fail:s.failed||0,done:s.done||0};
+}
+function renderRail(){
+  const c=(DOC&&DOC.summary)?normSummary(DOC.summary):slotStates();
+  document.getElementById('rail').innerHTML=COUNT_ORDER.map(([s,l])=>{
+    const hot=(s==='died'||s==='fail'||s==='stall')&&c[s]>0;
+    return '<div class="tile '+(s==='run'?'run':'')+' '+(hot?'hot':'')+'"><div class="lb">'+l+'</div><div class="num">'+c[s]+'</div></div>';
+  }).join('');
+}
+function renderChips(){
+  const present=new Set(((DOC&&DOC.hosts)||[]).map(h=>h.id));
+  const labels={mbp:'MACBOOK',mini:'MAC MINI',pc:'SHOP PC',cnc:'CNC NODE'};
+  let html='<span class="chip '+(activeHost==='all'?'on':'')+'" data-host="all" tabindex="0">ALL HOSTS</span>';
+  HOST_ORDER.forEach(id=>{
+    const h=((DOC&&DOC.hosts)||[]).find(x=>x.id===id);
+    const ghost=!h||h.online===false;
+    html+='<span class="chip '+(activeHost===id?'on':'')+(ghost?' ghost':'')+'" data-host="'+id+'" tabindex="'+(ghost?-1:0)+'">'+(labels[id]||id.toUpperCase())+'</span>';
+  });
+  document.getElementById('hostchips').innerHTML=html;
+}
+function renderTicker(){
+  const ev=(DOC&&DOC.events)||[];
+  const t=document.getElementById('ticker');
+  if(!ev.length){ t.className='ticker empty'; t.innerHTML=''; return; }
+  t.className='ticker';
+  t.innerHTML=ev.map(e=>'<span class="ts">'+esc(e[0])+'</span> '+esc(e[1])+' <span class="to '+stClass(e[2])+'">'+String(e[2]).toUpperCase()+
+    '</span><span style="color:var(--dim)">&rarr;</span><span class="to '+stClass(e[3])+'">'+String(e[3]).toUpperCase()+'</span>').join('<span class="sep">&middot;</span>');
+}
+function renderAge(){
+  const a=DOC?agoStr(DOC.generated_at):'';
+  const stale=DOC&&DOC.generated_at&&(Date.now()-Date.parse(DOC.generated_at))>120000;
+  document.getElementById('livebadge').textContent = stale?'STALE':'LIVE';
+  document.getElementById('livebadge').style.borderColor = stale?'#4a2327':'#24563b';
+  document.getElementById('livebadge').style.color = stale?'var(--fail)':'var(--run)';
+  document.getElementById('age').innerHTML = a?('<span class="pip"></span>'+esc(a)):'';
+}
+
+function applyCollapseState(){
+  document.querySelectorAll('.panel-hd[data-collapse]').forEach(hd=>{
+    const key='ow_col_'+hd.getAttribute('data-collapse');
+    const col=lsGet(key,'')==='1';
+    const body=hd.parentElement.querySelector('.body'), tri=hd.querySelector('.tri');
+    if(body){ body.classList.toggle('collapsed',col); tri.classList.toggle('open',!col); }
+  });
+}
+
+function renderAll(){
+  if(!DOC){ document.getElementById('idle').style.display='block'; document.getElementById('clipanel').style.display='none'; return; }
+  document.getElementById('idle').style.display='none';
+  document.getElementById('clipanel').style.display='';
+  renderChips(); renderCounts(); renderCLI(); renderTasks(); renderRail(); renderTicker(); renderAge();
+  applyCollapseState();
+}
+
+/* ---- public entry point (native app calls this on load + each refresh) ---- */
+window.overwatchRender = function(doc){ DOC = doc||null; try{ renderAll(); }catch(e){ /* never throw into the host */ } };
+
+/* ---- interactions ---- */
+document.addEventListener('click', e=>{
+  const node=e.target.closest('.tri[data-node]');
+  if(node){ e.stopPropagation(); const kids=node.closest('.row').nextElementSibling;
+    if(kids&&kids.classList.contains('kids')){ kids.classList.toggle('collapsed'); node.classList.toggle('open'); } return; }
+  const hd=e.target.closest('.panel-hd[data-collapse]');
+  if(hd){ const body=hd.parentElement.querySelector('.body'), tri=hd.querySelector('.tri');
+    const key='ow_col_'+hd.getAttribute('data-collapse'); const now=!body.classList.contains('collapsed');
+    body.classList.toggle('collapsed',now); tri.classList.toggle('open',!now); lsSet(key,now?'1':'0'); return; }
+  const hc=e.target.closest('#hostchips .chip'); if(hc&&!hc.classList.contains('ghost')){ activeHost=hc.dataset.host; renderChips(); renderCLI(); renderTasks(); renderCounts(); renderRail(); return; }
+  const dc=e.target.closest('#density .chip'); if(dc){ density=dc.dataset.d; lsSet('ow_density',density);
+    document.querySelectorAll('#density .chip').forEach(x=>x.classList.toggle('on',x===dc)); renderTasks(); return; }
+});
+document.addEventListener('keydown', e=>{ if((e.key==='Enter'||e.key===' ')&&e.target.classList&&e.target.classList.contains('chip')){ e.preventDefault(); e.target.click(); } });
+
+/* density chip reflects persisted default */
+document.querySelectorAll('#density .chip').forEach(x=>x.classList.toggle('on',x.dataset.d===density));
+
+/* ---- refresh ages every 20s (no network) ---- */
+setInterval(()=>{ if(DOC) renderAge(); }, 20000);
+
+/* ============================ MOCK (preview / ?mock=1) ============================ */
+function mockDoc(){
+  return {
+    generated_at: new Date(Date.now()-8000).toISOString(),
+    events: [['00:52:14','cli-tree-hub','WORKING_TOOL','RUNNING'],['00:51:58','audit-egress','RUNNING','WORKING_TOOL'],
+             ['00:50:41','spike-nesting','RUNNING','QUIET'],['00:49:03','cli-tree-ios','RUNNING','DONE'],['00:47:30','named-agents','WORKING_TOOL','DONE']],
+    hosts: [
+      { id:'mbp', label:'MacBook', online:true, roaming:181, cli:{claude:2,grok:2,cursor:2},
+        cli_tree:[
+          { kind:'claude', model:'claude-opus-5', mode:'interactive', channel:'ttys001', uptime_s:301500, children:[
+            { kind:'team-dispatch', channel:'aidash/cli-tree-hub', uptime_s:1344, children:[
+              { kind:'grok', model:'grok-4.6', mode:'headless', channel:'aidash-cli-tree-hub', uptime_s:1344, children:[] } ]},
+            { kind:'team-dispatch', channel:'aidash/audit-egress', uptime_s:400, children:[
+              { kind:'cursor', model:'composer-2.5', mode:'headless', channel:'aidash-audit-egress', uptime_s:400, children:[
+                { kind:'cursor', model:'composer-2.5', mode:'headless', channel:'aidash-audit-egress', uptime_s:399, children:[] } ]} ]},
+            { kind:'team-dispatch', channel:'aidash/spike-nesting', uptime_s:128, children:[
+              { kind:'grok', model:'grok-4.6', mode:'headless', channel:'aidash-spike-nesting', uptime_s:128, children:[] } ]} ]},
+          { kind:'cursor', model:'composer-2.5', mode:'headless', uptime_s:52560, children:[] },
+          { kind:'claude', model:'claude-opus-4-8', mode:'interactive', channel:'ttys000', uptime_s:236580, children:[] }
+        ],
+        tasks:[ { id:'aidash', slots:[
+          {lane:'cli-tree-hub', state:'RUNNING', age_s:1344, activity_s:3, exit_code:null, channel:'aidash-cli-tree-hub'},
+          {lane:'audit-egress', state:'WORKING_TOOL', age_s:400, activity_s:2, exit_code:null, channel:'aidash-audit-egress'},
+          {lane:'spike-nesting', state:'QUIET', age_s:128, activity_s:74, exit_code:null, channel:'aidash-spike-nesting'},
+          {lane:'stall-probe', state:'STALLED', age_s:640, activity_s:410, exit_code:null, channel:'aidash-stall-probe'},
+          {lane:'cli-tree-ios', state:'DONE', age_s:1227, activity_s:null, exit_code:0, channel:'aidash-cli-tree-ios'},
+          {lane:'named-agents', state:'DONE', age_s:1872, activity_s:null, exit_code:0, channel:'aidash-named-agents'},
+          {lane:'regauth-gate', state:'FAILED', age_s:2400, activity_s:null, exit_code:1, channel:'aidash-regauth-gate'}
+        ] } ]
+      },
+      { id:'mini', label:'Mac mini', online:true, cli:{claude:1,grok:0,cursor:0},
+        cli_tree:[ { kind:'claude', model:'fable', mode:'interactive', channel:'ttys000', uptime_s:125280, children:[] } ], tasks:[] },
+      { id:'pc', label:'Shop PC', online:true, cli:{claude:1,grok:0,cursor:0},
+        cli_tree:[ { kind:'claude', model:'fable', mode:'interactive', channel:'ttys002', uptime_s:210120, children:[] } ], tasks:[] },
+      { id:'cnc', label:'CNC Node', online:false, cli:{claude:0,grok:0,cursor:0}, cli_tree:[], tasks:[] }
+    ]
+  };
+}
+
+/* boot: never self-fetch.
+   - ?mock=1  -> render mock immediately.
+   - embedded -> native host calls overwatchRender(doc); set window.__hosted=1 (before load
+                or immediately) to suppress the preview fallback so no mock flash appears.
+   - bare preview link -> idle now, then fall back to mock after ~1.2s if nothing arrived. */
+(function boot(){
+  if(/[?&]mock=1\b/.test(location.search)){ window.overwatchRender(mockDoc()); return; }
+  renderAll(); // idle until the host calls overwatchRender
+  setTimeout(()=>{ if(!DOC && !window.__hosted) window.overwatchRender(mockDoc()); }, 1200);
+})();
+</script>
