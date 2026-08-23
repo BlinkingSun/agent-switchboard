@@ -2049,6 +2049,7 @@ try:
     json.dump({
         "subagent_id": "sub-can", "parent_session_id": sid,
         "status": "cancelled", "started_at": "2026-08-18T02:45:07Z",
+        "completed_at": sb._iso_z(NOW),
         "description": "cancelled-sub",
     }, open(os.path.join(subp, "meta.json"), "w"))
     pcan = payload_for({1: rec(1, 0, "??", "/sbin/launchd")}, 20.0, NOW)
@@ -2260,6 +2261,55 @@ try:
         sb.read_json = real_rj
     print("PASS_UNIT T52l terminal grok-sub memo reads meta once")
 
+    # T52m: posthoc flood-guard — months-old completed session dir is
+    # ledgered with its meta end ts and NEVER served; a fresh one IS
+    # served then expires. (ports 17950-17954)
+    reset_ledger(tmp)
+    sess_m = os.path.join(tmp, "gs-t52m")
+    sb.GROK_SESS_ROOT = sess_m
+    os.environ["AGENT_SWITCHBOARD_DONE_EXPIRE"] = "900"
+    cwd_m = "/tmp/lane-t52m"
+    enc_m = __import__("urllib.parse").parse.quote(cwd_m, safe="")
+    sid_old = "019ff000-0000-0000-0000-000000t52mo"
+    sid_fresh = "019ff000-0000-0000-0000-000000t52mf"
+    old_iso = "2023-01-01T00:00:00Z"
+    fresh_iso = sb._iso_z(NOW - 5)
+    for sid, sub, completed in (
+        (sid_old, "sub-old", old_iso),
+        (sid_fresh, "sub-fresh", fresh_iso),
+    ):
+        pth = os.path.join(sess_m, enc_m, sid, "subagents", sub)
+        os.makedirs(pth)
+        json.dump({
+            "subagent_id": sub, "parent_session_id": sid,
+            "status": "completed", "started_at": completed,
+            "completed_at": completed, "description": sub,
+        }, open(os.path.join(pth, "meta.json"), "w"))
+    id_old = "gs:%s:sub-old" % sid_old
+    id_fresh = "gs:%s:sub-fresh" % sid_fresh
+    dummy_m = {1: rec(1, 0, "??", "/sbin/launchd", cpu_s=0.0)}
+    p_m = payload_for(dummy_m, 60.0, NOW)
+    rows = ledger_rows(tmp)
+    en_old = [r for r in rows if r.get("ev") == "end" and r.get("id") == id_old]
+    en_fresh = [r for r in rows if r.get("ev") == "end" and r.get("id") == id_fresh]
+    assert_true(len(en_old) == 1 and en_old[0]["ended_source"] == "meta",
+                "months-old completed grok-sub is ledgered")
+    assert_true(en_old[0]["ts"] == old_iso,
+                "old end ts is meta completed_at, not observation time")
+    assert_true(len(en_fresh) == 1 and en_fresh[0]["ts"] == fresh_iso,
+                "fresh completed grok-sub ledgered with its own end ts")
+    served_old = find(p_m["roots"], lambda n: n.get("id") == id_old)
+    served_fresh = find(p_m["roots"], lambda n: n.get("id") == id_fresh)
+    assert_true(served_old is None, "months-old completed grok-sub NOT served")
+    assert_true(served_fresh is not None and served_fresh.get("status") == "completed",
+                "fresh completed grok-sub IS served")
+    os.environ["AGENT_SWITCHBOARD_DONE_EXPIRE"] = "1"
+    p_exp = payload_for(dummy_m, 62.0, NOW + 7)
+    omitted_fresh = find(p_exp["roots"], lambda n: n.get("id") == id_fresh)
+    assert_true(omitted_fresh is None, "fresh omitted after expiry")
+    os.environ["AGENT_SWITCHBOARD_DONE_EXPIRE"] = "900"
+    print("PASS_UNIT T52m flood-guard keys posthoc retention on meta end ts")
+
     print("ALL_T52_OK")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
@@ -2275,6 +2325,7 @@ if [ $? -eq 0 ]; then
   ck ok ok "T52h agents CLI --since/--live/--json + counts line"
   ck ok ok "T52k seeded DONE clamped to completed, never OOV"
   ck ok ok "T52l terminal grok-sub memo reads meta once"
+  ck ok ok "T52m months-old posthoc grok-sub ledgered not served; fresh served then expires"
 else
   ck fail ok "T52 agent ledger unit block"
 fi

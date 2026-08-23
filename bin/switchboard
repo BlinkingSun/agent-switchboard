@@ -2138,7 +2138,17 @@ def _ledger_orphan_grok_subs(forest, now):
                 _write_start(fake, {}, parents, observed, now)
             if terminal:
                 mapped = _virtual_cli_status(raw_status)
-                _write_end(nid, mapped, "meta", now)
+                # Posthoc seed: retention keys on the session's OWN end
+                # (meta.json completed_at/ended_at), never observation time.
+                # Missing end ts => older-than-window: ledgered, never served.
+                end_ts = now
+                if observed == "posthoc":
+                    end_ts = _parse_iso_ts(
+                        m.get("completed_at") or m.get("ended_at")
+                    )
+                    if end_ts is None:
+                        end_ts = 0.0
+                _write_end(nid, mapped, "meta", end_ts)
                 _LEDGER_GROK_META_MEMO.add(key)
                 _LEDGER_GROK_META_MEMO.add((sid, sub_dir))
         except Exception:
