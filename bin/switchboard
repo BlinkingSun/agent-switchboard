@@ -140,6 +140,15 @@ COLD_AFTER = float(os.environ.get("AGENT_SWITCHBOARD_COLD_AFTER", 86400))
 DONE_EXPIRE_S = float(os.environ.get("AGENT_SWITCHBOARD_DONE_EXPIRE", 900))
 BUS_MAXLEN = int(os.environ.get("AGENT_SWITCHBOARD_BUS_MAXLEN", 2000))
 CLI_CACHE_TTL = float(os.environ.get("AGENT_SWITCHBOARD_CLI_CACHE_TTL", 5.0))
+ARTIFACT_ACTIVE_WINDOW = float(
+    os.environ.get("AGENT_SWITCHBOARD_ACTIVITY_WINDOW", 30.0)
+)
+_ARTIFACT_STAT_CAP = 512
+_ARTIFACT_LISTDIR_INTERVAL = 60.0
+_ARTIFACT_CWD_CAP = 4
+_ARTIFACT_CWD_RETRY_MAX = 5
+_ARTIFACT_CWD_RETRY_INTERVAL = 30.0
+GROK_ARTIFACT_FILES = ("chat_history.jsonl", "updates.jsonl", "summary.json")
 
 # ---- Lifecycle env knobs ----
 # Idle self-exit: busy = cli_busy() OR viewer_running() OR any ACTIVE slot,
@@ -278,6 +287,16 @@ _CLI_CACHE_LOCK = threading.Lock()
 # CPU-delta history for per-node status. Key (pid, lstart); lstart defeats
 # pid reuse. Guarded by _CLI_CACHE_LOCK. Written only on a real sweep.
 _CPU_PREV = {}
+# Artifact-growth history for per-node status. Sibling to _CPU_PREV — same key
+# (pid, lstart), same lock, evicted in the same pass. Written only on a real
+# artifact sample (not when the node is already active or carry-forward skips).
+_ART_PREV = {}
+# _proc_cwd throttle memo (R6.4); cleared/evicted with _ART_PREV.
+_CWD_RESOLVE_MEMO = {}
+# Per-sweep test hooks (reset at the start of each _attach_cli_status call).
+_ART_SWEEP_STAT_COUNT = 0
+_ART_SWEEP_LISTDIR_COUNT = 0
+_ART_SWEEP_PROC_CWD_COUNT = 0
 _MODEL_DEFAULTS = {"claude": None, "grok": None, "cursor": None, "loaded_at": 0.0}
 
 
@@ -712,7 +731,11 @@ def _parse_wrapper_flags(command, kind):
                 meta["model"] = toks[j + 1]
                 break
         for j, t in enumerate(toks):
-            if t in ("--workspace", "-d", "--cwd") and j + 1 < len(toks) and toks[j + 1][:1] in "/~":
+            if t in ("-c", "--channel") and j + 1 < len(toks):
+                meta["channel"] = toks[j + 1]
+            elif t.startswith("--channel="):
+                meta["channel"] = t.split("=", 1)[1]
+            elif t in ("--workspace", "-d", "--cwd") and j + 1 < len(toks) and toks[j + 1][:1] in "/~":
                 meta["cwd_arg"] = toks[j + 1]
             elif t.startswith("--workspace=") and t.split("=", 1)[1][:1] in "/~":
                 meta["cwd_arg"] = t.split("=", 1)[1]
@@ -749,6 +772,13 @@ def _parse_wrapper_flags(command, kind):
             if t in ("-p", "--print"):
                 meta["headless_flag"] = True
                 break
+        for j, t in enumerate(toks):
+            if t in ("-d", "--cwd", "--workspace") and j + 1 < len(toks) and toks[j + 1][:1] in "/~":
+                meta["cwd_arg"] = toks[j + 1]
+            elif t.startswith("--cwd=") and t.split("=", 1)[1][:1] in "/~":
+                meta["cwd_arg"] = t.split("=", 1)[1]
+            elif t.startswith("--workspace=") and t.split("=", 1)[1][:1] in "/~":
+                meta["cwd_arg"] = t.split("=", 1)[1]
         # --model is NOT early: `claude -p <prompt> ... --model sonnet` puts it
         # after a prompt that ps splits into hundreds of tokens. Scan from the
         # END so the real flag wins over any lookalike inside the prompt text
@@ -1328,6 +1358,8 @@ def build_cli_forest(snap, now=None):
                     model = tm.get("model")
             if not model and channel:
                 model = cursor_channel_model(channel)
+            if not channel:
+                channel = meta.get("channel")
             label = channel
         elif ikind == "claude_cli":
             if mode == "headless" or meta.get("headless_flag"):
@@ -1532,8 +1564,9 @@ def get_cli_payload(boot_id=None, force=False, now=None, mono=None):
 
     Per-node `status` is computed on a cache miss (after build_cli_forest,
     which stays pure) and stored with the forest. A TTL hit never resamples
-    CPU and never touches _CPU_PREV — it serves the status computed with
-    that cached structure, which may therefore be up to CLI_CACHE_TTL (5s)
+    CPU, never touches _CPU_PREV / _ART_PREV, and performs zero artifact
+    stats — it serves the status computed with that cached structure, which
+    may therefore be up to CLI_CACHE_TTL (5s) + ARTIFACT_ACTIVE_WINDOW (30s)
     stale. Ended CLI/ledger nodes are merged in before the cache store and
     omitted once _done_expire() past their end ts.
     """
@@ -1597,8 +1630,8 @@ def get_cli_payload(boot_id=None, force=False, now=None, mono=None):
 def reset_cli_cache():
     """Test helper: clear /v1/cli TTL cache, sweep counter, and CPU history.
 
-    Clearing _CPU_PREV means no history exists — the next sweep is a first
-    observation for every node.
+    Clearing _CPU_PREV / _ART_PREV means no history exists — the next sweep is
+    a first observation for every node.
     """
     with _CLI_CACHE_LOCK:
         _CLI_CACHE["payload"] = None
@@ -1606,6 +1639,8 @@ def reset_cli_cache():
         _CLI_CACHE["sweep_ms"] = 0.0
         _CLI_CACHE["sweep_count"] = 0
         _CPU_PREV.clear()
+        _ART_PREV.clear()
+        _CWD_RESOLVE_MEMO.clear()
 
 
 def _iso_z(t=None):
@@ -1669,6 +1704,84 @@ def _first_obs_status(node):
     return "running"
 
 
+def _artifact_active_window():
+    raw = os.environ.get("AGENT_SWITCHBOARD_ACTIVITY_WINDOW")
+    if raw is not None and raw != "":
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return ARTIFACT_ACTIVE_WINDOW
+
+
+def _artifact_eval_active(prev_art, mtime, size, now_wall, mono):
+    """Artifact-active per R4: recency OR growth since prev sample."""
+    if mtime is None:
+        return False
+    window = _artifact_active_window()
+    recency = (now_wall - mtime) <= window
+    if prev_art is None:
+        return recency
+    gap = float(mono) - float(prev_art.get("mono", 0))
+    if gap > 120.0:
+        return recency
+    prev_mtime = prev_art.get("mtime")
+    prev_size = prev_art.get("size")
+    grew = (prev_mtime is not None and mtime > prev_mtime) or (
+        prev_size is not None and size is not None and size > prev_size
+    )
+    return recency or grew
+
+
+def _artifact_grok_cwd(node, rec, resolve_cwd_fn):
+    """Grok session cwd for artifact stat paths. Never calls resolve_grok_sid."""
+    cmd = rec.get("command") or ""
+    meta = _parse_wrapper_flags(cmd, "grok_cli")
+    cwd = meta.get("cwd_arg")
+    if cwd:
+        return os.path.expanduser(cwd)
+    if not node.get("session_id"):
+        return None
+    return resolve_cwd_fn()
+
+
+def _artifact_sample_grok(node, rec, resolve_cwd_fn, stat_fn):
+    sid = node.get("session_id")
+    if not sid or not name_ok(str(sid)):
+        return None
+    cwd = _artifact_grok_cwd(node, rec, resolve_cwd_fn)
+    if not cwd:
+        return None
+    root = _grok_cwd_root(cwd)
+    if not root:
+        return None
+    sdir = os.path.join(root, str(sid))
+    best = None
+    for fname in GROK_ARTIFACT_FILES:
+        hit = stat_fn(os.path.join(sdir, fname))
+        if hit is None:
+            continue
+        mt, sz = hit
+        if best is None or mt > best[0]:
+            best = (mt, sz)
+    return best
+
+
+def _artifact_sample_cursor(node, stat_fn):
+    channel = node.get("channel")
+    if not channel or not name_ok(str(channel)):
+        return None
+    best = None
+    for base, ext in ((CURSOR_LOG_DIR, ".jsonl"), (CURSOR_CHANNEL_DIR, ".json")):
+        hit = stat_fn(os.path.join(base, "%s%s" % (channel, ext)))
+        if hit is None:
+            continue
+        mt, sz = hit
+        if best is None or mt > best[0]:
+            best = (mt, sz)
+    return best
+
+
 def _attach_cli_status(forest, snap, now, mono):
     """Stamp `status` and `id` on every node. Mutates forest in place.
 
@@ -1676,8 +1789,16 @@ def _attach_cli_status(forest, snap, now, mono):
     cache-MISS branch of get_cli_payload AFTER the forest is built and BEFORE
     it is stored in _CLI_CACHE["payload"]. Caller holds _CLI_CACHE_LOCK.
     """
+    global _ART_SWEEP_STAT_COUNT, _ART_SWEEP_LISTDIR_COUNT, _ART_SWEEP_PROC_CWD_COUNT
+    _ART_SWEEP_STAT_COUNT = 0
+    _ART_SWEEP_LISTDIR_COUNT = 0
+    _ART_SWEEP_PROC_CWD_COUNT = 0
+    sweep = {"stats": 0, "listdir": 0, "proc_cwd": 0}
+
     snap = snap or {}
     prev_status_by_pid = {}
+    stat_budget = _ARTIFACT_STAT_CAP
+    proc_cwd_new = 0
 
     def _collect_prev(ns):
         for n in ns or []:
@@ -1688,6 +1809,173 @@ def _attach_cli_status(forest, snap, now, mono):
     cached = _CLI_CACHE.get("payload") or {}
     _collect_prev(cached.get("roots"))
 
+    def _stat_path(path):
+        nonlocal stat_budget
+        if stat_budget <= 0:
+            return None
+        stat_budget -= 1
+        sweep["stats"] += 1
+        try:
+            st = os.stat(path)
+            return st.st_mtime, st.st_size
+        except OSError:
+            return None
+
+    def _resolve_cwd(pid, key):
+        nonlocal proc_cwd_new
+        memo = _CWD_RESOLVE_MEMO.get(key) or {}
+        if memo.get("permanent"):
+            return memo.get("cwd")
+        if memo.get("cwd"):
+            return memo["cwd"]
+        tries = int(memo.get("tries") or 0)
+        if tries >= _ARTIFACT_CWD_RETRY_MAX:
+            _CWD_RESOLVE_MEMO[key] = {
+                "tries": tries,
+                "resolved_mono": memo.get("resolved_mono", float(mono)),
+                "permanent": True,
+            }
+            return None
+        resolved_mono = memo.get("resolved_mono")
+        if resolved_mono is not None and float(mono) - float(resolved_mono) < _ARTIFACT_CWD_RETRY_INTERVAL:
+            return None
+        if proc_cwd_new >= _ARTIFACT_CWD_CAP:
+            return None
+        proc_cwd_new += 1
+        sweep["proc_cwd"] += 1
+        cwd = _proc_cwd(pid)
+        entry = {
+            "tries": tries + 1,
+            "resolved_mono": float(mono),
+            "cwd": cwd,
+        }
+        if not cwd and entry["tries"] >= _ARTIFACT_CWD_RETRY_MAX:
+            entry["permanent"] = True
+        _CWD_RESOLVE_MEMO[key] = entry
+        return cwd
+
+    def _sample_grok(node, rec, key):
+        return _artifact_sample_grok(
+            node,
+            rec,
+            lambda: _resolve_cwd(node.get("pid"), key),
+            _stat_path,
+        )
+
+    def _sample_cursor(node):
+        return _artifact_sample_cursor(node, _stat_path)
+
+    def _claude_transcript_path(project_dir, started_ts, key, prev_art):
+        prev_art = prev_art or {}
+        path = prev_art.get("path")
+        last_listdir = prev_art.get("listdir_mono")
+        grew_recently = False
+        if path:
+            hit = _stat_path(path)
+            if hit is not None:
+                mt, sz = hit
+                prev_mtime = prev_art.get("mtime")
+                prev_size = prev_art.get("size")
+                grew_recently = (prev_mtime is not None and mt > prev_mtime) or (
+                    prev_size is not None
+                    and sz is not None
+                    and sz > prev_size
+                )
+                if grew_recently:
+                    return path
+        need_listdir = path is None or not grew_recently
+        if need_listdir:
+            if last_listdir is not None and float(mono) - float(last_listdir) < _ARTIFACT_LISTDIR_INTERVAL:
+                return path
+            if not os.path.isdir(project_dir):
+                return None
+            sweep["listdir"] += 1
+            floor = (started_ts - 5) if started_ts is not None else None
+            newest = None
+            try:
+                for name in os.listdir(project_dir):
+                    if not name.endswith(".jsonl"):
+                        continue
+                    p = os.path.join(project_dir, name)
+                    if not os.path.isfile(p):
+                        continue
+                    try:
+                        mt = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                    if floor is not None and mt < floor:
+                        continue
+                    if newest is None or mt > newest[0]:
+                        newest = (mt, p)
+            except OSError:
+                return None
+            path = newest[1] if newest else None
+            if prev_art is not None:
+                prev_art = dict(prev_art)
+            else:
+                prev_art = {}
+            prev_art["listdir_mono"] = float(mono)
+            if path:
+                prev_art["path"] = path
+            _ART_PREV[key] = prev_art
+        return path
+
+    def _sample_claude(node, rec, key, started_ts):
+        cmd = rec.get("command") or ""
+        meta = _parse_wrapper_flags(cmd, "claude_cli")
+        cwd = meta.get("cwd_arg")
+        if cwd:
+            cwd = os.path.expanduser(cwd)
+        elif node.get("pid") is not None:
+            cwd = _resolve_cwd(node["pid"], key)
+        if not cwd:
+            return None
+        project_dir = claude_project_dir(cwd)
+        if not project_dir or not os.path.isdir(project_dir):
+            return None
+        prev_art = _ART_PREV.get(key)
+        path = _claude_transcript_path(project_dir, started_ts, key, prev_art)
+        if not path:
+            return None
+        hit = _stat_path(path)
+        return hit
+
+    def _artifact_promote(node, rec, key, started_ts):
+        if stat_budget <= 0:
+            return False
+        kind = node.get("kind")
+        try:
+            if kind == "grok":
+                sample = _sample_grok(node, rec, key)
+            elif kind == "cursor":
+                sample = _sample_cursor(node)
+            elif kind == "claude":
+                sample = _sample_claude(node, rec, key, started_ts)
+            else:
+                return False
+            if sample is None:
+                return False
+            mt, sz = sample
+            if mt is None:
+                return False
+            prev_art = _ART_PREV.get(key)
+            active = _artifact_eval_active(prev_art, mt, sz, float(now), float(mono))
+            _ART_PREV[key] = {
+                "path": prev_art.get("path") if prev_art else None,
+                "mtime": float(mt),
+                "size": int(sz) if sz is not None else None,
+                "mono": float(mono),
+                "resolved_mono": float(mono),
+                "tries": int((prev_art or {}).get("tries") or 0),
+            }
+            if prev_art and prev_art.get("path"):
+                _ART_PREV[key]["path"] = prev_art["path"]
+            if prev_art and prev_art.get("listdir_mono") is not None:
+                _ART_PREV[key]["listdir_mono"] = prev_art["listdir_mono"]
+            return active
+        except Exception:
+            return False
+
     def walk(node, parent_sid):
         pid = node.get("pid")
         virtual = bool(node.get("virtual")) or pid is None
@@ -1696,6 +1984,7 @@ def _attach_cli_status(forest, snap, now, mono):
             rec = {}
         lstart = rec.get("lstart") or ""
         sid = node.get("session_id") or parent_sid
+        started_ts = _lstart_ts(lstart)
 
         if virtual:
             sub = node.get("subagent_id") or ""
@@ -1709,6 +1998,7 @@ def _attach_cli_status(forest, snap, now, mono):
             cpu_s = rec.get("cpu_s")
             key = (pid, lstart)
             prev = _CPU_PREV.get(key)
+            carried = False
             if prev is None or cpu_s is None or prev.get("cpu_s") is None:
                 status = _first_obs_status(node)
                 if cpu_s is not None:
@@ -1720,8 +2010,8 @@ def _attach_cli_status(forest, snap, now, mono):
                     status = _first_obs_status(node)
                     _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
                 elif gap < 1.0:
-                    # Do not recompute; do not touch _CPU_PREV (no flap).
                     status = prev_status_by_pid.get(pid) or "running"
+                    carried = True
                 elif delta >= 0.05 and gap >= 1.0:
                     status = "active"
                     _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
@@ -1730,6 +2020,9 @@ def _attach_cli_status(forest, snap, now, mono):
                     _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
             if status not in CLI_TREE_STATUSES:
                 status = "running"
+            if status == "running" and not carried:
+                if _artifact_promote(node, rec, key, started_ts):
+                    status = "active"
             node["status"] = status
 
         next_sid = node.get("session_id") or (
@@ -1741,6 +2034,10 @@ def _attach_cli_status(forest, snap, now, mono):
     for r in forest.get("roots") or []:
         walk(r, None)
 
+    _ART_SWEEP_STAT_COUNT = sweep["stats"]
+    _ART_SWEEP_LISTDIR_COUNT = sweep["listdir"]
+    _ART_SWEEP_PROC_CWD_COUNT = sweep["proc_cwd"]
+
     if snap:
         live_keys = set()
         for p, rec in snap.items():
@@ -1749,6 +2046,12 @@ def _attach_cli_status(forest, snap, now, mono):
         for k in list(_CPU_PREV.keys()):
             if k not in live_keys:
                 del _CPU_PREV[k]
+        for k in list(_ART_PREV.keys()):
+            if k not in live_keys:
+                del _ART_PREV[k]
+        for k in list(_CWD_RESOLVE_MEMO.keys()):
+            if k not in live_keys:
+                del _CWD_RESOLVE_MEMO[k]
 
 
 # ---------------------------------------------------------------- agent ledger
