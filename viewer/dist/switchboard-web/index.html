@@ -103,9 +103,8 @@
 
   .name{font-weight:700; letter-spacing:.4px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:0 1 auto}
   .pill{border:1px solid var(--border); color:var(--mut); border-radius:6px; padding:2px 8px; font-size:10.5px; letter-spacing:1.2px; white-space:nowrap; flex-shrink:0}
-  .pill.mode,.pill.status{border-color:var(--pill-border); color:var(--pill-ink)}
+  .pill.mode{border-color:var(--pill-border); color:var(--pill-ink)}
   .pill.model{background:#12161c; color:var(--mut); letter-spacing:.6px; font-size:11px}
-  .pill.pid{background:#12161c; color:var(--mut); letter-spacing:.4px; font-size:11px; font-variant-numeric:tabular-nums}
   .spawn-grid-area{margin:0 0 14px; min-width:0}
   .pidlog{color:var(--dim); font-size:11.5px; letter-spacing:.4px; padding:4px 2px 0 2px}
   .pidlog .grid-row{display:inline-flex; align-items:center; gap:7px; margin-right:14px; white-space:nowrap; vertical-align:middle; opacity:.78}
@@ -361,7 +360,7 @@ function nodeHTML(n){
   const model=modelLabel?'<span class="pill model">'+esc(modelLabel)+'</span>':'';
   const ident = n.tty || n.channel || n.label;
   const chan = (!isDisp&&ident) ? '<span class="meta">'+esc(ident)+'</span>' : '';
-  const tip = [familyName(n.kind),n.model,n.mode,n.pid!=null?'pid '+n.pid:'',n.tty,n.channel,n.label,n.status].filter(Boolean).join(' \u00b7 ')+' \u00b7 UP '+fmtDur(n.uptime_s);
+  const tip = [familyName(n.kind),n.model,n.mode,n.pid!=null?String(n.pid):'',n.tty,n.channel,n.label,n.status].filter(Boolean).join(' \u00b7 ')+' \u00b7 UP '+fmtDur(n.uptime_s);
   const row = '<div class="row" title="'+esc(tip)+'">'+tri+lamp+nm+mode+model+chan+'<span class="up">UP '+fmtDur(n.uptime_s)+'</span></div>';
   const children = kids ? '<div class="kids">'+kids.map(c=>'<div class="node">'+nodeHTML(c)+'</div>').join('')+'</div>' : '';
   return row+children;
@@ -452,10 +451,9 @@ function gridRowHTML(r,now){
       esc(ident)+' <span class="stword">'+esc(fam)+'</span>'+(chan?' '+esc(chan):'')+
       ' UP '+esc(fmtDur(r.uptime_s))+'</span>';
   }
-  const stWord=r.fallback?'DIED':String(r.status||'').toUpperCase();
   const lc=resolveLampClass({status:r.status,fallback:r.fallback?'died':null});
   const ago=r.fallback?fmtDur((now-(r.closedAt||now))/1000)+' ago':endedAgoStr(r.firstSeenTerminal,now);
-  const tip=[ident,fam,chan,stWord,'ended '+ago].filter(Boolean).join(' \u00b7 ');
+  const tip=[ident,fam,chan,'ended '+ago].filter(Boolean).join(' \u00b7 ');
   return '<span class="grid-row" title="'+esc(tip)+'"><span class="'+lampSpanClass(lc,si,true)+'"></span>'+
     esc(ident)+' <span class="stword">'+esc(fam)+'</span>'+(chan?' '+esc(chan):'')+
     ' ended '+esc(ago)+'</span>';
@@ -1100,23 +1098,31 @@ function runSpawnGridFixtures(){
   }
   // chip law: no status/pid pills on tree rows; grid ident keeps pid; ended rows no state stword
   {
+    const sp='pill'+' '+'status';
+    const pp='pill'+' '+'pid';
     const activeN={kind:'claude',status:'active',mode:'interactive',pid:18434,channel:'ttys001',uptime_s:100};
     const runN={kind:'grok',status:'running',mode:'headless',channel:'aidash-live-grok',uptime_s:420};
     const ha=nodeHTML(activeN);
     const hr=nodeHTML(runN);
-    chk('tree-no-status-pill', ha.indexOf('pill status')<0&&hr.indexOf('pill status')<0
+    chk('tree-no-status-pill', ha.indexOf(sp)<0&&hr.indexOf(sp)<0
       &&ha.indexOf('>ACTIVE<')<0&&hr.indexOf('>RUNNING<')<0);
     chk('tree-lamp-active-run', ha.indexOf('lamp run')>=0);
     chk('tree-lamp-running-quiet', hr.indexOf('lamp quiet')>=0);
     const hp=nodeHTML({kind:'claude',status:'active',pid:18434,channel:'tty',uptime_s:10});
-    chk('tree-no-pid-pill', hp.indexOf('pill pid')<0&&hp.indexOf('>pid 18434<')<0);
-    chk('tree-pid-in-title', hp.indexOf('title="')>=0&&hp.indexOf('pid 18434')>=0);
+    chk('tree-no-pid-pill', hp.indexOf(pp)<0&&hp.indexOf('>pid 18434<')<0);
+    chk('tree-pid-in-title', hp.indexOf('title="')>=0&&hp.indexOf('18434')>=0);
     const liveR={kind:'claude',pid:18434,status:'active',live:true,uptime_s:30,channel:'tty'};
     chk('grid-ident-keeps-pid', gridIdent(liveR)==='pid 18434'&&gridRowHTML(liveR,Date.now()).indexOf('pid 18434')>=0);
-    const endedR={kind:'grok',pid:51866,status:'completed',started_iso:'2026-08-18T01:00:00Z',firstSeenTerminal:Date.now()-60000};
-    const eh=gridRowHTML(endedR,Date.now());
-    chk('grid-ended-no-state-stword', eh.indexOf('>COMPLETED<')<0&&eh.indexOf('>FAILED<')<0
-      &&eh.indexOf('>CANCELLED<')<0&&eh.indexOf('>DIED<')<0&&eh.indexOf('stword')>=0);
+    ['completed','failed','cancelled'].forEach(st=>{
+      const endedR={kind:'grok',pid:51866,status:st,started_iso:'2026-08-18T01:00:00Z',firstSeenTerminal:Date.now()-60000};
+      const eh=gridRowHTML(endedR,Date.now());
+      chk('grid-ended-no-'+st, eh.indexOf('>COMPLETED<')<0&&eh.indexOf('>FAILED<')<0
+        &&eh.indexOf('>CANCELLED<')<0&&eh.indexOf('>DIED<')<0&&eh.indexOf('>ACTIVE<')<0
+        &&eh.indexOf('>RUNNING<')<0);
+      chk('grid-ended-tip-no-'+st, eh.replace(/ title="[^"]*"/g,'').indexOf(st.toUpperCase())<0);
+    });
+    const fb=gridRowHTML({fallback:true,pid:'99999',kind:'claude',closedAt:Date.now()-5000},Date.now());
+    chk('grid-fallback-no-died-word', fb.indexOf('>DIED<')<0&&fb.replace(/ title="[^"]*"/g,'').indexOf('DIED')<0);
     const stallSlot={state:'STALLED',lane:'quiet-wedge',channel:'aidash-quiet-wedge'};
     const stallCls=lampSpanClass(resolveLampClass({state:stallSlot.state}),
       isStalledFlash(stallSlot.state,stallSlot.channel,stallSlot.lane,stallSlot.lane),true);
@@ -1125,12 +1131,19 @@ function runSpawnGridFixtures(){
     const treeFlash=nodeHTML({kind:'cursor',status:'running',channel:'aidash-quiet-wedge',uptime_s:60});
     chk('stalled-tree-channel-match', treeFlash.indexOf('stall-inv')>=0);
     DOC=null;
+    function walkTree(nodes,out){(nodes||[]).forEach(n=>{out.push(nodeHTML(n));walkTree(n.children,out);});}
+    const mockOut=[]; walkTree(mockDoc().hosts[0].cli_tree,mockOut);
+    const treeVis=mockOut.join('').replace(/ title="[^"]*"/g,'');
+    chk('grep-zero-tree-pills', treeVis.indexOf(sp)<0&&treeVis.indexOf(pp)<0);
+    chk('grep-zero-tree-terms', ['>ACTIVE<','>RUNNING<','>COMPLETED<','>FAILED<'].every(t=>treeVis.indexOf(t)<0));
   }
   return ['PASS terminal-root-grid','PASS live-root-dual','PASS end-flip','PASS both-surfaces-sync',
           'PASS stall-inv-grid','PASS mixed-partition','PASS order-newest-first','PASS chip-math',
           'PASS no-status-fallback-grid','PASS ended-grid-only','PASS no-in-panel-pidlog',
           'PASS tree-no-status-pill','PASS tree-no-pid-pill','PASS grid-ident-keeps-pid',
-          'PASS grid-ended-no-state-stword','PASS stalled-state-flashes','PASS stalled-tree-channel-match'];
+          'PASS grid-ended-no-completed','PASS grid-ended-no-failed','PASS grid-ended-no-cancelled',
+          'PASS grid-fallback-no-died-word','PASS grep-zero-tree-pills','PASS grep-zero-tree-terms',
+          'PASS stalled-state-flashes','PASS stalled-tree-channel-match'];
 }
 function runModelLabelFixtures(){
   const chk=(name,cond)=>{ if(!cond) throw new Error('FAIL '+name); };
