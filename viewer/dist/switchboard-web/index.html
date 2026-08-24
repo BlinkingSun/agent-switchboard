@@ -105,7 +105,7 @@
   .pill{border:1px solid var(--border); color:var(--mut); border-radius:6px; padding:2px 8px; font-size:10.5px; letter-spacing:1.2px; white-space:nowrap; flex-shrink:0}
   .pill.mode{border-color:var(--pill-border); color:var(--pill-ink)}
   .pill.model{background:#12161c; color:var(--mut); letter-spacing:.6px; font-size:11px}
-  .spawn-grid-area{margin:0 0 14px; min-width:0}
+  .spawn-grid-area{margin:0; padding:4px 2px 0 18px; min-width:0}
   .pidlog{color:var(--dim); font-size:11.5px; letter-spacing:.4px; padding:4px 2px 0 2px}
   .pidlog .grid-row{display:inline-flex; align-items:center; gap:7px; margin-right:14px; white-space:nowrap; vertical-align:middle; opacity:.78}
   .pidlog .grid-row.live{opacity:1}
@@ -169,7 +169,6 @@
         <div class="body" id="clibody"></div>
       </section>
       <div id="taskpanels"></div>
-      <div class="spawn-grid-area" id="spawngridwrap" hidden><div class="pidlog" id="pidlog"></div></div>
       <div class="idle" id="idle" style="display:none">waiting for fleet snapshot&#8230;</div>
     </div>
   </div>
@@ -493,19 +492,12 @@ function collectSpawnGridRows(now){
   rows.sort((a,b)=>gridSpawnSortKey(b)-gridSpawnSortKey(a));
   return rows;
 }
-function renderSpawnGrid(){
-  const el=document.getElementById('pidlog');
-  const wrap=document.getElementById('spawngridwrap');
-  if(!el) return;
-  const now=Date.now();
+function spawnGridHTML(now){
+  now=now||Date.now();
   const rows=collectSpawnGridRows(now);
-  if(!rows.length){
-    if(wrap) wrap.hidden=true;
-    el.innerHTML='';
-    return;
-  }
-  if(wrap) wrap.hidden=false;
-  el.innerHTML=rows.map(r=>gridRowHTML(r,now)).join('');
+  if(!rows.length) return '';
+  return '<div class="spawn-grid-area"><div class="pidlog">'
+    +rows.map(r=>gridRowHTML(r,now)).join('')+'</div></div>';
 }
 function renderCLI(){
   let html='';
@@ -518,9 +510,9 @@ function renderCLI(){
     if(!tree.length){ html+='<div class="host-empty">no CLI sessions</div>'; return; }
     html+=tree.map(n=>'<div class="node">'+nodeHTML(n)+'</div>').join('');
   });
+  html+=spawnGridHTML();
   document.getElementById('clibody').innerHTML=html;
   if(mbpTree&&!mbpHasStatus) noteClosedPids(mbpTree);
-  renderSpawnGrid();
   const k=cliKindCounts();
   const parts=[]; if(k.claude)parts.push('CLAUDE '+k.claude); if(k.grok)parts.push('GROK '+k.grok); if(k.cursor)parts.push('CURSOR '+k.cursor);
   document.getElementById('cliroll').innerHTML=parts.join(' <span style="color:var(--dim)">\u00b7</span> ')+
@@ -887,7 +879,7 @@ function startFleetHost(){
 
 /* ---- refresh ages every 20s (no network) ---- */
 if(!globalThis.__RUN_TREE_ROOT_FIXTURES__){
-  setInterval(()=>{ if(DOC){ renderAge(); renderSpawnGrid(); renderCounts(); } }, 20000);
+  setInterval(()=>{ if(DOC){ renderAge(); renderCLI(); renderCounts(); } }, 20000);
 }
 
 /* ============================ MOCK (preview / ?mock=1) ============================ */
@@ -1076,7 +1068,7 @@ function runSpawnGridFixtures(){
     DOC=null;
     CLOSED_PID_LOG=[];
   }
-  // in-panel strip absent; bottom grid owns ended rows (not tree)
+  // spawn grid in CLI panel body only; no bottom duplicate strip
   {
     const roots=[
       {kind:'grok',pid:51866,status:'completed',started_iso:'2026-08-18T01:00:00Z',uptime_s:null,children:[]},
@@ -1089,10 +1081,16 @@ function runSpawnGridFixtures(){
     const ended=rows.filter(x=>!x.live);
     chk('ended-only-in-grid', ended.length===1&&ended[0].pid===51866);
     chk('ended-not-in-tree', !terminalInTree(r.tree).includes(51866));
+    const gridHtml=spawnGridHTML();
+    chk('spawn-grid-html', gridHtml.indexOf('grid-row')>=0&&gridHtml.indexOf('pid 51866')>=0);
     if(typeof document!=='undefined'){
       const clip=document.getElementById('clipanel');
-      const pid=document.getElementById('pidlog');
-      chk('no-in-panel-pidlog', clip&&pid&&!clip.contains(pid));
+      const body=document.getElementById('clibody');
+      const tasks=document.getElementById('taskpanels');
+      chk('no-spawngridwrap-node', !document.getElementById('spawngridwrap'));
+      chk('spawn-grid-in-clibody', body&&spawnGridHTML().length>0);
+      chk('no-bottom-pidlog-strip', tasks&&tasks.nextElementSibling?.id!=='spawngridwrap');
+      chk('single-pidlog-in-render', (spawnGridHTML().match(/class="pidlog"/g)||[]).length===1);
     }
     DOC=null;
   }
@@ -1139,7 +1137,9 @@ function runSpawnGridFixtures(){
   }
   return ['PASS terminal-root-grid','PASS live-root-dual','PASS end-flip','PASS both-surfaces-sync',
           'PASS stall-inv-grid','PASS mixed-partition','PASS order-newest-first','PASS chip-math',
-          'PASS no-status-fallback-grid','PASS ended-grid-only','PASS no-in-panel-pidlog',
+          'PASS no-status-fallback-grid','PASS ended-grid-only','PASS spawn-grid-html',
+          'PASS no-spawngridwrap-node','PASS spawn-grid-in-clibody','PASS no-bottom-pidlog-strip',
+          'PASS single-pidlog-in-render',
           'PASS tree-no-status-pill','PASS tree-no-pid-pill','PASS grid-ident-keeps-pid',
           'PASS grid-ended-no-completed','PASS grid-ended-no-failed','PASS grid-ended-no-cancelled',
           'PASS grid-fallback-no-died-word','PASS grep-zero-tree-pills','PASS grep-zero-tree-terms',
