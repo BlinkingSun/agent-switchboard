@@ -212,6 +212,23 @@ function isStallInvestigator(){
   }
   return false;
 }
+function collectStalledChannels(){
+  const s=new Set();
+  ((DOC&&DOC.hosts)||[]).forEach(h=>{
+    (h.tasks||[]).forEach(t=>{
+      (t.slots||[]).forEach(slot=>{
+        if(String(slot.state||'').toUpperCase()==='STALLED'&&slot.channel) s.add(String(slot.channel));
+      });
+    });
+  });
+  return s;
+}
+function isStalledFlash(state, channel, label, lane){
+  if(String(state||'').toUpperCase()==='STALLED') return true;
+  const ch=String(channel||'');
+  if(ch&&collectStalledChannels().has(ch)) return true;
+  return isStallInvestigator(channel,label,lane);
+}
 function lampClassFromStatus(status){
   return LAMP_STATUS[String(status||'').toLowerCase()] || null;
 }
@@ -248,6 +265,23 @@ function agoStr(iso){
 }
 const stClass = st => STATE_CLASS[String(st||'').toUpperCase()] || 'quiet';
 const hasLamp = kind => kind!=='team-dispatch' && kind!=='team_dispatch';
+
+/* canonical model chip label — display layer only; raw n.model unchanged */
+function formatModelLabel(model){
+  if(model==null||model==='') return null;
+  const s=String(model).trim();
+  if(!s) return null;
+  const low=s.toLowerCase();
+  if(low.indexOf('fable')>=0) return 'fable';
+  if(low.indexOf('opus')>=0) return 'opus';
+  if(low.indexOf('sonnet')>=0) return 'sonnet';
+  if(low.indexOf('haiku')>=0) return 'haiku';
+  if(low.indexOf('composer')>=0) return 'composer-2.5';
+  if(/grok[- ]?4\.6/i.test(s)) return 'grok-4.6';
+  if(/grok[- ]?4\.5/i.test(s)) return 'grok-4.5';
+  if(low.indexOf('grok')>=0) return 'grok-4.6';
+  return s;
+}
 
 /* ---- live agent/subagent counts (CLI tree + recent closed/failed) ---- */
 function emptyAgentCounts(){
@@ -317,19 +351,18 @@ function nodeHTML(n){
   const isDisp = !hasLamp(n.kind);
   const tri = kids ? '<span class="tri open" data-node></span>' : '<span class="tri hidden"></span>';
   const lc=resolveLampClass({status:n.status,state:n.state});
-  const si=isStallInvestigator(n.channel,n.label,n.lane);
+  const si=isStalledFlash(n.state,n.channel,n.label,n.lane);
   const lamp = isDisp ? '' : '<span class="'+lampSpanClass(lc,si,false)+'"></span>';
   const nm = isDisp
     ? '<span class="name">team-dispatch</span>'+(n.channel||n.lane?' <span class="meta">'+esc(n.channel||n.lane)+'</span>':'')
     : '<span class="name">'+esc(familyName(n.kind))+'</span>';
   const mode = (!isDisp&&n.mode) ? '<span class="pill mode">'+esc(String(n.mode).toUpperCase())+'</span>' : '';
-  const status = (!isDisp&&n.status!=null&&n.status!=='') ? '<span class="pill status">'+esc(String(n.status).toUpperCase())+'</span>' : '';
-  const model = (!isDisp&&n.model) ? '<span class="pill model">'+esc(n.model)+'</span>' : '';
-  const pid = (!isDisp&&n.pid!=null&&n.pid!=='') ? '<span class="pill pid">pid '+esc(n.pid)+'</span>' : '';
+  const modelLabel=(!isDisp&&n.model)?formatModelLabel(n.model):null;
+  const model=modelLabel?'<span class="pill model">'+esc(modelLabel)+'</span>':'';
   const ident = n.tty || n.channel || n.label;
   const chan = (!isDisp&&ident) ? '<span class="meta">'+esc(ident)+'</span>' : '';
   const tip = [familyName(n.kind),n.model,n.mode,n.pid!=null?'pid '+n.pid:'',n.tty,n.channel,n.label,n.status].filter(Boolean).join(' \u00b7 ')+' \u00b7 UP '+fmtDur(n.uptime_s);
-  const row = '<div class="row" title="'+esc(tip)+'">'+tri+lamp+nm+mode+status+model+pid+chan+'<span class="up">UP '+fmtDur(n.uptime_s)+'</span></div>';
+  const row = '<div class="row" title="'+esc(tip)+'">'+tri+lamp+nm+mode+model+chan+'<span class="up">UP '+fmtDur(n.uptime_s)+'</span></div>';
   const children = kids ? '<div class="kids">'+kids.map(c=>'<div class="node">'+nodeHTML(c)+'</div>').join('')+'</div>' : '';
   return row+children;
 }
@@ -411,7 +444,7 @@ function gridRowHTML(r,now){
   const fam=familyName(r.kind);
   const ident=gridIdent(r);
   const chan=r.channel||r.label||r.tty||'';
-  const si=isStallInvestigator(r.channel,r.label,r.lane);
+  const si=isStalledFlash(r.state,r.channel,r.label,r.lane);
   if(r.live){
     const lc=resolveLampClass({status:r.status,state:r.state});
     const tip=[ident,fam,chan,'UP '+fmtDur(r.uptime_s)].filter(Boolean).join(' \u00b7 ');
@@ -425,7 +458,7 @@ function gridRowHTML(r,now){
   const tip=[ident,fam,chan,stWord,'ended '+ago].filter(Boolean).join(' \u00b7 ');
   return '<span class="grid-row" title="'+esc(tip)+'"><span class="'+lampSpanClass(lc,si,true)+'"></span>'+
     esc(ident)+' <span class="stword">'+esc(fam)+'</span>'+(chan?' '+esc(chan):'')+
-    ' <span class="stword">'+esc(stWord)+'</span> ended '+esc(ago)+'</span>';
+    ' ended '+esc(ago)+'</span>';
 }
 function collectTreePids(nodes, acc){
   (nodes||[]).forEach(n=>{
@@ -500,19 +533,17 @@ function renderTasks(){
   let html='';
   hosts().forEach(h=>{
     (h.tasks||[]).forEach(t=>{
-      const slots=t.slots||[]; const cnt={};
-      slots.forEach(s=>{ const k=String(s.state||'').toUpperCase(); cnt[k]=(cnt[k]||0)+1; });
-      const roll=Object.entries(cnt).map(([s,n])=>n+' '+s).join(' \u00b7 ');
+      const slots=t.slots||[];
       const inner='<div class="grid">'+slots.map(s=>{
           const lc=resolveLampClass({state:s.state});
-          const si=isStallInvestigator(s.lane,s.channel);
+          const si=isStalledFlash(s.state,s.channel,s.lane,s.lane);
           const tip=esc(s.lane)+' \u00b7 '+String(s.state||'').toUpperCase()+' \u00b7 '+fmtDur(s.age_s)+(s.channel?' \u00b7 '+esc(s.channel):'');
           return '<div class="cell" title="'+tip+'"><span class="'+lampSpanClass(lc,si,true)+'"></span><span class="nm">'+esc(s.lane)+'</span><span class="cage">'+fmtDur(s.age_s)+'</span></div>';
         }).join('')+'</div>';
       const hostName=(h.label||h.id); const cap=hostName.charAt(0).toUpperCase()+hostName.slice(1);
       html+='<section class="panel"><div class="panel-hd" data-collapse="task-'+esc(h.id)+'-'+esc(t.id)+'">'+
             '<div class="lt"><span class="tri open"></span><span class="title" style="letter-spacing:1px">'+esc(cap)+
-            ' <span style="color:var(--dim)">&rsaquo;</span> '+esc(t.id)+'</span></div><div class="roll">'+esc(roll)+'</div></div>'+
+            ' <span style="color:var(--dim)">&rsaquo;</span> '+esc(t.id)+'</span></div></div>'+
             '<div class="body">'+inner+'</div></section>';
     });
   });
@@ -857,7 +888,9 @@ function startFleetHost(){
 }
 
 /* ---- refresh ages every 20s (no network) ---- */
-setInterval(()=>{ if(DOC){ renderAge(); renderSpawnGrid(); renderCounts(); } }, 20000);
+if(!globalThis.__RUN_TREE_ROOT_FIXTURES__){
+  setInterval(()=>{ if(DOC){ renderAge(); renderSpawnGrid(); renderCounts(); } }, 20000);
+}
 
 /* ============================ MOCK (preview / ?mock=1) ============================ */
 function mockDoc(){
@@ -871,11 +904,13 @@ function mockDoc(){
           { kind:'claude', model:'claude-opus-5', mode:'interactive', pid:18434, status:'active', channel:'ttys001', started_iso:'2026-08-20T10:00:00Z', uptime_s:301500, children:[
             { kind:'grok', model:'grok-4.6', mode:'headless', pid:18440, status:'running', channel:'aidash-live-grok', started_iso:'2026-08-23T12:50:00Z', uptime_s:420, children:[] },
             { kind:'cursor', model:'composer-2.5', mode:'headless', pid:18850, status:'running', channel:'stall-investigator-live', started_iso:'2026-08-23T13:00:00Z', uptime_s:60, children:[] },
+            { kind:'cursor', model:'composer-2.5', mode:'headless', pid:18851, status:'running', channel:'aidash-quiet-wedge', started_iso:'2026-08-23T13:01:00Z', uptime_s:120, children:[] },
             { kind:'grok', model:'grok-4.6', mode:'headless', status:'completed', channel:'aidash-ended-parent', started_iso:'2026-08-20T11:00:00Z', uptime_s:null, children:[
               { kind:'cursor', model:'composer-2.5', mode:'headless', pid:18802, status:'active', label:'reparented-cursor', channel:'aidash-reparented', started_iso:'2026-08-23T12:55:00Z', uptime_s:95, children:[] } ]},
             { kind:'grok-sub', model:'grok-4.6', mode:'headless', subagent_id:'sub-slice-ended-7f3a', label:'slice-ended', status:'completed', started_iso:'2026-08-22T08:00:00Z', uptime_s:null, children:[] },
             { kind:'grok-sub', model:'grok-4.6', mode:'headless', subagent_id:'sub-slice-failed-9c2e', label:'slice-failed', status:'failed', started_iso:'2026-08-22T07:00:00Z', uptime_s:null, children:[] },
             { kind:'cursor', model:'composer-2.5', mode:'headless', pid:19999, label:'grid-only-cursor', status:'cancelled', channel:'aidash-grid-cursor', started_iso:'2026-08-21T14:00:00Z', uptime_s:null, children:[] } ]},
+          { kind:'claude', model:'claude-fable-5', mode:'interactive', channel:'ttys003', status:'active', started_iso:'2026-08-22T08:00:00Z', uptime_s:86400, children:[] },
           { kind:'claude', model:'claude-opus-4-8', mode:'interactive', channel:'ttys000', status:'active', started_iso:'2026-08-19T09:00:00Z', uptime_s:236580, children:[] },
           { kind:'grok', model:'grok-4.6', mode:'headless', pid:57204, status:'completed', started_iso:'2026-08-18T02:00:00Z', uptime_s:null, label:null, channel:null, children:[] }
         ],
@@ -884,6 +919,7 @@ function mockDoc(){
           {lane:'audit-egress', state:'WORKING_TOOL', age_s:400, activity_s:2, exit_code:null, channel:'aidash-audit-egress'},
           {lane:'spike-nesting', state:'QUIET', age_s:128, activity_s:74, exit_code:null, channel:'aidash-spike-nesting'},
           {lane:'stall-probe', state:'STALLED', age_s:640, activity_s:410, exit_code:null, channel:'stall-probe-aidash'},
+          {lane:'quiet-wedge', state:'STALLED', age_s:120, activity_s:90, exit_code:null, channel:'aidash-quiet-wedge'},
           {lane:'cli-tree-ios', state:'DONE', age_s:1227, activity_s:null, exit_code:0, channel:'aidash-cli-tree-ios'},
           {lane:'named-agents', state:'DONE', age_s:1872, activity_s:null, exit_code:0, channel:'aidash-named-agents'},
           {lane:'regauth-gate', state:'FAILED', age_s:2400, activity_s:null, exit_code:1, channel:'aidash-regauth-gate'}
@@ -973,8 +1009,8 @@ function runSpawnGridFixtures(){
     chk('sync-grid-row', !!gridR);
     const lcTree=resolveLampClass({status:treeN.status,state:treeN.state});
     const lcGrid=resolveLampClass({status:gridR.status,state:gridR.state});
-    const siTree=isStallInvestigator(treeN.channel,treeN.label,treeN.lane);
-    const siGrid=isStallInvestigator(gridR.channel,gridR.label,gridR.lane);
+    const siTree=isStalledFlash(treeN.state,treeN.channel,treeN.label,treeN.lane);
+    const siGrid=isStalledFlash(gridR.state,gridR.channel,gridR.label,gridR.lane);
     const clsTree=lampSpanClass(lcTree,siTree,false);
     const clsGrid=lampSpanClass(lcGrid,siGrid,true);
     chk('sync-lamp-class', lcTree===lcGrid);
@@ -986,7 +1022,7 @@ function runSpawnGridFixtures(){
     const r=stamp(roots,'mbp');
     const gridR=r.grid.find(g=>g.pid===18850&&g.live);
     const lc=resolveLampClass({status:gridR.status,state:gridR.state});
-    const cls=lampSpanClass(lc,isStallInvestigator(gridR.channel,gridR.label,gridR.lane),true);
+    const cls=lampSpanClass(lc,isStalledFlash(gridR.state,gridR.channel,gridR.label,gridR.lane),true);
     chk('stall-inv-grid', cls.indexOf('stall-inv')>=0);
   }
   // mixed roots: 2 ended + 1 live in grid
@@ -1062,17 +1098,71 @@ function runSpawnGridFixtures(){
     }
     DOC=null;
   }
+  // chip law: no status/pid pills on tree rows; grid ident keeps pid; ended rows no state stword
+  {
+    const activeN={kind:'claude',status:'active',mode:'interactive',pid:18434,channel:'ttys001',uptime_s:100};
+    const runN={kind:'grok',status:'running',mode:'headless',channel:'aidash-live-grok',uptime_s:420};
+    const ha=nodeHTML(activeN);
+    const hr=nodeHTML(runN);
+    chk('tree-no-status-pill', ha.indexOf('pill status')<0&&hr.indexOf('pill status')<0
+      &&ha.indexOf('>ACTIVE<')<0&&hr.indexOf('>RUNNING<')<0);
+    chk('tree-lamp-active-run', ha.indexOf('lamp run')>=0);
+    chk('tree-lamp-running-quiet', hr.indexOf('lamp quiet')>=0);
+    const hp=nodeHTML({kind:'claude',status:'active',pid:18434,channel:'tty',uptime_s:10});
+    chk('tree-no-pid-pill', hp.indexOf('pill pid')<0&&hp.indexOf('>pid 18434<')<0);
+    chk('tree-pid-in-title', hp.indexOf('title="')>=0&&hp.indexOf('pid 18434')>=0);
+    const liveR={kind:'claude',pid:18434,status:'active',live:true,uptime_s:30,channel:'tty'};
+    chk('grid-ident-keeps-pid', gridIdent(liveR)==='pid 18434'&&gridRowHTML(liveR,Date.now()).indexOf('pid 18434')>=0);
+    const endedR={kind:'grok',pid:51866,status:'completed',started_iso:'2026-08-18T01:00:00Z',firstSeenTerminal:Date.now()-60000};
+    const eh=gridRowHTML(endedR,Date.now());
+    chk('grid-ended-no-state-stword', eh.indexOf('>COMPLETED<')<0&&eh.indexOf('>FAILED<')<0
+      &&eh.indexOf('>CANCELLED<')<0&&eh.indexOf('>DIED<')<0&&eh.indexOf('stword')>=0);
+    const stallSlot={state:'STALLED',lane:'quiet-wedge',channel:'aidash-quiet-wedge'};
+    const stallCls=lampSpanClass(resolveLampClass({state:stallSlot.state}),
+      isStalledFlash(stallSlot.state,stallSlot.channel,stallSlot.lane,stallSlot.lane),true);
+    chk('stalled-state-flashes', stallCls.indexOf('stall-inv')>=0);
+    DOC={hosts:[{id:'mbp',tasks:[{id:'aidash',slots:[stallSlot]}]}]};
+    const treeFlash=nodeHTML({kind:'cursor',status:'running',channel:'aidash-quiet-wedge',uptime_s:60});
+    chk('stalled-tree-channel-match', treeFlash.indexOf('stall-inv')>=0);
+    DOC=null;
+  }
   return ['PASS terminal-root-grid','PASS live-root-dual','PASS end-flip','PASS both-surfaces-sync',
           'PASS stall-inv-grid','PASS mixed-partition','PASS order-newest-first','PASS chip-math',
-          'PASS no-status-fallback-grid','PASS ended-grid-only','PASS no-in-panel-pidlog'];
+          'PASS no-status-fallback-grid','PASS ended-grid-only','PASS no-in-panel-pidlog',
+          'PASS tree-no-status-pill','PASS tree-no-pid-pill','PASS grid-ident-keeps-pid',
+          'PASS grid-ended-no-state-stword','PASS stalled-state-flashes','PASS stalled-tree-channel-match'];
+}
+function runModelLabelFixtures(){
+  const chk=(name,cond)=>{ if(!cond) throw new Error('FAIL '+name); };
+  const cases=[
+    [null,null],[ '',null],
+    ['claude-fable-5','fable'],['fable','fable'],
+    ['claude-opus-5','opus'],['opus','opus'],['claude-opus-4-8','opus'],
+    ['claude-sonnet-4','sonnet'],['haiku','haiku'],
+    ['grok-4.6','grok-4.6'],['grok-4.5','grok-4.5'],
+    ['composer','composer-2.5'],['composer-2.5','composer-2.5'],
+    ['default','default']
+  ];
+  cases.forEach(([inp,exp])=>{
+    const got=formatModelLabel(inp);
+    const label=inp==null?'null':inp===''?'empty':String(inp);
+    chk('model-label-'+label, got===exp);
+  });
+  const noChip=nodeHTML({kind:'claude',model:'',channel:'tty',uptime_s:10});
+  chk('model-null-no-chip', noChip.indexOf('pill model')<0);
+  const fableHtml=nodeHTML({kind:'claude',model:'claude-fable-5',mode:'interactive',channel:'tty',uptime_s:10});
+  chk('model-render-fable', fableHtml.indexOf('>fable<')>=0&&fableHtml.indexOf('>claude-fable-5<')<0);
+  chk('model-render-title-raw', fableHtml.indexOf('claude-fable-5')>=0);
+  return ['PASS model-label-map','PASS model-null-no-chip','PASS model-render-fable','PASS model-render-title-raw'];
 }
 function runTreeRootFixtures(){
-  return runSpawnGridFixtures();
+  return runSpawnGridFixtures().concat(runModelLabelFixtures());
 }
 if(typeof globalThis!=='undefined' && globalThis.__RUN_TREE_ROOT_FIXTURES__){
   try{
     runTreeRootFixtures().forEach(r=>console.log(r));
     console.log('VERDICT: pass');
+    if(typeof process!=='undefined'&&process.exit) process.exit(0);
   }catch(e){
     console.error(e.message||e);
     console.log('VERDICT: fail');
@@ -1102,8 +1192,10 @@ function boot(){
   renderAll();
   setTimeout(()=>{ if(!DOC && !window.__hosted) window.overwatchRender(mockDoc()); }, 1200);
 }
-if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', boot);
-else boot();
+if(!globalThis.__RUN_TREE_ROOT_FIXTURES__){
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+}
 </script>
 </body>
 </html>
