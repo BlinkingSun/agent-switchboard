@@ -105,12 +105,6 @@
   .pill{border:1px solid var(--border); color:var(--mut); border-radius:6px; padding:2px 8px; font-size:10.5px; letter-spacing:1.2px; white-space:nowrap; flex-shrink:0}
   .pill.mode{border-color:var(--pill-border); color:var(--pill-ink)}
   .pill.model{background:#12161c; color:var(--mut); letter-spacing:.6px; font-size:11px}
-  .spawn-grid-area{margin:0; padding:4px 2px 0 18px; min-width:0}
-  .pidlog{color:var(--dim); font-size:11.5px; letter-spacing:.4px; padding:4px 2px 0 2px}
-  .pidlog .grid-row{display:inline-flex; align-items:center; gap:7px; margin-right:14px; white-space:nowrap; vertical-align:middle; opacity:.78}
-  .pidlog .grid-row.live{opacity:1}
-  .pidlog .grid-row .lamp.done{background:radial-gradient(circle at 35% 32%, #5a6270, var(--done) 64%)}
-  .pidlog .grid-row .stword{color:var(--mut); letter-spacing:.8px; font-size:10.5px}
   .meta{color:var(--mut); font-size:12.5px; letter-spacing:.3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; flex:1 1 0%}
   .meta .k{color:var(--dim)}
   .up{margin-left:auto; color:var(--mut); font-size:12.5px; letter-spacing:.5px; white-space:nowrap; font-variant-numeric:tabular-nums; padding-left:8px; flex-shrink:0}
@@ -202,7 +196,7 @@ function lsGet(k,d){ try{ const v=localStorage.getItem(k); return v==null?d:v; }
 function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
-/* lamp color law — single mapping for tree, slot grid, ended grid (DESIGN.md) */
+/* lamp color law — tree + task-slot grid (DESIGN.md) */
 function isStallInvestigator(){
   for(let i=0;i<arguments.length;i++){
     const s=String(arguments[i]||'').toLowerCase();
@@ -413,49 +407,12 @@ function pruneHostFirstSeen(hostId, activeKeys){
     if(k.startsWith(prefix)&&!activeKeys.has(k)) delete TERMINAL_FIRST_SEEN[k];
   });
 }
-function subIdTail(id){
-  const s=String(id||'');
-  if(!s) return '';
-  const p=s.split('-');
-  return p.length>1?p[p.length-1]:s.slice(-8);
-}
-function gridIdent(r){
-  if(r.fallback) return 'pid '+r.pid;
-  if(r.pid!=null&&r.pid!=='') return 'pid '+r.pid;
-  const tail=subIdTail(r.subagent_id);
-  if(tail) return tail;
-  return r.channel||r.label||r.tty||'';
-}
-function endedAgoStr(firstSeen,now){
-  const fs=firstSeen||now;
-  const sec=Math.max(0,Math.round((now-fs)/1000));
-  return sec<90?sec+'s ago':Math.round(sec/60)+'m ago';
-}
 function gridSpawnSortKey(r){
   const s=r.started_iso||r.started;
   if(s){ const t=Date.parse(s); if(!isNaN(t)) return t; }
   if(r.firstSeenTerminal) return r.firstSeenTerminal;
   if(r.closedAt) return r.closedAt;
   return 0;
-}
-function gridRowHTML(r,now){
-  const fam=familyName(r.kind);
-  const ident=gridIdent(r);
-  const chan=r.channel||r.label||r.tty||'';
-  const si=isStalledFlash(r.state,r.channel,r.label,r.lane);
-  if(r.live){
-    const lc=resolveLampClass({status:r.status,state:r.state});
-    const tip=[ident,fam,chan,'UP '+fmtDur(r.uptime_s)].filter(Boolean).join(' \u00b7 ');
-    return '<span class="grid-row live" title="'+esc(tip)+'"><span class="'+lampSpanClass(lc,si,true)+'"></span>'+
-      esc(ident)+' <span class="stword">'+esc(fam)+'</span>'+(chan?' '+esc(chan):'')+
-      ' UP '+esc(fmtDur(r.uptime_s))+'</span>';
-  }
-  const lc=resolveLampClass({status:r.status,fallback:r.fallback?'died':null});
-  const ago=r.fallback?fmtDur((now-(r.closedAt||now))/1000)+' ago':endedAgoStr(r.firstSeenTerminal,now);
-  const tip=[ident,fam,chan,'ended '+ago].filter(Boolean).join(' \u00b7 ');
-  return '<span class="grid-row" title="'+esc(tip)+'"><span class="'+lampSpanClass(lc,si,true)+'"></span>'+
-    esc(ident)+' <span class="stword">'+esc(fam)+'</span>'+(chan?' '+esc(chan):'')+
-    ' ended '+esc(ago)+'</span>';
 }
 function collectTreePids(nodes, acc){
   (nodes||[]).forEach(n=>{
@@ -492,13 +449,6 @@ function collectSpawnGridRows(now){
   rows.sort((a,b)=>gridSpawnSortKey(b)-gridSpawnSortKey(a));
   return rows;
 }
-function spawnGridHTML(now){
-  now=now||Date.now();
-  const rows=collectSpawnGridRows(now);
-  if(!rows.length) return '';
-  return '<div class="spawn-grid-area"><div class="pidlog">'
-    +rows.map(r=>gridRowHTML(r,now)).join('')+'</div></div>';
-}
 function renderCLI(){
   let html='';
   let mbpTree=null;
@@ -510,7 +460,6 @@ function renderCLI(){
     if(!tree.length){ html+='<div class="host-empty">no CLI sessions</div>'; return; }
     html+=tree.map(n=>'<div class="node">'+nodeHTML(n)+'</div>').join('');
   });
-  html+=spawnGridHTML();
   document.getElementById('clibody').innerHTML=html;
   if(mbpTree&&!mbpHasStatus) noteClosedPids(mbpTree);
   const k=cliKindCounts();
@@ -1052,7 +1001,7 @@ function runSpawnGridFixtures(){
     chk('chip-fail-live-excluded', chips.fail===1);
     chk('chip-live-not-done', !r.grid.some(g=>g.live&&(g.status==='completed'||g.status==='failed')));
   }
-  // no-status host: stamp grid empty; fallback rows render in bottom grid only
+  // no-status host: stamp grid empty; fallback rows in data only (not rendered)
   {
     const roots=[{kind:'claude',pid:99,channel:'tty',uptime_s:10,children:[]}];
     const r=stamp(roots,'mbp');
@@ -1068,7 +1017,7 @@ function runSpawnGridFixtures(){
     DOC=null;
     CLOSED_PID_LOG=[];
   }
-  // spawn grid in CLI panel body only; no bottom duplicate strip
+  // spawn grid data only — no pidlog / ended-line rendering on page
   {
     const roots=[
       {kind:'grok',pid:51866,status:'completed',started_iso:'2026-08-18T01:00:00Z',uptime_s:null,children:[]},
@@ -1079,22 +1028,13 @@ function runSpawnGridFixtures(){
     activeHost='mbp';
     const rows=collectSpawnGridRows();
     const ended=rows.filter(x=>!x.live);
-    chk('ended-only-in-grid', ended.length===1&&ended[0].pid===51866);
+    chk('ended-only-in-data', ended.length===1&&ended[0].pid===51866);
     chk('ended-not-in-tree', !terminalInTree(r.tree).includes(51866));
-    const gridHtml=spawnGridHTML();
-    chk('spawn-grid-html', gridHtml.indexOf('grid-row')>=0&&gridHtml.indexOf('pid 51866')>=0);
-    if(typeof document!=='undefined'){
-      const clip=document.getElementById('clipanel');
-      const body=document.getElementById('clibody');
-      const tasks=document.getElementById('taskpanels');
-      chk('no-spawngridwrap-node', !document.getElementById('spawngridwrap'));
-      chk('spawn-grid-in-clibody', body&&spawnGridHTML().length>0);
-      chk('no-bottom-pidlog-strip', tasks&&tasks.nextElementSibling?.id!=='spawngridwrap');
-      chk('single-pidlog-in-render', (spawnGridHTML().match(/class="pidlog"/g)||[]).length===1);
-    }
+    chk('no-spawngridwrap-node', typeof document==='undefined'||!document.getElementById('spawngridwrap'));
+    chk('no-pidlog-node', typeof document==='undefined'||!document.getElementById('pidlog'));
     DOC=null;
   }
-  // chip law: no status/pid pills on tree rows; grid ident keeps pid; ended rows no state stword
+  // chip law + grep-zero: no pidlog lines in any render output
   {
     const sp='pill'+' '+'status';
     const pp='pill'+' '+'pid';
@@ -1109,18 +1049,6 @@ function runSpawnGridFixtures(){
     const hp=nodeHTML({kind:'claude',status:'active',pid:18434,channel:'tty',uptime_s:10});
     chk('tree-no-pid-pill', hp.indexOf(pp)<0&&hp.indexOf('>pid 18434<')<0);
     chk('tree-pid-in-title', hp.indexOf('title="')>=0&&hp.indexOf('18434')>=0);
-    const liveR={kind:'claude',pid:18434,status:'active',live:true,uptime_s:30,channel:'tty'};
-    chk('grid-ident-keeps-pid', gridIdent(liveR)==='pid 18434'&&gridRowHTML(liveR,Date.now()).indexOf('pid 18434')>=0);
-    ['completed','failed','cancelled'].forEach(st=>{
-      const endedR={kind:'grok',pid:51866,status:st,started_iso:'2026-08-18T01:00:00Z',firstSeenTerminal:Date.now()-60000};
-      const eh=gridRowHTML(endedR,Date.now());
-      chk('grid-ended-no-'+st, eh.indexOf('>COMPLETED<')<0&&eh.indexOf('>FAILED<')<0
-        &&eh.indexOf('>CANCELLED<')<0&&eh.indexOf('>DIED<')<0&&eh.indexOf('>ACTIVE<')<0
-        &&eh.indexOf('>RUNNING<')<0);
-      chk('grid-ended-tip-no-'+st, eh.replace(/ title="[^"]*"/g,'').indexOf(st.toUpperCase())<0);
-    });
-    const fb=gridRowHTML({fallback:true,pid:'99999',kind:'claude',closedAt:Date.now()-5000},Date.now());
-    chk('grid-fallback-no-died-word', fb.indexOf('>DIED<')<0&&fb.replace(/ title="[^"]*"/g,'').indexOf('DIED')<0);
     const stallSlot={state:'STALLED',lane:'quiet-wedge',channel:'aidash-quiet-wedge'};
     const stallCls=lampSpanClass(resolveLampClass({state:stallSlot.state}),
       isStalledFlash(stallSlot.state,stallSlot.channel,stallSlot.lane,stallSlot.lane),true);
@@ -1134,15 +1062,36 @@ function runSpawnGridFixtures(){
     const treeVis=mockOut.join('').replace(/ title="[^"]*"/g,'');
     chk('grep-zero-tree-pills', treeVis.indexOf(sp)<0&&treeVis.indexOf(pp)<0);
     chk('grep-zero-tree-terms', ['>ACTIVE<','>RUNNING<','>COMPLETED<','>FAILED<'].every(t=>treeVis.indexOf(t)<0));
+    function pageRenderHTML(){
+      let h='';
+      hosts().forEach(host=>{
+        (function walk(ns){(ns||[]).forEach(n=>{
+          h+=nodeHTML(n);
+          walk(n.children);
+        });})(host.cli_tree);
+      });
+      hosts().forEach(host=>{
+        (host.tasks||[]).forEach(t=>{
+          (t.slots||[]).forEach(s=>{ h+=esc(s.lane)+fmtDur(s.age_s); });
+        });
+      });
+      return h;
+    }
+    DOC=mockDoc();
+    activeHost='all';
+    const vis=pageRenderHTML().replace(/ title="[^"]*"/g,'');
+    chk('grep-zero-pidlog-markup', vis.indexOf('pidlog')<0&&vis.indexOf('grid-row')<0);
+    chk('grep-zero-pid-lines', !/\bpid \d+/.test(vis));
+    chk('grep-zero-ended-lines', vis.indexOf('ended ')<0);
+    DOC=null;
   }
   return ['PASS terminal-root-grid','PASS live-root-dual','PASS end-flip','PASS both-surfaces-sync',
           'PASS stall-inv-grid','PASS mixed-partition','PASS order-newest-first','PASS chip-math',
-          'PASS no-status-fallback-grid','PASS ended-grid-only','PASS spawn-grid-html',
-          'PASS no-spawngridwrap-node','PASS spawn-grid-in-clibody','PASS no-bottom-pidlog-strip',
-          'PASS single-pidlog-in-render',
-          'PASS tree-no-status-pill','PASS tree-no-pid-pill','PASS grid-ident-keeps-pid',
-          'PASS grid-ended-no-completed','PASS grid-ended-no-failed','PASS grid-ended-no-cancelled',
-          'PASS grid-fallback-no-died-word','PASS grep-zero-tree-pills','PASS grep-zero-tree-terms',
+          'PASS no-status-fallback-grid','PASS ended-only-in-data','PASS ended-not-in-tree',
+          'PASS no-spawngridwrap-node','PASS no-pidlog-node',
+          'PASS tree-no-status-pill','PASS tree-no-pid-pill',
+          'PASS grep-zero-pidlog-markup','PASS grep-zero-pid-lines','PASS grep-zero-ended-lines',
+          'PASS grep-zero-tree-pills','PASS grep-zero-tree-terms',
           'PASS stalled-state-flashes','PASS stalled-tree-channel-match'];
 }
 function runModelLabelFixtures(){
