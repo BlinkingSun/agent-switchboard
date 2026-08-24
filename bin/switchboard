@@ -148,7 +148,26 @@ _ARTIFACT_LISTDIR_INTERVAL = 60.0
 _ARTIFACT_CWD_CAP = 4
 _ARTIFACT_CWD_RETRY_MAX = 5
 _ARTIFACT_CWD_RETRY_INTERVAL = 30.0
-GROK_ARTIFACT_FILES = ("chat_history.jsonl", "updates.jsonl", "summary.json")
+GROK_ARTIFACT_FILES = (
+    "chat_history.jsonl",
+    "updates.jsonl",
+    "summary.json",
+    "events.jsonl",
+)
+_ARTIFACT_TAIL_CAP = 16
+ACTIVE_HOLD_DEFAULT = 900.0
+TAIL_BYTES_DEFAULT = 8192
+TAIL_BYTES_RETRY_DEFAULT = 65536
+_CLAUDE_SKIP_META = frozenset(
+    {
+        "last-prompt",
+        "ai-title",
+        "mode",
+        "bridge-session",
+        "file-history-snapshot",
+        "attachment",
+    }
+)
 
 # ---- Lifecycle env knobs ----
 # Idle self-exit: busy = cli_busy() OR viewer_running() OR any ACTIVE slot,
@@ -297,6 +316,7 @@ _CWD_RESOLVE_MEMO = {}
 _ART_SWEEP_STAT_COUNT = 0
 _ART_SWEEP_LISTDIR_COUNT = 0
 _ART_SWEEP_PROC_CWD_COUNT = 0
+_ART_SWEEP_TAIL_COUNT = 0
 _MODEL_DEFAULTS = {"claude": None, "grok": None, "cursor": None, "loaded_at": 0.0}
 
 
@@ -960,28 +980,63 @@ def _parse_iso_ts(s):
             return None
 
 
-def _proc_cwd(pid):
-    """Best-effort cwd of a live pid. Never raises. Tests with fake pids → None."""
+def _proc_lsof_info(pid):
+    """Best-effort cwd + open file paths for a live pid. One probe. Never raises."""
     if not pid:
-        return None
+        return {"cwd": None, "files": []}
     if os.name != "nt":
+        cwd = None
+        files = []
         try:
-            return os.readlink("/proc/%d/cwd" % int(pid))
+            cwd = os.readlink("/proc/%d/cwd" % int(pid))
         except Exception:
             pass
         try:
-            out = subprocess.check_output(
-                ["lsof", "-a", "-p", str(int(pid)), "-d", "cwd", "-Fn"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-                timeout=0.4,
-            )
-            for line in out.splitlines():
-                if line.startswith("n"):
-                    return line[1:]
+            fd_dir = "/proc/%d/fd" % int(pid)
+            for name in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(os.path.join(fd_dir, name))
+                    if target.startswith("/"):
+                        files.append(target)
+                except Exception:
+                    pass
         except Exception:
             pass
-    return None
+        if cwd or files:
+            return {"cwd": cwd, "files": files}
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-p", str(int(pid)), "-Fn"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=0.4,
+        )
+        cwd = None
+        files = []
+        pending = None
+        for line in out.splitlines():
+            if line == "fcwd":
+                pending = "cwd"
+            elif line.startswith("f"):
+                pending = "file"
+            elif line.startswith("n"):
+                path = line[1:]
+                if pending == "cwd":
+                    cwd = path
+                elif pending == "file":
+                    files.append(path)
+                pending = None
+        return {"cwd": cwd, "files": files}
+    except Exception:
+        return {"cwd": None, "files": []}
+
+
+def _proc_cwd(pid):
+    """Best-effort cwd of a live pid. Never raises. Tests may monkeypatch this."""
+    return _proc_lsof_info(pid).get("cwd")
+
+
+_BUILTIN_PROC_CWD = _proc_cwd
 
 
 def _grok_cwd_root(cwd):
@@ -1714,6 +1769,189 @@ def _artifact_active_window():
     return ARTIFACT_ACTIVE_WINDOW
 
 
+def _active_hold():
+    raw = os.environ.get("AGENT_SWITCHBOARD_ACTIVE_HOLD")
+    if raw is not None and raw != "":
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return ACTIVE_HOLD_DEFAULT
+
+
+def _tail_bytes():
+    raw = os.environ.get("AGENT_SWITCHBOARD_TAIL_BYTES")
+    if raw is not None and raw != "":
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return TAIL_BYTES_DEFAULT
+
+
+def _tail_bytes_retry():
+    raw = os.environ.get("AGENT_SWITCHBOARD_TAIL_BYTES_RETRY")
+    if raw is not None and raw != "":
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return TAIL_BYTES_RETRY_DEFAULT
+
+
+def _tail_jsonl_records(path, max_bytes):
+    """Bounded tail read of jsonl records. Never raises."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    lines = data.splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def _is_headless_keep_kind(node):
+    return node.get("kind") in ("claude", "grok", "cursor") and node.get("mode") == "headless"
+
+
+def _headless_first_obs_active(node, rec):
+    """Fresh-spawn green only when the lane has a resolvable work identity."""
+    kind = node.get("kind")
+    if kind == "grok":
+        return bool(node.get("session_id"))
+    if kind == "cursor":
+        ch = node.get("channel")
+        return bool(ch and name_ok(str(ch)))
+    if kind == "claude":
+        cmd = rec.get("command") or ""
+        meta = _parse_wrapper_flags(cmd, "claude_cli")
+        cwd = meta.get("cwd_arg")
+        if node.get("task") or node.get("lane"):
+            return True
+        if not cwd:
+            return False
+        project_dir = claude_project_dir(os.path.expanduser(cwd))
+        return bool(project_dir and os.path.isdir(project_dir))
+    return False
+
+
+def _pick_claude_jsonl(files, projects_root):
+    root = os.path.normpath(os.path.expanduser(projects_root or ""))
+    candidates = []
+    for p in files or []:
+        if not p.endswith(".jsonl") or p.endswith(".lock"):
+            continue
+        if root and not os.path.normpath(p).startswith(root):
+            continue
+        candidates.append(p)
+    if not candidates:
+        return None
+    uuid_re = re.compile(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        re.I,
+    )
+    for p in candidates:
+        if uuid_re.search(os.path.basename(p)):
+            return p
+    return candidates[0]
+
+
+def _claude_completion_from_records(records):
+    for rec in reversed(records or []):
+        typ = rec.get("type")
+        if typ in _CLAUDE_SKIP_META:
+            continue
+        if typ == "system":
+            sub = rec.get("subtype")
+            if sub == "stop_hook_summary":
+                continue
+            if sub == "turn_duration":
+                return "complete"
+        if typ == "result":
+            return "complete"
+        if typ == "assistant":
+            msg = rec.get("message") or {}
+            stop = msg.get("stop_reason")
+            content = msg.get("content") or []
+            has_text = any(
+                isinstance(b, dict) and b.get("type") == "text" for b in content
+            )
+            has_tool = any(
+                isinstance(b, dict) and b.get("type") == "tool_use" for b in content
+            )
+            only_thinking = bool(content) and all(
+                isinstance(b, dict) and b.get("type") == "thinking" for b in content
+            )
+            if stop == "end_turn" and has_text and not has_tool:
+                return "complete"
+            if stop == "tool_use" or has_tool or only_thinking:
+                return "in_progress"
+            return "in_progress"
+        if typ == "user":
+            return "in_progress"
+        if typ:
+            return "in_progress"
+    return None
+
+
+def _grok_completion_from_records(records):
+    if not records:
+        return None
+    typ = records[-1].get("type")
+    if typ == "turn_ended":
+        return "complete"
+    if typ in ("turn_started", "phase_changed", "tool_started", "tool_completed"):
+        return "in_progress"
+    return None
+
+
+def _cursor_hb_completion(records):
+    if not records:
+        return None
+    typ = records[-1].get("type")
+    if typ == "result":
+        return "complete"
+    if typ in ("progress", "tool_started", "tool_completed", "system"):
+        return "in_progress"
+    return None
+
+
+def _cursor_log_completion(records):
+    if not records:
+        return None
+    ev = records[-1].get("event")
+    if ev == "complete":
+        return "complete"
+    if ev == "start":
+        return "in_progress"
+    return None
+
+
+def _completion_file_fresh(path, now_wall):
+    """Ignore stale in_progress tails; complete/result always trusted."""
+    try:
+        age = float(now_wall) - os.path.getmtime(path)
+        if age < 0:
+            return (-age) <= 120.0
+        return age <= _active_hold()
+    except OSError:
+        return False
+
+
 def _artifact_eval_active(prev_art, mtime, size, now_wall, mono):
     """Artifact-active per R4: recency OR growth since prev sample."""
     if mtime is None:
@@ -1762,6 +2000,8 @@ def _artifact_sample_grok(node, rec, resolve_cwd_fn, stat_fn):
         if hit is None:
             continue
         mt, sz = hit
+        if fname == "events.jsonl":
+            continue
         if best is None or mt > best[0]:
             best = (mt, sz)
     return best
@@ -1790,10 +2030,14 @@ def _attach_cli_status(forest, snap, now, mono):
     it is stored in _CLI_CACHE["payload"]. Caller holds _CLI_CACHE_LOCK.
     """
     global _ART_SWEEP_STAT_COUNT, _ART_SWEEP_LISTDIR_COUNT, _ART_SWEEP_PROC_CWD_COUNT
+    global _ART_SWEEP_TAIL_COUNT
     _ART_SWEEP_STAT_COUNT = 0
     _ART_SWEEP_LISTDIR_COUNT = 0
     _ART_SWEEP_PROC_CWD_COUNT = 0
-    sweep = {"stats": 0, "listdir": 0, "proc_cwd": 0}
+    _ART_SWEEP_TAIL_COUNT = 0
+    sweep = {"stats": 0, "listdir": 0, "proc_cwd": 0, "tails": 0}
+    tail_budget = _ARTIFACT_TAIL_CAP
+    hold_window = _active_hold()
 
     snap = snap or {}
     prev_status_by_pid = {}
@@ -1821,38 +2065,119 @@ def _attach_cli_status(forest, snap, now, mono):
         except OSError:
             return None
 
-    def _resolve_cwd(pid, key):
+    def _proc_info(pid, key):
         nonlocal proc_cwd_new
         memo = _CWD_RESOLVE_MEMO.get(key) or {}
-        if memo.get("permanent"):
-            return memo.get("cwd")
-        if memo.get("cwd"):
-            return memo["cwd"]
+        if memo.get("permanent") and memo.get("lsof_done"):
+            return memo
+        if memo.get("lsof_done"):
+            return memo
         tries = int(memo.get("tries") or 0)
         if tries >= _ARTIFACT_CWD_RETRY_MAX:
             _CWD_RESOLVE_MEMO[key] = {
                 "tries": tries,
                 "resolved_mono": memo.get("resolved_mono", float(mono)),
                 "permanent": True,
+                "lsof_done": True,
+                "cwd": memo.get("cwd"),
+                "files": memo.get("files") or [],
             }
-            return None
+            return _CWD_RESOLVE_MEMO[key]
         resolved_mono = memo.get("resolved_mono")
         if resolved_mono is not None and float(mono) - float(resolved_mono) < _ARTIFACT_CWD_RETRY_INTERVAL:
-            return None
+            return memo
         if proc_cwd_new >= _ARTIFACT_CWD_CAP:
-            return None
+            return memo
         proc_cwd_new += 1
         sweep["proc_cwd"] += 1
-        cwd = _proc_cwd(pid)
+        if _proc_cwd is _BUILTIN_PROC_CWD:
+            lsof = _proc_lsof_info(pid)
+            cwd = lsof.get("cwd")
+            files = lsof.get("files") or []
+        else:
+            cwd = _proc_cwd(pid)
+            files = []
         entry = {
             "tries": tries + 1,
             "resolved_mono": float(mono),
             "cwd": cwd,
+            "files": files,
+            "lsof_done": True,
         }
-        if not cwd and entry["tries"] >= _ARTIFACT_CWD_RETRY_MAX:
+        if not entry["cwd"] and entry["tries"] >= _ARTIFACT_CWD_RETRY_MAX:
             entry["permanent"] = True
         _CWD_RESOLVE_MEMO[key] = entry
-        return cwd
+        return entry
+
+    def _resolve_cwd(pid, key):
+        return _proc_info(pid, key).get("cwd")
+
+    def _tail_read(path):
+        nonlocal tail_budget
+        if not path or tail_budget <= 0:
+            return None
+        tail_budget -= 1
+        sweep["tails"] += 1
+        try:
+            first_w = _tail_bytes()
+            recs = _tail_jsonl_records(path, first_w)
+            if not recs:
+                sz = os.path.getsize(path)
+                if sz > first_w:
+                    if tail_budget <= 0:
+                        return None
+                    tail_budget -= 1
+                    sweep["tails"] += 1
+                    recs = _tail_jsonl_records(path, _tail_bytes_retry())
+            return recs
+        except Exception:
+            return None
+
+    def _claude_transcript_path(node, rec, key, started_ts, prev_art):
+        prev_art = prev_art or {}
+        path = prev_art.get("path")
+        if path and os.path.isfile(path):
+            return path
+        cmd = rec.get("command") or ""
+        meta = _parse_wrapper_flags(cmd, "claude_cli")
+        cwd = meta.get("cwd_arg")
+        if cwd:
+            cwd = os.path.expanduser(cwd)
+        elif node.get("pid") is not None:
+            cwd = _resolve_cwd(node["pid"], key)
+        if not cwd:
+            return None
+        if node.get("pid") is None:
+            return None
+        files = (_proc_info(node["pid"], key).get("files") or [])
+        path = _pick_claude_jsonl(files, CLAUDE_PROJECTS_ROOT)
+        if path:
+            merged = dict(prev_art)
+            merged["path"] = path
+            _ART_PREV[key] = merged
+        return path
+
+    def _grok_events_path(node, rec, key):
+        sid = node.get("session_id")
+        if not sid or not name_ok(str(sid)):
+            return None
+        cwd = _artifact_grok_cwd(node, rec, lambda: _resolve_cwd(node.get("pid"), key))
+        if not cwd:
+            return None
+        root = _grok_cwd_root(cwd)
+        if not root:
+            return None
+        return os.path.join(root, str(sid), "events.jsonl")
+
+    def _cursor_tail_paths(node):
+        channel = node.get("channel")
+        if not channel or not name_ok(str(channel)):
+            return None, None
+        log_p = os.path.join(CURSOR_LOG_DIR, "%s.jsonl" % channel)
+        hb_p = os.path.join(CURSOR_LOG_DIR, "%s.hb.jsonl" % channel)
+        if os.path.isfile(hb_p):
+            return log_p, hb_p
+        return log_p, None
 
     def _sample_grok(node, rec, key):
         return _artifact_sample_grok(
@@ -1865,116 +2190,97 @@ def _attach_cli_status(forest, snap, now, mono):
     def _sample_cursor(node):
         return _artifact_sample_cursor(node, _stat_path)
 
-    def _claude_transcript_path(project_dir, started_ts, key, prev_art):
-        prev_art = prev_art or {}
-        path = prev_art.get("path")
-        last_listdir = prev_art.get("listdir_mono")
-        grew_recently = False
-        if path:
-            hit = _stat_path(path)
-            if hit is not None:
-                mt, sz = hit
-                prev_mtime = prev_art.get("mtime")
-                prev_size = prev_art.get("size")
-                grew_recently = (prev_mtime is not None and mt > prev_mtime) or (
-                    prev_size is not None
-                    and sz is not None
-                    and sz > prev_size
-                )
-                if grew_recently:
-                    return path
-        need_listdir = path is None or not grew_recently
-        if need_listdir:
-            if last_listdir is not None and float(mono) - float(last_listdir) < _ARTIFACT_LISTDIR_INTERVAL:
-                return path
-            if not os.path.isdir(project_dir):
-                return None
-            sweep["listdir"] += 1
-            floor = (started_ts - 5) if started_ts is not None else None
-            newest = None
-            try:
-                for name in os.listdir(project_dir):
-                    if not name.endswith(".jsonl"):
-                        continue
-                    p = os.path.join(project_dir, name)
-                    if not os.path.isfile(p):
-                        continue
-                    try:
-                        mt = os.path.getmtime(p)
-                    except OSError:
-                        continue
-                    if floor is not None and mt < floor:
-                        continue
-                    if newest is None or mt > newest[0]:
-                        newest = (mt, p)
-            except OSError:
-                return None
-            path = newest[1] if newest else None
-            if prev_art is not None:
-                prev_art = dict(prev_art)
-            else:
-                prev_art = {}
-            prev_art["listdir_mono"] = float(mono)
-            if path:
-                prev_art["path"] = path
-            _ART_PREV[key] = prev_art
-        return path
-
     def _sample_claude(node, rec, key, started_ts):
-        cmd = rec.get("command") or ""
-        meta = _parse_wrapper_flags(cmd, "claude_cli")
-        cwd = meta.get("cwd_arg")
-        if cwd:
-            cwd = os.path.expanduser(cwd)
-        elif node.get("pid") is not None:
-            cwd = _resolve_cwd(node["pid"], key)
-        if not cwd:
-            return None
-        project_dir = claude_project_dir(cwd)
-        if not project_dir or not os.path.isdir(project_dir):
-            return None
         prev_art = _ART_PREV.get(key)
-        path = _claude_transcript_path(project_dir, started_ts, key, prev_art)
+        path = _claude_transcript_path(node, rec, key, started_ts, prev_art)
         if not path:
             return None
         hit = _stat_path(path)
         return hit
 
-    def _artifact_promote(node, rec, key, started_ts):
-        if stat_budget <= 0:
-            return False
+    def _artifact_sample(node, rec, key, started_ts):
         kind = node.get("kind")
         try:
             if kind == "grok":
-                sample = _sample_grok(node, rec, key)
-            elif kind == "cursor":
-                sample = _sample_cursor(node)
-            elif kind == "claude":
-                sample = _sample_claude(node, rec, key, started_ts)
-            else:
-                return False
-            if sample is None:
-                return False
-            mt, sz = sample
-            if mt is None:
-                return False
-            prev_art = _ART_PREV.get(key)
-            active = _artifact_eval_active(prev_art, mt, sz, float(now), float(mono))
-            _ART_PREV[key] = {
-                "path": prev_art.get("path") if prev_art else None,
-                "mtime": float(mt),
-                "size": int(sz) if sz is not None else None,
-                "mono": float(mono),
-                "resolved_mono": float(mono),
-                "tries": int((prev_art or {}).get("tries") or 0),
-            }
-            if prev_art and prev_art.get("path"):
-                _ART_PREV[key]["path"] = prev_art["path"]
-            if prev_art and prev_art.get("listdir_mono") is not None:
-                _ART_PREV[key]["listdir_mono"] = prev_art["listdir_mono"]
-            return active
+                return _sample_grok(node, rec, key)
+            if kind == "cursor":
+                return _sample_cursor(node)
+            if kind == "claude":
+                return _sample_claude(node, rec, key, started_ts)
         except Exception:
-            return False
+            return None
+        return None
+
+    def _completion_probe(node, rec, key, started_ts, prev_art, allow_stale=False):
+        kind = node.get("kind")
+        try:
+            if kind == "claude":
+                path = _claude_transcript_path(node, rec, key, started_ts, prev_art)
+                if not path:
+                    return None
+                recs = _tail_read(path)
+                hit = _claude_completion_from_records(recs)
+                if hit == "in_progress" and not allow_stale and not _completion_file_fresh(path, now):
+                    return None
+                return hit
+            if kind == "grok":
+                path = _grok_events_path(node, rec, key)
+                if not path:
+                    return None
+                recs = _tail_read(path)
+                hit = _grok_completion_from_records(recs)
+                if hit == "in_progress" and not allow_stale:
+                    act = _artifact_sample_grok(
+                        node,
+                        rec,
+                        lambda: _resolve_cwd(node.get("pid"), key),
+                        _stat_path,
+                    )
+                    try:
+                        ev_mt = os.path.getmtime(path)
+                        if act is not None and abs(ev_mt - act[0]) > 120.0:
+                            hit = None
+                    except OSError:
+                        pass
+                if hit == "in_progress" and not allow_stale and not _completion_file_fresh(path, now):
+                    return None
+                return hit
+            if kind == "cursor":
+                log_p, hb_p = _cursor_tail_paths(node)
+                if not log_p:
+                    return None
+                if hb_p:
+                    recs = _tail_read(hb_p)
+                    hit = _cursor_hb_completion(recs)
+                    if hit:
+                        if hit == "in_progress" and not allow_stale and not _completion_file_fresh(hb_p, now):
+                            return None
+                        return hit
+                recs = _tail_read(log_p)
+                hit = _cursor_log_completion(recs)
+                if hit == "in_progress" and not allow_stale and not _completion_file_fresh(log_p, now):
+                    return None
+                return hit
+        except Exception:
+            return None
+        return None
+
+    def _store_art(key, prev_art, path, mt, sz, last_active_wall, completed):
+        merged = dict(prev_art or {})
+        if path:
+            merged["path"] = path
+        if mt is not None:
+            merged["mtime"] = float(mt)
+        if sz is not None:
+            merged["size"] = int(sz)
+        merged["mono"] = float(mono)
+        merged["resolved_mono"] = float(mono)
+        if last_active_wall is not None:
+            merged["last_active_wall"] = float(last_active_wall)
+        elif "last_active_wall" in merged and last_active_wall is None:
+            pass
+        merged["completed"] = bool(completed)
+        _ART_PREV[key] = merged
 
     def walk(node, parent_sid):
         pid = node.get("pid")
@@ -1997,32 +2303,209 @@ def _attach_cli_status(forest, snap, now, mono):
             node["id"] = _ledger_id_os(pid, lstart)
             cpu_s = rec.get("cpu_s")
             key = (pid, lstart)
-            prev = _CPU_PREV.get(key)
+            prev_cpu = _CPU_PREV.get(key)
+            prev_art = _ART_PREV.get(key) or {}
+            had_prev_art = key in _ART_PREV
+            last_active_wall = prev_art.get("last_active_wall")
+            completed = bool(prev_art.get("completed"))
+            child_active = _first_obs_status(node) == "active"
+            is_first_obs = (
+                prev_cpu is None or cpu_s is None or prev_cpu.get("cpu_s") is None
+            )
             carried = False
-            if prev is None or cpu_s is None or prev.get("cpu_s") is None:
-                status = _first_obs_status(node)
-                if cpu_s is not None:
-                    _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
-            else:
-                gap = float(mono) - float(prev["mono"])
-                delta = float(cpu_s) - float(prev["cpu_s"])
+            status = "running"
+            art_path = prev_art.get("path")
+            sample = None
+            completion = None
+
+            if not is_first_obs:
+                gap = float(mono) - float(prev_cpu["mono"])
+                delta = float(cpu_s) - float(prev_cpu["cpu_s"])
                 if gap > 120.0 or delta < 0:
-                    status = _first_obs_status(node)
-                    _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
+                    is_first_obs = True
                 elif gap < 1.0:
                     status = prev_status_by_pid.get(pid) or "running"
                     carried = True
+                    node["status"] = status if status in CLI_TREE_STATUSES else "running"
+                    next_sid = node.get("session_id") or (
+                        sid if node.get("kind") == "grok" else parent_sid
+                    )
+                    for c in node.get("children") or []:
+                        walk(c, next_sid)
+                    return
                 elif delta >= 0.05 and gap >= 1.0:
                     status = "active"
+                    last_active_wall = float(now)
+                    completed = False
                     _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
+                    _store_art(key, prev_art, art_path, None, None, last_active_wall, completed)
+                    node["status"] = status
+                    next_sid = node.get("session_id") or (
+                        sid if node.get("kind") == "grok" else parent_sid
+                    )
+                    for c in node.get("children") or []:
+                        walk(c, next_sid)
+                    return
+                else:
+                    _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
+
+            if child_active:
+                status = "active"
+                last_active_wall = float(now)
+                completed = False
+                if cpu_s is not None:
+                    _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
+                _store_art(key, prev_art, art_path, None, None, last_active_wall, completed)
+                node["status"] = status
+                next_sid = node.get("session_id") or (
+                    sid if node.get("kind") == "grok" else parent_sid
+                )
+                for c in node.get("children") or []:
+                    walk(c, next_sid)
+                return
+
+            if cpu_s is not None and (is_first_obs or prev_cpu is not None):
+                _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
+
+            artifact_grew = False
+            tail_at_node = tail_budget
+            if (
+                not carried
+                and node.get("kind") in ("claude", "grok", "cursor")
+                and not (had_prev_art and tail_at_node <= 0)
+            ):
+                sample = _artifact_sample(node, rec, key, started_ts)
+                if sample is not None:
+                    mt, sz = sample
+                    prev_mtime = prev_art.get("mtime")
+                    prev_size = prev_art.get("size")
+                    artifact_grew = (prev_mtime is not None and mt > prev_mtime) or (
+                        prev_size is not None
+                        and sz is not None
+                        and sz > prev_size
+                    )
+                    if node.get("kind") == "claude":
+                        art_path = _claude_transcript_path(
+                            node, rec, key, started_ts, _ART_PREV.get(key) or prev_art
+                        )
+                    elif node.get("kind") == "grok":
+                        art_path = _grok_events_path(node, rec, key) or art_path
+                    prev_art = _ART_PREV.get(key) or prev_art
+
+                skip_tail = False
+                if completed and not artifact_grew:
+                    skip_tail = True
+                has_completion_path = False
+                if node.get("kind") == "grok":
+                    has_completion_path = bool(_grok_events_path(node, rec, key))
+                elif node.get("kind") == "claude":
+                    has_completion_path = bool(
+                        _claude_transcript_path(
+                            node, rec, key, started_ts, _ART_PREV.get(key) or prev_art
+                        )
+                    )
+                elif node.get("kind") == "cursor":
+                    has_completion_path = bool(_cursor_tail_paths(node)[0])
+                if not skip_tail and tail_budget > 0 and (
+                    sample is not None or has_completion_path
+                ):
+                    completion = _completion_probe(
+                        node, rec, key, started_ts, prev_art, allow_stale=artifact_grew
+                    )
+
+            artifact_active = False
+            if sample is not None:
+                mt, sz = sample
+                if completed and artifact_grew:
+                    artifact_active = completion == "in_progress"
+                else:
+                    artifact_active = _artifact_eval_active(
+                        prev_art, mt, sz, float(now), float(mono)
+                    )
+
+            if is_first_obs:
+                if _is_headless_keep_kind(node) and _headless_first_obs_active(node, rec):
+                    if completion == "complete":
+                        status = "running"
+                        completed = True
+                    elif sample is None and (
+                        cpu_s is None or float(cpu_s) <= 0.0
+                    ):
+                        status = "active"
+                        last_active_wall = float(now)
+                        completed = False
+                    elif artifact_active or completion == "in_progress":
+                        status = "active"
+                        last_active_wall = float(now)
+                        completed = False
+                    else:
+                        status = "running"
                 else:
                     status = "running"
-                    _CPU_PREV[key] = {"cpu_s": float(cpu_s), "mono": float(mono)}
+                    if completion == "complete":
+                        status = "running"
+                        completed = True
+                    elif completion == "in_progress" or artifact_active:
+                        status = "active"
+                        last_active_wall = float(now)
+                        completed = False
+            else:
+                if completion == "complete":
+                    status = "running"
+                    completed = True
+                elif completed and not artifact_grew:
+                    status = "running"
+                elif completed and artifact_grew and completion == "in_progress":
+                    status = "active"
+                    last_active_wall = float(now)
+                    completed = False
+                elif completion == "in_progress":
+                    if (
+                        last_active_wall is not None
+                        and float(now) - float(last_active_wall) > hold_window
+                    ):
+                        status = "running"
+                    else:
+                        status = "active"
+                        last_active_wall = float(now)
+                        completed = False
+                elif artifact_active or (
+                    last_active_wall is not None
+                    and float(now) - float(last_active_wall) <= hold_window
+                    and not completed
+                ):
+                    status = "active"
+                    if artifact_active or completion == "in_progress":
+                        last_active_wall = float(now)
+                        completed = False
+                else:
+                    status = "running"
+
             if status not in CLI_TREE_STATUSES:
                 status = "running"
-            if status == "running" and not carried:
-                if _artifact_promote(node, rec, key, started_ts):
-                    status = "active"
+
+            if sample is not None and not (had_prev_art and tail_at_node <= 0):
+                mt, sz = sample
+                _store_art(
+                    key,
+                    prev_art,
+                    art_path,
+                    mt,
+                    sz,
+                    last_active_wall,
+                    completed,
+                )
+            elif (last_active_wall is not None or completed) and not had_prev_art:
+                _store_art(
+                    key,
+                    prev_art,
+                    art_path,
+                    prev_art.get("mtime"),
+                    prev_art.get("size"),
+                    last_active_wall,
+                    completed,
+                )
+
             node["status"] = status
 
         next_sid = node.get("session_id") or (
@@ -2037,6 +2520,7 @@ def _attach_cli_status(forest, snap, now, mono):
     _ART_SWEEP_STAT_COUNT = sweep["stats"]
     _ART_SWEEP_LISTDIR_COUNT = sweep["listdir"]
     _ART_SWEEP_PROC_CWD_COUNT = sweep["proc_cwd"]
+    _ART_SWEEP_TAIL_COUNT = sweep["tails"]
 
     if snap:
         live_keys = set()

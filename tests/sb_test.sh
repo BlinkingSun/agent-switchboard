@@ -2645,29 +2645,46 @@ try:
     with open(fresh_p, "w") as f:
         f.write("{}\n")
     os.utime(fresh_p, (NOW - 1, NOW - 1))
+    real_lsof_i = sb._proc_lsof_info
+    sb._proc_lsof_info = lambda pid, p=fresh_p: {"cwd": cwd_cl, "files": [p]}
     p_fr = payload_for({921: rec(921, 1, "??", cmd_cl, cpu_s=1.0)}, 9000.0, now=NOW)
+    sb._proc_lsof_info = real_lsof_i
     assert_true(find(p_fr["roots"], lambda n: n["pid"] == 921)["status"] == "active", "fresh transcript => active")
     print("PASS_UNIT T54i claude started-5 filter")
 
-    # claude per-cwd over-attribution (intended)
+    # claude per-session attribution (rewritten T54j)
     reset_ledger(tmp)
     os.makedirs(proj, exist_ok=True)
-    shared = os.path.join(proj, "shared.jsonl")
-    with open(shared, "w") as f:
-        f.write("{}\n")
-    os.utime(shared, (NOW - 1, NOW - 1))
+    path_a = os.path.join(proj, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeaaaa.jsonl")
+    path_b = os.path.join(proj, "bbbbbbbb-cccc-dddd-eeee-ffffffffbbbb.jsonl")
+    with open(path_a, "w") as f:
+        f.write('{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use"}]}}\n')
+    with open(path_b, "w") as f:
+        f.write('{"type":"system","subtype":"turn_duration"}\n')
+    os.utime(path_a, (NOW - 1, NOW - 1))
+    os.utime(path_b, (NOW - 600, NOW - 600))
     cmd_a = claude_cmd + " --cwd " + cwd_cl
     cmd_b = claude_cmd + " --cwd " + cwd_cl
+    real_lsof = sb._proc_lsof_info
+    def stub_lsof(pid):
+        if int(pid) == 930:
+            return {"cwd": cwd_cl, "files": [path_a]}
+        if int(pid) == 931:
+            return {"cwd": cwd_cl, "files": [path_b]}
+        return {"cwd": None, "files": []}
+    sb._proc_lsof_info = stub_lsof
     snap2 = {
         930: rec(930, 1, "??", cmd_a, cpu_s=1.0),
         931: rec(931, 1, "??", cmd_b, cpu_s=1.0),
     }
+    payload_for(snap2, 9098.0, now=NOW)
     p_ov = payload_for(snap2, 9100.0, now=NOW)
+    sb._proc_lsof_info = real_lsof
     sa = find(p_ov["roots"], lambda n: n["pid"] == 930)
     sb_node = find(p_ov["roots"], lambda n: n["pid"] == 931)
-    assert_true(sa and sb_node and sa["status"] == "active" and sb_node["status"] == "active",
-                "per-cwd over-attribution both active")
-    print("PASS_UNIT T54j claude per-cwd over-attribution intended")
+    assert_true(sa and sb_node and sa["status"] == "active" and sb_node["status"] == "running",
+                "per-session only generator active")
+    print("PASS_UNIT T54j claude per-session attribution")
 
     # virtual grok-sub never artifact-sampled
     reset_ledger(tmp)
@@ -2740,7 +2757,7 @@ if [ $? -eq 0 ]; then
   ck ok ok "T54g grok three named files not dir mtime"
   ck ok ok "T54h cursor name_ok gate; valid channel active"
   ck ok ok "T54i claude newest-jsonl honours started-5 filter"
-  ck ok ok "T54j claude per-cwd over-attribution intended"
+  ck ok ok "T54j claude per-session attribution (only generator active)"
   ck ok ok "T54k virtual grok-subs never artifact-sampled"
   ck ok ok "T54l R9 fallbacks keep CPU-derived status"
   ck ok ok "T54m reset_cli_cache clears _ART_PREV"
@@ -2856,7 +2873,7 @@ try:
     assert_true(sb._ART_SWEEP_STAT_COUNT == 0, "cpu active zero stats")
     print("PASS_UNIT T55b cpu-delta short-circuit zero stats")
 
-    # claude listdir at most once per 60s
+    # claude fd miss => zero listdir, no sibling bleed
     reset_all(tmp)
     sb.CLAUDE_PROJECTS_ROOT = os.path.join(tmp, "cp")
     cwd_cl = "/tmp/t55-cl"
@@ -2866,12 +2883,11 @@ try:
     open(tr, "w").close()
     os.utime(tr, (NOW - 1, NOW - 1))
     ccmd = "/home/user/.local/bin/claude --cwd " + cwd_cl
+    sb._proc_lsof_info = lambda pid: {"cwd": cwd_cl, "files": []}
     payload_for({300: rec(300, 1, "??", ccmd, cpu_s=1.0)}, 3000.0, now=NOW)
-    ld1 = sb._ART_SWEEP_LISTDIR_COUNT
-    payload_for({300: rec(300, 1, "??", ccmd, cpu_s=1.0)}, 3005.0, now=NOW + 5)
-    ld2 = sb._ART_SWEEP_LISTDIR_COUNT
-    assert_true(ld1 == 1 and ld2 == 0, "listdir once per 60s steady")
-    print("PASS_UNIT T55c claude listdir throttle")
+    assert_true(sb._ART_SWEEP_LISTDIR_COUNT == 0, "fd miss no listdir")
+    assert_true(find_status(payload_for({300: rec(300, 1, "??", ccmd, cpu_s=1.0)}, 3002.0, now=NOW), 300) == "running", "fd miss running")
+    print("PASS_UNIT T55c claude fd miss no listdir bleed")
 
     # _proc_cwd cap 4 new resolutions per sweep
     reset_all(tmp)
@@ -2986,7 +3002,7 @@ EOF
 if [ $? -eq 0 ]; then
   ck ok ok "T55a already-active-from-child => zero artifact stats"
   ck ok ok "T55b already-active-from-cpu-delta => zero artifact stats"
-  ck ok ok "T55c claude listdir at most once per 60s"
+  ck ok ok "T55c claude fd miss => zero listdir, stays running"
   ck ok ok "T55d _proc_cwd at most 4 new resolutions per sweep"
   ck ok ok "T55d2 grok artifact path uses capped _proc_cwd (6-pid burst)"
   ck ok ok "T55e 512-stat backstop; late _ART_PREV untouched"
@@ -3347,6 +3363,522 @@ t53_alive "$CHILD53K" && ck alive dead "T53k CLI reap killed the worker" || ck o
 t53_kill "$CHILD53K" "$WRAP53K"
 kill "$SRV53K" 2>/dev/null
 wait 2>/dev/null
+
+# T56: completion-aware quiet + ACTIVE-hold unit (no ports)
+python3 - "$SB" <<'EOF'
+import importlib.machinery, importlib.util, sys, os, json, tempfile, shutil, time, urllib.parse
+
+loader = importlib.machinery.SourceFileLoader("sb", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+sb = importlib.util.module_from_spec(spec)
+loader.exec_module(sb)
+
+NOW = 1723252800.0
+LSTART = "Fri Aug  9 12:00:00 2024"
+ALLOW = sb.CLI_TREE_STATUSES
+
+
+def rec(pid, ppid, tty, command, lstart=LSTART, cputime="0:00.00", cpu_s=0.0):
+    return {
+        "pid": pid, "ppid": ppid, "tty": tty, "lstart": lstart,
+        "command": command, "cputime": cputime, "cpu_s": cpu_s,
+    }
+
+
+def find(nodes, pred):
+    for n in nodes:
+        if pred(n):
+            return n
+        hit = find(n.get("children") or [], pred)
+        if hit:
+            return hit
+    return None
+
+
+def assert_true(cond, msg):
+    if not cond:
+        print("FAIL_ASSERT", msg)
+        sys.exit(1)
+
+
+def reset_all(root):
+    sb.ROOT = root
+    sb.reset_cli_cache()
+    sb.reset_model_defaults()
+    sb.GROK_SESS_ROOT = os.path.join(root, "grok-sess")
+    sb.GROK_ACTIVE_SESSIONS = os.path.join(root, "grok-active.json")
+    os.makedirs(sb.GROK_SESS_ROOT, exist_ok=True)
+    with open(sb.GROK_ACTIVE_SESSIONS, "w") as f:
+        json.dump([], f)
+    sb.CLAUDE_PROJECTS_ROOT = os.path.join(root, "claude-projects")
+    os.makedirs(sb.CLAUDE_PROJECTS_ROOT, exist_ok=True)
+    sb.CURSOR_LOG_DIR = os.path.join(root, "cursor-logs")
+    sb.CURSOR_CHANNEL_DIR = os.path.join(root, "cursor-channels")
+    os.makedirs(sb.CURSOR_LOG_DIR, exist_ok=True)
+    os.makedirs(sb.CURSOR_CHANNEL_DIR, exist_ok=True)
+    os.environ.pop("AGENT_SWITCHBOARD_ACTIVE_HOLD", None)
+    os.environ.pop("AGENT_SWITCHBOARD_TAIL_BYTES", None)
+    os.environ.pop("AGENT_SWITCHBOARD_TAIL_BYTES_RETRY", None)
+
+
+def payload_for(snap, mono, now=NOW):
+    sb.ps_cli_snapshot = lambda: snap
+    return sb.get_cli_payload(force=True, now=now, mono=mono)
+
+
+def claude_setup(tmp, name, lines, mtime):
+    cwd = "/tmp/t56-" + name
+    proj = sb.claude_project_dir(cwd)
+    os.makedirs(proj, exist_ok=True)
+    path = os.path.join(proj, name + ".jsonl")
+    with open(path, "w") as f:
+        for ln in lines:
+            f.write(ln if ln.endswith("\n") else ln + "\n")
+    os.utime(path, (mtime, mtime))
+    cmd = "/home/user/.local/bin/claude --cwd " + cwd
+    real = sb._proc_lsof_info
+    sb._proc_lsof_info = lambda pid, p=path: {"cwd": cwd, "files": [p]}
+    return cmd, path, real
+
+
+tmp = tempfile.mkdtemp(prefix="sb-t56-")
+try:
+    reset_all(tmp)
+    claude_cmd = "/home/user/.local/bin/claude"
+    grok_cmd = "/home/user/.grok/bin/grok"
+    cursor_cmd = "/home/user/.local/bin/cursor-agent"
+
+    # T56a claude turn_duration + fresh mtime => running (not recency-active)
+    reset_all(tmp)
+    cmd, path, real = claude_setup(tmp, "t56a", ['{"type":"system","subtype":"turn_duration"}'], NOW)
+    p = payload_for({100: rec(100, 1, "??", cmd, cpu_s=1.0)}, 1000.0, now=NOW)
+    sb._proc_lsof_info = real
+    assert_true(find(p["roots"], lambda n: n["pid"] == 100)["status"] == "running", "T56a")
+    print("PASS_UNIT T56a claude turn_duration => running")
+
+    # T56b tool_use + hold
+    reset_all(tmp)
+    cmd, path, real = claude_setup(tmp, "t56b",
+        ['{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use"}]}}'],
+        NOW - 300)
+    payload_for({101: rec(101, 1, "??", cmd, cpu_s=1.0)}, 2000.0, now=NOW)
+    p = payload_for({101: rec(101, 1, "??", cmd, cpu_s=1.0)}, 2002.0, now=NOW)
+    sb._proc_lsof_info = real
+    assert_true(find(p["roots"], lambda n: n["pid"] == 101)["status"] == "active", "T56b")
+    print("PASS_UNIT T56b claude tool_use hold => active")
+
+    # T56c stale hold expiry
+    reset_all(tmp)
+    cmd, path, real = claude_setup(tmp, "t56c",
+        ['{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use"}]}}'],
+        NOW - 960)
+    payload_for({102: rec(102, 1, "??", cmd, cpu_s=1.0)}, 3000.0, now=NOW - 960)
+    key = (102, LSTART)
+    sb._ART_PREV[key]["last_active_wall"] = NOW - 960
+    p = payload_for({102: rec(102, 1, "??", cmd, cpu_s=1.0)}, 3002.0, now=NOW)
+    sb._proc_lsof_info = real
+    assert_true(find(p["roots"], lambda n: n["pid"] == 102)["status"] == "running", "T56c")
+    print("PASS_UNIT T56c stale hold => running")
+
+    # T56d interactive first-obs idle transcript
+    reset_all(tmp)
+    cmd, path, real = claude_setup(tmp, "t56d", ['{"type":"system","subtype":"turn_duration"}'], NOW - 600)
+    p = payload_for({103: rec(103, 1, "ttys001", cmd, cpu_s=1.0)}, 4000.0, now=NOW)
+    sb._proc_lsof_info = real
+    assert_true(find(p["roots"], lambda n: n["pid"] == 103)["status"] == "running", "T56d")
+    print("PASS_UNIT T56d interactive first-obs => running")
+
+    # T56p headless grok first-obs cold => active
+    reset_all(tmp)
+    cwd_g = "/tmp/t56p"
+    enc = urllib.parse.quote(cwd_g, safe="")
+    sid = "019ff000-0000-0000-0000-00000000t56p"
+    cmd_g = grok_cmd + " --resume %s --cwd %s" % (sid, cwd_g)
+    p = payload_for({104: rec(104, 1, "??", cmd_g, cpu_s=0.0)}, 5000.0, now=NOW)
+    assert_true(find(p["roots"], lambda n: n["pid"] == 104)["status"] == "active", "T56p")
+    print("PASS_UNIT T56p headless grok first-obs => active")
+
+    # T56q headless grok COMPLETE decay
+    reset_all(tmp)
+    sdir = os.path.join(sb.GROK_SESS_ROOT, enc, sid)
+    os.makedirs(sdir, exist_ok=True)
+    ev = os.path.join(sdir, "events.jsonl")
+    with open(ev, "w") as f:
+        f.write('{"type":"turn_ended"}\n')
+    cmd_g = grok_cmd + " --resume %s --cwd %s" % (sid, cwd_g)
+    payload_for({105: rec(105, 1, "??", cmd_g, cpu_s=0.0)}, 5100.0, now=NOW)
+    p = payload_for({105: rec(105, 1, "??", cmd_g, cpu_s=0.0)}, 5102.0, now=NOW)
+    assert_true(find(p["roots"], lambda n: n["pid"] == 105)["status"] == "running", "T56q")
+    print("PASS_UNIT T56q headless grok COMPLETE => running")
+
+    # T56r per-session claude (same as T54j pattern)
+    reset_all(tmp)
+    cwd_cl = "/tmp/lane-t56r"
+    proj = sb.claude_project_dir(cwd_cl)
+    os.makedirs(proj)
+    pa = os.path.join(proj, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeaaaa.jsonl")
+    pb = os.path.join(proj, "bbbbbbbb-cccc-dddd-eeee-ffffffffbbbb.jsonl")
+    open(pa, "w").write('{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use"}]}}\n')
+    open(pb, "w").write('{"type":"system","subtype":"turn_duration"}\n')
+    os.utime(pa, (NOW - 1, NOW - 1))
+    os.utime(pb, (NOW - 600, NOW - 600))
+    ca = claude_cmd + " --cwd " + cwd_cl
+    real = sb._proc_lsof_info
+    sb._proc_lsof_info = lambda pid: {"cwd": cwd_cl, "files": [pa if int(pid) == 110 else pb]}
+    payload_for({110: rec(110, 1, "ttys002", ca, cpu_s=1.0), 111: rec(111, 1, "ttys003", ca, cpu_s=1.0)}, 6000.0)
+    p = payload_for({110: rec(110, 1, "ttys002", ca, cpu_s=1.0), 111: rec(111, 1, "ttys003", ca, cpu_s=1.0)}, 6002.0)
+    sb._proc_lsof_info = real
+    assert_true(find(p["roots"], lambda n: n["pid"] == 110)["status"] == "active", "T56r A")
+    assert_true(find(p["roots"], lambda n: n["pid"] == 111)["status"] == "running", "T56r B")
+    print("PASS_UNIT T56r per-session claude attribution")
+
+    # T56s fd miss: sibling growth must not mark idle session active
+    reset_all(tmp)
+    cwd_cl = "/tmp/lane-t56s"
+    proj = sb.claude_project_dir(cwd_cl)
+    os.makedirs(proj)
+    path_a = os.path.join(proj, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeaaaa.jsonl")
+    path_b = os.path.join(proj, "bbbbbbbb-cccc-dddd-eeee-ffffffffbbbb.jsonl")
+    with open(path_a, "w") as f:
+        f.write('{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use"}]}}\n')
+    with open(path_b, "w") as f:
+        f.write('{"type":"system","subtype":"turn_duration"}\n')
+    os.utime(path_a, (NOW - 1, NOW - 1))
+    os.utime(path_b, (NOW - 600, NOW - 600))
+    ca = claude_cmd + " --cwd " + cwd_cl
+    real_lsof = sb._proc_lsof_info
+    sb._proc_lsof_info = lambda pid: (
+        {"cwd": cwd_cl, "files": [path_a]}
+        if int(pid) == 112
+        else {"cwd": cwd_cl, "files": []}
+    )
+    snap_s = {
+        112: rec(112, 1, "ttys002", ca, cpu_s=1.0),
+        113: rec(113, 1, "ttys003", ca, cpu_s=1.0),
+    }
+    payload_for(snap_s, 6050.0, now=NOW)
+    with open(path_a, "a") as f:
+        f.write('{"type":"user","message":{"content":"more"}}\n')
+    os.utime(path_a, (NOW - 1, NOW - 1))
+    p = payload_for(snap_s, 6052.0, now=NOW)
+    sb._proc_lsof_info = real_lsof
+    assert_true(find(p["roots"], lambda n: n["pid"] == 112)["status"] == "active", "T56s A")
+    assert_true(find(p["roots"], lambda n: n["pid"] == 113)["status"] == "running", "T56s B")
+    print("PASS_UNIT T56s fd miss no sibling bleed")
+
+    # T56e grok turn_ended
+    reset_all(tmp)
+    os.makedirs(sdir, exist_ok=True)
+    with open(ev, "w") as f:
+        f.write('{"type":"turn_ended"}\n')
+    chat = os.path.join(sdir, "chat_history.jsonl")
+    with open(chat, "w") as f:
+        f.write("{}\n")
+    os.utime(chat, (NOW, NOW))
+    p = payload_for({120: rec(120, 1, "ttys009", cmd_g, cpu_s=1.0)}, 7000.0, now=NOW)
+    assert_true(find(p["roots"], lambda n: n["pid"] == 120)["status"] == "running", "T56e")
+    print("PASS_UNIT T56e grok turn_ended => running")
+
+    # T56f grok in_progress hold
+    reset_all(tmp)
+    os.makedirs(sdir, exist_ok=True)
+    with open(ev, "w") as f:
+        f.write('{"type":"phase_changed","phase":"streaming_reasoning"}\n')
+    os.utime(ev, (NOW - 120, NOW - 120))
+    payload_for({121: rec(121, 1, "ttys009", cmd_g, cpu_s=1.0)}, 7100.0, now=NOW - 120)
+    key = (121, LSTART)
+    sb._ART_PREV[key]["last_active_wall"] = NOW - 120
+    p = payload_for({121: rec(121, 1, "ttys009", cmd_g, cpu_s=1.0)}, 7102.0, now=NOW)
+    assert_true(find(p["roots"], lambda n: n["pid"] == 121)["status"] == "active", "T56f")
+    print("PASS_UNIT T56f grok in_progress hold => active")
+
+    # T56g cursor complete
+    reset_all(tmp)
+    ch = "t56g"
+    lp = os.path.join(sb.CURSOR_LOG_DIR, ch + ".jsonl")
+    with open(lp, "w") as f:
+        f.write('{"event":"complete"}\n')
+    cc = cursor_cmd + " -c " + ch
+    p = payload_for({130: rec(130, 1, "ttys009", cc, cpu_s=1.0)}, 8000.0, now=NOW)
+    assert_true(find(p["roots"], lambda n: n["pid"] == 130)["status"] == "running", "T56g")
+    print("PASS_UNIT T56g cursor complete => running")
+
+    # T56h cursor hb result
+    reset_all(tmp)
+    ch = "t56h"
+    hb = os.path.join(sb.CURSOR_LOG_DIR, ch + ".hb.jsonl")
+    with open(hb, "w") as f:
+        f.write('{"type":"result"}\n')
+    cc = cursor_cmd + " -c " + ch
+    p = payload_for({131: rec(131, 1, "ttys009", cc, cpu_s=1.0)}, 8100.0, now=NOW)
+    assert_true(find(p["roots"], lambda n: n["pid"] == 131)["status"] == "running", "T56h")
+    print("PASS_UNIT T56h cursor hb result => running")
+
+    # T56i metadata must not re-arm
+    reset_all(tmp)
+    cmd, path, real = claude_setup(tmp, "t56i", ['{"type":"system","subtype":"turn_duration"}'], NOW - 60)
+    payload_for({140: rec(140, 1, "??", cmd, cpu_s=1.0)}, 9000.0, now=NOW - 60)
+    with open(path, "a") as f:
+        f.write('{"type":"last-prompt","text":"x"}\n')
+    os.utime(path, (NOW, NOW))
+    p = payload_for({140: rec(140, 1, "??", cmd, cpu_s=1.0)}, 9002.0, now=NOW)
+    sb._proc_lsof_info = real
+    assert_true(find(p["roots"], lambda n: n["pid"] == 140)["status"] == "running", "T56i")
+    print("PASS_UNIT T56i metadata no re-arm")
+
+    # T56j user record re-arms
+    reset_all(tmp)
+    cmd, path, real = claude_setup(tmp, "t56j", ['{"type":"system","subtype":"turn_duration"}'], NOW - 60)
+    payload_for({141: rec(141, 1, "??", cmd, cpu_s=1.0)}, 9100.0, now=NOW - 60)
+    with open(path, "a") as f:
+        f.write('{"type":"user","message":{"content":"hi"}}\n')
+    p = payload_for({141: rec(141, 1, "??", cmd, cpu_s=1.0)}, 9102.0, now=NOW)
+    sb._proc_lsof_info = real
+    assert_true(find(p["roots"], lambda n: n["pid"] == 141)["status"] == "active", "T56j")
+    print("PASS_UNIT T56j user re-arm => active")
+
+    # T56k short hold expiry
+    reset_all(tmp)
+    os.environ["AGENT_SWITCHBOARD_ACTIVE_HOLD"] = "5"
+    cmd, path, real = claude_setup(tmp, "t56k",
+        ['{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use"}]}}'],
+        NOW - 60)
+    payload_for({150: rec(150, 1, "??", cmd, cpu_s=1.0)}, 9200.0, now=NOW - 6)
+    key = (150, LSTART)
+    sb._ART_PREV[key]["last_active_wall"] = NOW - 6
+    p = payload_for({150: rec(150, 1, "??", cmd, cpu_s=1.0)}, 9202.0, now=NOW)
+    sb._proc_lsof_info = real
+    os.environ.pop("AGENT_SWITCHBOARD_ACTIVE_HOLD", None)
+    assert_true(find(p["roots"], lambda n: n["pid"] == 150)["status"] == "running", "T56k")
+    print("PASS_UNIT T56k hold expiry => running")
+
+    # T56l virtual grok-sub
+    reset_all(tmp)
+    os.makedirs(sdir, exist_ok=True)
+    sub = os.path.join(sdir, "subagents", "sv")
+    os.makedirs(sub)
+    json.dump({"subagent_id": "sv", "status": "running"}, open(os.path.join(sub, "meta.json"), "w"))
+    tails0 = sb._ART_SWEEP_TAIL_COUNT
+    p = payload_for({160: rec(160, 1, "??", cmd_g, cpu_s=1.0)}, 9300.0, now=NOW)
+    subs = find(p["roots"], lambda n: n["pid"] == 160)["children"]
+    assert_true(subs and subs[0]["status"] == "running" and sb._ART_SWEEP_TAIL_COUNT == tails0, "T56l")
+    print("PASS_UNIT T56l virtual grok-sub no tail")
+
+    # T56m R9 no raise (second sweep — CPU-derived)
+    reset_all(tmp)
+    try:
+        payload_for({170: rec(170, 1, "??", grok_cmd, cpu_s=1.0)}, 9400.0)
+        p = payload_for({170: rec(170, 1, "??", grok_cmd, cpu_s=1.0)}, 9402.0)
+        assert_true(find(p["roots"], lambda n: n["pid"] == 170)["status"] == "running", "T56m")
+    except Exception:
+        print("FAIL_ASSERT T56m raised")
+        sys.exit(1)
+    print("PASS_UNIT T56m R9 no raise")
+
+    # T56n allowlist
+    bad = [n for n in (p.get("roots") or []) if n.get("status") not in ALLOW]
+    assert_true(not bad, "T56n")
+    print("PASS_UNIT T56n allowlist")
+
+    # T56o child-active zero tails
+    reset_all(tmp)
+    import subprocess
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        snap = {180: rec(180, 1, "??", cmd_g, cpu_s=1.0), child.pid: rec(child.pid, 180, "??", grok_cmd, cpu_s=0.1)}
+        forest = sb.build_cli_forest(snap, now=NOW)
+        sb._attach_cli_status(forest, snap, NOW, 9500.0)
+        assert_true(sb._ART_SWEEP_TAIL_COUNT == 0, "T56o tails")
+        print("PASS_UNIT T56o child-active zero tails")
+    finally:
+        child.kill()
+        child.wait()
+
+    print("ALL_T56_OK")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+EOF
+if [ $? -eq 0 ]; then
+  ck ok ok "T56a claude turn_duration => running despite fresh mtime"
+  ck ok ok "T56b claude tool_use hold => active"
+  ck ok ok "T56c stale 15m hold => running"
+  ck ok ok "T56d interactive first-obs idle => running"
+  ck ok ok "T56p headless grok first-obs cold => active"
+  ck ok ok "T56q headless grok COMPLETE decay => running"
+  ck ok ok "T56r per-session claude attribution"
+  ck ok ok "T56s fd miss + sibling growth => idle stays running"
+  ck ok ok "T56e grok turn_ended => running"
+  ck ok ok "T56f grok in_progress hold => active"
+  ck ok ok "T56g cursor complete => running"
+  ck ok ok "T56h cursor hb result => running"
+  ck ok ok "T56i metadata growth no re-arm"
+  ck ok ok "T56j user record re-arm => active"
+  ck ok ok "T56k short hold expiry => running"
+  ck ok ok "T56l virtual grok-sub never tail-read"
+  ck ok ok "T56m R9 fallbacks no raise"
+  ck ok ok "T56n status allowlist"
+  ck ok ok "T56o child-active zero tails"
+else
+  ck fail ok "T56 completion-aware quiet unit block"
+fi
+
+# T57: tail budget + serve (ports 17945-17949 ONLY)
+python3 - "$SB" <<'EOF'
+import importlib.machinery, importlib.util, sys, os, json, tempfile, shutil, time, urllib.parse
+
+loader = importlib.machinery.SourceFileLoader("sb", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+sb = importlib.util.module_from_spec(spec)
+loader.exec_module(sb)
+
+NOW = 1723252800.0
+LSTART = "Fri Aug  9 12:00:00 2024"
+
+
+def rec(pid, ppid, tty, command, lstart=LSTART, cputime="0:00.00", cpu_s=0.0):
+    return {"pid": pid, "ppid": ppid, "tty": tty, "lstart": lstart,
+            "command": command, "cputime": cputime, "cpu_s": cpu_s}
+
+
+def assert_true(cond, msg):
+    if not cond:
+        print("FAIL_ASSERT", msg)
+        sys.exit(1)
+
+
+def reset_all(root):
+    sb.ROOT = root
+    sb.reset_cli_cache()
+    sb.reset_model_defaults()
+    sb.GROK_SESS_ROOT = os.path.join(root, "grok-sess")
+    sb.GROK_ACTIVE_SESSIONS = os.path.join(root, "grok-active.json")
+    os.makedirs(sb.GROK_SESS_ROOT, exist_ok=True)
+    with open(sb.GROK_ACTIVE_SESSIONS, "w") as f:
+        json.dump([], f)
+    sb.CLAUDE_PROJECTS_ROOT = os.path.join(root, "claude-projects")
+    os.makedirs(sb.CLAUDE_PROJECTS_ROOT, exist_ok=True)
+    sb.CURSOR_LOG_DIR = os.path.join(root, "cursor-logs")
+    sb.CURSOR_CHANNEL_DIR = os.path.join(root, "cursor-channels")
+    os.makedirs(sb.CURSOR_LOG_DIR, exist_ok=True)
+    os.makedirs(sb.CURSOR_CHANNEL_DIR, exist_ok=True)
+
+
+def payload_for(snap, mono, now=NOW):
+    sb.ps_cli_snapshot = lambda: snap
+    return sb.get_cli_payload(force=True, now=now, mono=mono)
+
+
+def find_status(payload, pid):
+    for n in payload.get("roots") or []:
+        if n.get("pid") == pid:
+            return n.get("status")
+    return None
+
+
+tmp = tempfile.mkdtemp(prefix="sb-t57-")
+try:
+    reset_all(tmp)
+    grok_cmd = "/home/user/.grok/bin/grok"
+    cwd = "/tmp/t57"
+    enc = urllib.parse.quote(cwd, safe="")
+    sid = "019ff000-0000-0000-0000-00000000t57a"
+    sdir = os.path.join(sb.GROK_SESS_ROOT, enc, sid)
+    os.makedirs(sdir, exist_ok=True)
+    ev = os.path.join(sdir, "events.jsonl")
+    cmd = grok_cmd + " --resume %s --cwd %s" % (sid, cwd)
+
+    # T57a cpu-delta => zero tails
+    with open(ev, "w") as f:
+        f.write('{"type":"turn_started"}\n')
+    payload_for({200: rec(200, 1, "??", cmd, cpu_s=1.0)}, 1000.0)
+    sb._ART_SWEEP_TAIL_COUNT = 0
+    p = payload_for({200: rec(200, 1, "??", cmd, cpu_s=1.25)}, 1002.0)
+    assert_true(find_status(p, 200) == "active" and sb._ART_SWEEP_TAIL_COUNT == 0, "T57a")
+    print("PASS_UNIT T57a cpu-delta zero tails")
+
+    # T57b 16-open tail cap
+    reset_all(tmp)
+    nodes = []
+    for i in range(20):
+        sid_i = "019ff000-0000-0000-0000-%012d" % (300 + i)
+        d = os.path.join(sb.GROK_SESS_ROOT, enc, sid_i)
+        os.makedirs(d, exist_ok=True)
+        ep = os.path.join(d, "events.jsonl")
+        with open(ep, "w") as f:
+            f.write('{"type":"turn_ended"}\n')
+        nodes.append((400 + i, rec(400 + i, 1, "??", grok_cmd + " --resume %s --cwd %s" % (sid_i, cwd), cpu_s=1.0)))
+    key_late = (419, LSTART)
+    sb._ART_PREV[key_late] = {"path": None, "mtime": 1.0, "size": 1, "mono": 1.0, "completed": False}
+    before = dict(sb._ART_PREV[key_late])
+    payload_for(dict(nodes), 2000.0)
+    assert_true(sb._ART_SWEEP_TAIL_COUNT <= 16, "T57b cap")
+    assert_true(sb._ART_PREV.get(key_late) == before, "T57b late untouched")
+    print("PASS_UNIT T57b 16-open tail cap")
+
+    # T57c gap<1.0 zero tails
+    reset_all(tmp)
+    os.makedirs(sdir, exist_ok=True)
+    with open(ev, "w") as f:
+        f.write('{"type":"turn_started"}\n')
+    payload_for({500: rec(500, 1, "??", cmd, cpu_s=1.0)}, 3000.0)
+    sb._ART_SWEEP_TAIL_COUNT = 0
+    payload_for({500: rec(500, 1, "??", cmd, cpu_s=1.0)}, 3000.5)
+    assert_true(sb._ART_SWEEP_TAIL_COUNT == 0, "T57c")
+    print("PASS_UNIT T57c gap carry-forward zero tails")
+
+    # T57d TTL zero tails
+    reset_all(tmp)
+    sb.CLI_CACHE_TTL = 5.0
+    os.makedirs(sdir, exist_ok=True)
+    with open(ev, "w") as f:
+        f.write('{"type":"turn_started"}\n')
+    snap_t = {600: rec(600, 1, "??", cmd, cpu_s=1.0)}
+    nps = {"n": 0}
+    sb.ps_cli_snapshot = lambda: (nps.__setitem__("n", nps["n"] + 1) or snap_t)
+    sb.get_cli_payload(now=NOW, mono=4000.0)
+    sb._ART_SWEEP_TAIL_COUNT = 0
+    b = sb.get_cli_payload(now=NOW, mono=4001.0)
+    assert_true(b.get("cached") and sb._ART_SWEEP_TAIL_COUNT == 0, "T57d")
+    print("PASS_UNIT T57d TTL zero tails")
+
+    print("ALL_T57_OK")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+EOF
+if [ $? -eq 0 ]; then
+  ck ok ok "T57a cpu-delta-active => zero tails"
+  ck ok ok "T57b 16-open tail cap; late _ART_PREV untouched"
+  ck ok ok "T57c gap<1.0 => zero tails"
+  ck ok ok "T57d TTL hit => zero tails"
+else
+  ck fail ok "T57 tail budget unit block"
+fi
+
+T57_ROOT=$(mktemp -d)
+python3 - "$T57_ROOT" <<'EOF'
+import json, os, sys, time, urllib.parse
+root = sys.argv[1]
+grok_root = os.path.join(root, "grok")
+cwd = "/tmp/t57-serve"
+enc = urllib.parse.quote(cwd, safe="")
+sid = "019ff000-0000-0000-0000-00000000t57e"
+sdir = os.path.join(grok_root, enc, sid)
+os.makedirs(sdir, exist_ok=True)
+ev = os.path.join(sdir, "events.jsonl")
+with open(ev, "w") as f:
+    f.write('{"type":"turn_ended"}\n')
+open(os.path.join(root, "boot.json"), "w").write(json.dumps({"boot_id": "t57-serve"}))
+EOF
+AGENT_SWITCHBOARD_ROOT="$T57_ROOT" AGENT_SWITCHBOARD_GROK_SESSIONS="$T57_ROOT/grok" \
+  AGENT_SWITCHBOARD_CLI_CACHE_TTL=0.2 AGENT_SWITCHBOARD_ACTIVE_HOLD=900 \
+  "$SB" serve --port 17945 >/dev/null 2>&1 &
+SRV57=$!
+sleep 1.5
+H57=$(curl -s "http://127.0.0.1:17945/v1/health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok"))' 2>/dev/null || echo fail)
+ck "$H57" "True" "T57e serve health on 17945"
+kill "$SRV57" 2>/dev/null
+wait 2>/dev/null
+rm -rf "$T57_ROOT"
 
 echo; echo "RESULT: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]
