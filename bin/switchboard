@@ -138,6 +138,9 @@ CLAUDE_SETTINGS_PATH = os.environ.get(
 CLAUDE_PROJECTS_ROOT = os.environ.get(
     "AGENT_SWITCHBOARD_CLAUDE_PROJECTS", os.path.expanduser("~/.claude/projects")
 )
+CLAUDE_SESSIONS_DIR = os.environ.get(
+    "AGENT_SWITCHBOARD_CLAUDE_SESSIONS", os.path.expanduser("~/.claude/sessions")
+)
 CURSOR_CONFIG_PATH = os.environ.get(
     "AGENT_SWITCHBOARD_CURSOR_CONFIG", os.path.expanduser("~/.cursor/cli-config.json")
 )
@@ -4149,12 +4152,33 @@ def _session_id_from_transcript_path(path):
     return m.group(0) if m else None
 
 
+def _claude_transcript_from_session(pid):
+    """Own-transcript path from ~/.claude/sessions/<pid>.json when lsof has no jsonl."""
+    if not pid:
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    sess_path = os.path.join(CLAUDE_SESSIONS_DIR, "%d.json" % pid)
+    meta = read_json(sess_path) or {}
+    sid = meta.get("sessionId")
+    if not sid or not name_ok(str(sid)):
+        return None
+    proj = claude_project_dir(meta.get("cwd"))
+    if not proj:
+        return None
+    path = os.path.join(proj, "%s.jsonl" % sid)
+    return path if os.path.isfile(path) else None
+
+
 def _report_cs_session_live(session_id, snap):
     """True if session_id is a currently-live claude_cli session.
 
     Independent of the POST body: live claude_cli processes from `snap`,
     then the same transcript_path resolution the forest uses (open files
-    via _proc_lsof_info + _pick_claude_jsonl under CLAUDE_PROJECTS_ROOT).
+    via _proc_lsof_info + _pick_claude_jsonl under CLAUDE_PROJECTS_ROOT;
+    fallback: _claude_transcript_from_session when lsof has no jsonl).
     Fail-closed: missing snap, no matching live process, or unresolvable
     transcript => False.
     """
@@ -4167,6 +4191,10 @@ def _report_cs_session_live(session_id, snap):
             continue
         files = _proc_lsof_info(pid).get("files") or []
         path = _pick_claude_jsonl(files, CLAUDE_PROJECTS_ROOT)
+        sid = _session_id_from_transcript_path(path)
+        if sid and sid == session_id:
+            return True
+        path = _claude_transcript_from_session(pid)
         sid = _session_id_from_transcript_path(path)
         if sid and sid == session_id:
             return True
