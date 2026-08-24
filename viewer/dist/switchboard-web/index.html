@@ -188,7 +188,7 @@ const STATE_CLASS = {RUNNING:'quiet',WORKING_TOOL:'run',WAITING_INPUT:'quiet',QU
                      STALLED:'fail',DIED:'fail',FAILED:'fail',DONE:'done',ORPHAN:'quiet',CORRUPT:'fail'};
 const COUNT_ORDER = [['run','RUNNING'],['quiet','QUIET'],['stall','STALLED'],
                      ['died','DIED'],['fail','FAILED'],['done','DONE']];
-const HOST_ORDER = ['mbp','mini','pc','cnc'];
+const HOST_ORDER = ['mbp','mini','pc'];
 
 let DOC = null, activeHost = 'all';
 
@@ -336,6 +336,7 @@ function familyName(kind){
   if(kind==='grok-sub'||kind==='grok') return 'grok';
   if(kind==='cursor-sub'||kind==='cursor') return 'cursor';
   if(kind==='claude-sub'||kind==='claude') return 'claude';
+  if(kind==='forest-watch') return 'forest-watch';
   return kind||'?';
 }
 function nodeHTML(n){
@@ -351,10 +352,11 @@ function nodeHTML(n){
   const mode = (!isDisp&&n.mode) ? '<span class="pill mode">'+esc(String(n.mode).toUpperCase())+'</span>' : '';
   const modelLabel=(!isDisp&&n.model)?formatModelLabel(n.model):null;
   const model=modelLabel?'<span class="pill model">'+esc(modelLabel)+'</span>':'';
+  const pid = (!isDisp&&n.pid!=null&&n.pid!=='') ? '<span class="meta">'+esc(String(n.pid))+'</span>' : '';
   const ident = n.tty || n.channel || n.label;
   const chan = (!isDisp&&ident) ? '<span class="meta">'+esc(ident)+'</span>' : '';
   const tip = [familyName(n.kind),n.model,n.mode,n.pid!=null?String(n.pid):'',n.tty,n.channel,n.label,n.status].filter(Boolean).join(' \u00b7 ')+' \u00b7 UP '+fmtDur(n.uptime_s);
-  const row = '<div class="row" title="'+esc(tip)+'">'+tri+lamp+nm+mode+model+chan+'<span class="up">UP '+fmtDur(n.uptime_s)+'</span></div>';
+  const row = '<div class="row" title="'+esc(tip)+'">'+tri+lamp+nm+mode+model+pid+chan+'<span class="up">UP '+fmtDur(n.uptime_s)+'</span></div>';
   const children = kids ? '<div class="kids">'+kids.map(c=>'<div class="node">'+nodeHTML(c)+'</div>').join('')+'</div>' : '';
   return row+children;
 }
@@ -504,7 +506,7 @@ function renderCounts(){
 }
 function renderChips(){
   const present=new Set(((DOC&&DOC.hosts)||[]).map(h=>h.id));
-  const labels={mbp:'MACBOOK',mini:'MAC MINI',pc:'SHOP PC',cnc:'CNC NODE'};
+  const labels={mbp:'MACBOOK',mini:'MAC MINI',pc:'SHOP PC'};
   let html='<span class="chip '+(activeHost==='all'?'on':'')+'" data-host="all" tabindex="0">ALL HOSTS</span>';
   HOST_ORDER.forEach(id=>{
     const h=((DOC&&DOC.hosts)||[]).find(x=>x.id===id);
@@ -584,7 +586,7 @@ document.addEventListener('keydown', e=>{ if((e.key==='Enter'||e.key===' ')&&e.t
 const FLEET_REFRESH_MS = 30000;
 const LOCAL_WAIT_TIMEOUT_S = 25;
 const LOCAL_HOST_ID = 'mbp';
-const KEEP_KINDS = {claude:1, grok:1, cursor:1, 'claude-sub':1, 'grok-sub':1, 'cursor-sub':1};
+const KEEP_KINDS = {claude:1, grok:1, cursor:1, 'claude-sub':1, 'grok-sub':1, 'cursor-sub':1, 'forest-watch':1};
 const WRAP_KINDS = {team_dispatch:1, 'team-dispatch':1, agent_dispatch:1, python:1};
 let FLEET_DOC = null;
 let LOCAL_MBP = null;
@@ -867,8 +869,7 @@ function mockDoc(){
       { id:'mini', label:'Mac mini', online:true, cli:{claude:1,grok:0,cursor:0},
         cli_tree:[ { kind:'claude', model:'fable', mode:'interactive', channel:'ttys000', uptime_s:125280, children:[] } ], tasks:[] },
       { id:'pc', label:'Shop PC', online:true, cli:{claude:1,grok:0,cursor:0},
-        cli_tree:[ { kind:'claude', model:'fable', mode:'interactive', channel:'ttys002', uptime_s:210120, children:[] } ], tasks:[] },
-      { id:'cnc', label:'CNC Node', online:false, cli:{claude:0,grok:0,cursor:0}, cli_tree:[], tasks:[] }
+        cli_tree:[ { kind:'claude', model:'fable', mode:'interactive', channel:'ttys002', uptime_s:210120, children:[] } ], tasks:[] }
     ]
   };
 }

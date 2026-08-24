@@ -403,7 +403,7 @@
     bootId: null,
     startBusy: false,
     spawnPaired: false,
-    spawnHostIds: ["mbp", "mini", "pc", "cnc"],
+    spawnHostIds: ["mbp", "mini", "pc"],
     spawn: {
       open: false,
       host: "mbp",
@@ -966,6 +966,10 @@
         "</span>";
       //  muted model chip immediately after INTERACTIVE/HEADLESS
       html += renderModelChip(node.model);
+      if (node.pid != null && node.pid !== "") {
+        html +=
+          '<span class="meta">' + escapeHtml(String(node.pid)) + "</span>";
+      }
       if (node.mode === "interactive" && node.tty) {
         html +=
           '<span class="meta">' + escapeHtml(String(node.tty)) + "</span>";
@@ -1411,7 +1415,7 @@
   /* ── Spawn sheet (Rust crypto; dormant until paired) ─ */
 
   var SPAWN_AGENTS = ["claude", "grok", "cursor"];
-  var SPAWN_HOST_LABELS = { mbp: "MBP", mini: "MINI", pc: "PC", cnc: "CNC" };
+  var SPAWN_HOST_LABELS = { mbp: "MBP", mini: "MINI", pc: "PC" };
 
   function spawnHostLabel(id) {
     return SPAWN_HOST_LABELS[id] || String(id || "").toUpperCase();
