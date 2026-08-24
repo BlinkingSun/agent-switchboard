@@ -4,7 +4,7 @@ service for AI agent lanes (Agent Switchboard).
 
 OBSERVE/ALERT ONLY by default. This tool never signals, kills, restarts, or re-dispatches
 anything (design rule: no autonomous destructive enforcement).
-Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only (no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes.
+Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only except POST /v1/report (ledger start/end write; no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes.
 It derives lane state from facts that exist anyway — pids, grok session file
 mtimes, slot records written by agent-dispatch — so workers never have to
 self-report heartbeats.
@@ -53,12 +53,14 @@ wait exit codes: 0 = event occurred (or all watched lanes already terminal),
 ORPHAN/CORRUPT/STALLED/WAITING_INPUT, on refuse events, on --watch-file
 changes, and (with --alert-quiet) on QUIET. QUIET alone is not a wake.
 
-serve HTTP API (read-only): GET /v1/health /v1/tasks /v1/status /v1/events
+serve HTTP API: GET /v1/health /v1/tasks /v1/status /v1/events
 /v1/cli (spawn-tree forest of claude/grok/cursor/agent_dispatch nodes,
-each stamped with status in running|active|completed|cancelled|failed|error;
+each stamped with status in running|active|completed|cancelled|failed|error
+and observed_at = true sweep/event time, never restamped on a cache hit;
 a cache hit may serve status up to CLI_CACHE_TTL (5s) stale),
-GET /v1/advise?task=T, and long-poll
-/v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55].
+GET /v1/advise?task=T, long-poll
+/v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55],
+and POST /v1/report (the only write: ledger start/end, never a heartbeat).
 
 Status rows carry ended_s for terminal lanes (seconds since finish; source:
 slot 'ended', else last terminal transition in events.jsonl, else slot file
@@ -80,6 +82,7 @@ import argparse
 import contextlib
 import datetime
 import glob
+import hashlib
 import json
 import os
 import re
@@ -93,6 +96,29 @@ import urllib.request
 import uuid
 
 VERSION = "1.4.0"
+
+
+def _binary_sha(n=12):
+    """First n hex chars of sha256(this file). None if unreadable.
+
+    Computed once at import (daemon startup), never per /v1/health.
+    Distinguishes binaries that share VERSION.
+    """
+    try:
+        path = os.path.abspath(__file__)
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()[:n]
+    except Exception:
+        return None
+
+
+BINARY_SHA = _binary_sha()
 ROOT = os.environ.get(
     "AGENT_SWITCHBOARD_ROOT",
     os.path.expanduser("~/.agent-switchboard/state"),
@@ -312,6 +338,13 @@ _CPU_PREV = {}
 _ART_PREV = {}
 # _proc_cwd throttle memo (R6.4); cleared/evicted with _ART_PREV.
 _CWD_RESOLVE_MEMO = {}
+# /v1/report accept rate: last-accepted wall time per pid. Guarded by
+# _REPORT_LOCK. Evicted opportunistically (entries older than 10s) so the
+# dict cannot grow unbounded — same spirit as _CPU_PREV.
+_REPORT_LAST = {}
+_REPORT_LOCK = threading.Lock()
+REPORT_MAX_BYTES = 16 * 1024
+REPORT_RATE_S = 1.0
 # Per-sweep test hooks (reset at the start of each _attach_cli_status call).
 _ART_SWEEP_STAT_COUNT = 0
 _ART_SWEEP_LISTDIR_COUNT = 0
@@ -1656,6 +1689,14 @@ def get_cli_payload(boot_id=None, force=False, now=None, mono=None):
             _merge_ended_into_forest(forest, now_wall)
         except Exception:
             pass
+        try:
+            _merge_live_reports_into_forest(forest, now_wall)
+        except Exception:
+            pass
+        try:
+            _stamp_cli_observed_at(forest, _iso_z(now_wall))
+        except Exception:
+            pass
         _CLI_CACHE["sweep_count"] = _CLI_CACHE["sweep_count"] + 1
         _CLI_CACHE["sweep_ms"] = sweep_ms
         _CLI_CACHE["mono"] = mono
@@ -1698,6 +1739,16 @@ def reset_cli_cache():
         _CWD_RESOLVE_MEMO.clear()
 
 
+def _invalidate_cli_cache():
+    """Drop the /v1/cli TTL payload so the next GET rebuilds.
+
+    Leaves _CPU_PREV / _ART_PREV intact (unlike reset_cli_cache, a test
+    helper). Called on every accepted /v1/report.
+    """
+    with _CLI_CACHE_LOCK:
+        _CLI_CACHE["payload"] = None
+
+
 def _iso_z(t=None):
     """UTC ISO8601 with trailing Z, for ledger timestamps."""
     dt = datetime.datetime.fromtimestamp(
@@ -1714,6 +1765,10 @@ def _ledger_id_os(pid, lstart):
 
 def _ledger_id_gs(sid, subagent_id):
     return "gs:%s:%s" % (sid, subagent_id)
+
+
+def _ledger_id_cs(session_id, agent_id):
+    return "cs:%s:%s" % (session_id, agent_id)
 
 
 def _virtual_cli_status(raw):
@@ -2646,8 +2701,11 @@ def _kind_internal(kind):
 
 
 def _ledger_cwd(node, rec):
-    """cwd for a start record: cwd_arg, else grok session cwd, else _proc_cwd once."""
+    """cwd for a start record: explicit node cwd, else cwd_arg, else grok session cwd, else _proc_cwd once."""
     rec = rec if isinstance(rec, dict) else {}
+    explicit = node.get("cwd")
+    if isinstance(explicit, str) and explicit.strip():
+        return os.path.expanduser(explicit.strip())
     cmd = rec.get("command") or ""
     ikind = _kind_internal(node.get("kind"))
     meta = _parse_wrapper_flags(cmd, ikind) if ikind else {}
@@ -2670,9 +2728,27 @@ def _ledger_cwd(node, rec):
     return None
 
 
-def _write_start(node, rec, parents, observed, now):
+def _apply_ledger_extra(rec, extra, overwrite=False):
+    """Copy additive report fields onto a ledger record. Never touches kind."""
+    if not extra or not isinstance(rec, dict):
+        return
+    for k in ("role", "observed_at"):
+        v = extra.get(k)
+        if v is None:
+            continue
+        if overwrite or k not in rec or rec.get(k) in (None, ""):
+            rec[k] = v
+
+
+def _write_start(node, rec, parents, observed, now, extra=None):
     nid = node.get("id")
-    if not nid or nid in _LEDGER_SEEN_START:
+    if not nid:
+        return
+    if nid in _LEDGER_SEEN_START:
+        # Duplicate start: no second append. Overlay report extras in memory
+        # so /v1/cli observed_at can still reflect the hook origin time.
+        cur = _LEDGER_STARTS.get(nid)
+        _apply_ledger_extra(cur, extra, overwrite=True)
         return
     channel = node.get("channel")
     if channel is None and "channel" not in node:
@@ -2693,13 +2769,18 @@ def _write_start(node, rec, parents, observed, now):
         "lane": node.get("lane"),
         "observed": observed,
     }
+    _apply_ledger_extra(start, extra)
     _ledger_append(start)
     _LEDGER_SEEN_START.add(nid)
     _LEDGER_STARTS[nid] = start
 
 
-def _write_end(nid, status, ended_source, now):
-    if not nid or nid in _LEDGER_SEEN_END:
+def _write_end(nid, status, ended_source, now, extra=None):
+    if not nid:
+        return
+    if nid in _LEDGER_SEEN_END:
+        cur = _LEDGER_ENDS.get(nid)
+        _apply_ledger_extra(cur, extra, overwrite=True)
         return
     if status not in CLI_TREE_STATUSES:
         status = "completed"
@@ -2710,6 +2791,7 @@ def _write_end(nid, status, ended_source, now):
         "status": status,
         "ended_source": ended_source,
     }
+    _apply_ledger_extra(end, extra)
     _ledger_append(end)
     _LEDGER_SEEN_END.add(nid)
     _LEDGER_ENDS[nid] = end
@@ -2964,7 +3046,9 @@ def _node_from_ledger(start, end):
         node["task"] = start["task"]
     if start.get("lane"):
         node["lane"] = start["lane"]
-    if node["kind"] == "grok-sub":
+    if start.get("role"):
+        node["role"] = start["role"]
+    if node["kind"] in ("grok-sub", "claude-sub"):
         node["virtual"] = True
     return node
 
@@ -3007,6 +3091,71 @@ def _merge_ended_into_forest(forest, now):
             forest.setdefault("roots", []).append(node)
         by_id[eid] = node
         live_ids.add(eid)
+
+
+def _ledger_observed_at(nid):
+    """Most recent report-originated observed_at for nid, or None."""
+    if not nid:
+        return None
+    for rec in (_LEDGER_ENDS.get(nid), _LEDGER_STARTS.get(nid)):
+        if not isinstance(rec, dict):
+            continue
+        v = rec.get("observed_at")
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
+def _stamp_cli_observed_at(forest, sweep_iso):
+    """Set per-node observed_at once at sweep time. Cache hits must not restamp.
+
+    Self-reported nodes carry the hook's own observed_at; everyone else falls
+    back to this sweep's timestamp.
+    """
+    def walk(ns):
+        for n in ns or []:
+            n["observed_at"] = _ledger_observed_at(n.get("id")) or sweep_iso
+            walk(n.get("children") or [])
+
+    walk((forest or {}).get("roots"))
+
+
+def _merge_live_reports_into_forest(forest, now):
+    """Graft un-ended self-reported ids (esp. cs:) not already in the forest.
+
+    Report-originated starts carry role and/or observed_at. Daemon-written
+    p:/gs: starts do not, so they are not double-grafted here.
+    """
+    _seed_ledger()
+    live_ids = set()
+    by_id = {}
+
+    def index(ns):
+        for n in ns or []:
+            nid = n.get("id")
+            if nid:
+                live_ids.add(nid)
+                by_id[nid] = n
+            index(n.get("children") or [])
+
+    index((forest or {}).get("roots") or [])
+    for nid, start in list(_LEDGER_STARTS.items()):
+        if nid in live_ids or nid in _LEDGER_ENDS:
+            continue
+        if not (start.get("role") or start.get("observed_at")):
+            continue
+        node = _node_from_ledger(start, {"status": "running"})
+        parents = start.get("parents") or []
+        attached = False
+        if parents:
+            parent = by_id.get(parents[0])
+            if parent is not None:
+                parent.setdefault("children", []).append(node)
+                attached = True
+        if not attached:
+            forest.setdefault("roots", []).append(node)
+        by_id[nid] = node
+        live_ids.add(nid)
 
 
 def _collect_cli_nodes(roots, statuses=None):
@@ -3986,6 +4135,78 @@ def _reap_identity_ok(slot, snap):
     return slot_ts == snap_ts
 
 
+_CLAUDE_SID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.I,
+)
+
+
+def _session_id_from_transcript_path(path):
+    """UUID session_id from a Claude transcript filename. None if absent."""
+    if not path:
+        return None
+    m = _CLAUDE_SID_RE.search(os.path.basename(path))
+    return m.group(0) if m else None
+
+
+def _report_cs_session_live(session_id, snap):
+    """True if session_id is a currently-live claude_cli session.
+
+    Independent of the POST body: live claude_cli processes from `snap`,
+    then the same transcript_path resolution the forest uses (open files
+    via _proc_lsof_info + _pick_claude_jsonl under CLAUDE_PROJECTS_ROOT).
+    Fail-closed: missing snap, no matching live process, or unresolvable
+    transcript => False.
+    """
+    if not isinstance(session_id, str) or not session_id or not snap:
+        return False
+    for pid, rec in snap.items():
+        if not isinstance(rec, dict):
+            continue
+        if kind_from_command(rec.get("command") or "") != "claude_cli":
+            continue
+        files = _proc_lsof_info(pid).get("files") or []
+        path = _pick_claude_jsonl(files, CLAUDE_PROJECTS_ROOT)
+        sid = _session_id_from_transcript_path(path)
+        if sid and sid == session_id:
+            return True
+    return False
+
+
+def _report_identity_ok(pid, lstart, snap, nid=None, session_id=None):
+    """Require (pid, lstart) to match the current process table.
+
+    Same lstart-ts equality the reaper uses; no prog_base-in-cmdline check
+    (this is a ledger write, not a signal). Uses ps_cli_snapshot's rich map
+    (ps_snapshot() is the thin {pid: command} projection and has no lstart).
+    Fail-closed: missing snap, missing pid, or unparseable lstart => False.
+
+    Carve-out (cs: + pid absent/null only): skip pid+lstart and require
+    session_id to match a live claude_cli session independently resolved
+    from the process table via transcript_path. The ledger id must also
+    be bound to that verified session (`cs:<session_id>:<agent_id>`).
+    Every other prefix, and cs: reports that carry a pid, keep the strict
+    pid+lstart check unchanged.
+    """
+    if pid is None and isinstance(nid, str) and nid.startswith("cs:"):
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        pfx = "cs:%s:" % session_id
+        if not nid.startswith(pfx) or len(nid) <= len(pfx):
+            return False
+        return _report_cs_session_live(session_id, snap)
+    if pid is None or not snap:
+        return False
+    rec = snap.get(pid)
+    if not isinstance(rec, dict):
+        return False
+    claimed = _lstart_ts(lstart)
+    live = _lstart_ts(rec.get("lstart"))
+    if claimed is None or live is None:
+        return False
+    return claimed == live
+
+
 def _reap_ledger(kind, task, lane, pid, lstart, reason=None):
     """Every outcome lands in the agents ledger. Success ends with ended_source=reap."""
     _seed_ledger()
@@ -4293,8 +4514,16 @@ class EventBus:
                     e
                     for e in self.events
                     if e["seq"] > cursor
-                    and (task is None or e["task"] == task)
-                    and (not lanes or e.get("lane") in lanes or e["event"] == "file")
+                    and (
+                        task is None
+                        or e["task"] == task
+                        or e.get("event") == "ledger"
+                    )
+                    and (
+                        not lanes
+                        or e.get("lane") in lanes
+                        or e.get("event") in ("file", "ledger")
+                    )
                 ]
                 if hits or gap or self.stopping:
                     return self.seq, hits, gap
@@ -4547,6 +4776,203 @@ def ensure_daemon(host=None, port=None, timeout=5.0):
     return False
 
 
+def _report_id_ok(nid):
+    """Non-empty string matching p: / gs: / cs: id-grammar prefixes."""
+    if not isinstance(nid, str) or not nid:
+        return False
+    for pfx in ("p:", "gs:", "cs:"):
+        if nid.startswith(pfx) and len(nid) > len(pfx):
+            return True
+    return False
+
+
+def _kind_for_report_id(nid, pid, snap):
+    """kind on a self-reported start. Never copies the wire `role` field.
+
+    p:  classify the live process the same way the forest does (_KIND_OUT).
+        Unknown/non-keep processes get kind None — do not invent a value.
+    gs: grok-sub (what the daemon already writes for those ids).
+    cs: claude-sub (new id type; parallel to grok-sub, distinct from role).
+    """
+    if isinstance(nid, str) and nid.startswith("gs:"):
+        return "grok-sub"
+    if isinstance(nid, str) and nid.startswith("cs:"):
+        return "claude-sub"
+    rec = (snap or {}).get(pid) if pid is not None else None
+    rec = rec if isinstance(rec, dict) else {}
+    ikind = kind_from_command(rec.get("command") or "")
+    if ikind in _KIND_OUT:
+        return _KIND_OUT[ikind]
+    return None
+
+
+def _report_rate_ok(pid, now):
+    """True and mark accepted if this pid is under 1 accept/s. Else False.
+
+    Evicts entries older than 10s so the map cannot grow unbounded.
+    """
+    with _REPORT_LOCK:
+        stale = [k for k, t in _REPORT_LAST.items() if now - t > 10.0]
+        for k in stale:
+            del _REPORT_LAST[k]
+        last = _REPORT_LAST.get(pid)
+        if last is not None and (now - last) < REPORT_RATE_S:
+            return False
+        _REPORT_LAST[pid] = now
+        return True
+
+
+def _opt_str(body, key):
+    """Optional JSON string field. Returns (value_or_None, error_or_None)."""
+    if key not in body:
+        return None, None
+    v = body.get(key)
+    if v is None:
+        return None, None
+    if not isinstance(v, str):
+        return None, "invalid %s" % key
+    v = v.strip()
+    return (v if v else None), None
+
+
+def v1_report(raw, bus=None):
+    """Apply a POST /v1/report body. Returns (obj, http_code). Never raises."""
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        body = json.loads(raw)
+    except Exception:
+        return {"error": "invalid json"}, 400
+    if not isinstance(body, dict):
+        return {"error": "invalid json"}, 400
+
+    event = body.get("event")
+    if event not in ("start", "end"):
+        return {"error": "invalid event"}, 400
+    nid = body.get("id")
+    if not _report_id_ok(nid):
+        return {"error": "invalid id"}, 400
+    pid_raw = body.get("pid")
+    # cs: + pid null/absent: Claude Agent-tool subagents never carry a pid.
+    # Every other prefix, and cs: reports that DO carry a pid, still require
+    # a live pid+lstart match below.
+    cs_pidless = (
+        isinstance(nid, str) and nid.startswith("cs:") and pid_raw is None
+    )
+    if cs_pidless:
+        pid = None
+        lstart = None
+    else:
+        pid = pid_raw
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
+            return {"error": "invalid pid"}, 400
+        lstart = body.get("lstart")
+        if not isinstance(lstart, str) or not lstart.strip():
+            return {"error": "invalid lstart"}, 400
+        lstart = lstart.strip()
+
+    parents = body.get("parents")
+    if parents is None:
+        parents = []
+    elif not isinstance(parents, list):
+        return {"error": "invalid parents"}, 400
+    else:
+        clean = []
+        for p in parents:
+            if not isinstance(p, str) or not p:
+                return {"error": "invalid parents"}, 400
+            clean.append(p)
+        parents = clean[:10]
+
+    role, err = _opt_str(body, "role")
+    if err:
+        return {"error": err}, 400
+    cwd, err = _opt_str(body, "cwd")
+    if err:
+        return {"error": err}, 400
+    label, err = _opt_str(body, "label")
+    if err:
+        return {"error": err}, 400
+    model, err = _opt_str(body, "model")
+    if err:
+        return {"error": err}, 400
+    observed_at, err = _opt_str(body, "observed_at")
+    if err:
+        return {"error": err}, 400
+    session_id, err = _opt_str(body, "session_id")
+    if err:
+        return {"error": err}, 400
+    if cs_pidless and not session_id:
+        return {"error": "invalid session_id"}, 400
+
+    # Rate-limit before the ps snapshot so a flooding pid never pays the
+    # shell-out. Slot is marked used even if identity later fails.
+    # Pid-less cs: reports key by ledger-id+event so concurrent subagents
+    # (distinct agent_id) are not serialized, and a start does not consume
+    # the matching end's 1/s slot (subagents can finish in well under 1s).
+    now = time.time()
+    rate_key = pid if pid is not None else "%s:%s" % (nid, event)
+    if not _report_rate_ok(rate_key, now):
+        print("switchboard report: rate-limited pid=%s" % pid, file=sys.stderr)
+        return {"error": "rate_limited"}, 429
+
+    # Identity: pid+lstart must match the live process table, except the
+    # cs: + pid-absent carve-out (live session_id via transcript_path).
+    # 403 = the claim is forbidden (not a missing route; that's 404).
+    snap = ps_cli_snapshot()
+    if not _report_identity_ok(
+        pid, lstart, snap, nid=nid, session_id=session_id
+    ):
+        print(
+            "switchboard report: identity mismatch pid=%s session_id=%s"
+            % (pid, session_id),
+            file=sys.stderr,
+        )
+        return {"error": "identity_mismatch"}, 403
+
+    # p: ids are process-table facts — recompute from verified pid+lstart
+    # so a hook's formatting cannot fork a second ledger identity.
+    if nid.startswith("p:"):
+        nid = _ledger_id_os(pid, lstart)
+
+    extra = {"observed_at": observed_at or _iso_z(now)}
+    if role is not None:
+        extra["role"] = role
+
+    _seed_ledger()
+    if event == "start":
+        rec = snap.get(pid) if snap else None
+        rec = rec if isinstance(rec, dict) else {}
+        virtual = nid.startswith("gs:") or nid.startswith("cs:")
+        node = {
+            "id": nid,
+            "kind": _kind_for_report_id(nid, pid, snap),
+            "pid": None if virtual else pid,
+            "label": label,
+            "model": model,
+            "cwd": cwd,
+            "task": None,
+            "lane": None,
+            "channel": None,
+        }
+        if virtual:
+            node["virtual"] = True
+        _write_start(node, rec, parents, "live", now, extra=extra)
+    else:
+        # Lifecycle end only; status stays derived. Default completed
+        # (same as _write_end's unknown-status fallback). ended_source
+        # "hook" is new alongside reap / gone / meta / slot.
+        _write_end(nid, "completed", "hook", now, extra=extra)
+
+    _invalidate_cli_cache()
+    if bus is not None:
+        try:
+            bus.publish(None, {"event": "ledger", "id": nid, "ev": event})
+        except Exception:
+            pass
+    return {"ok": True}, 200
+
+
 def cmd_serve(args):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -4586,6 +5012,7 @@ def cmd_serve(args):
                         {
                             "ok": True,
                             "version": VERSION,
+                            "build": BINARY_SHA,
                             "uptime_s": round(time.time() - t0),
                             "root": ROOT,
                             "cursor": bus.seq,
@@ -4636,6 +5063,47 @@ def cmd_serve(args):
                         wait_sem.release()
                 else:
                     self._json({"error": "not found"}, 404)
+
+            def _read_capped(self, cap):
+                """Read POST body using Content-Length; never allocate past cap.
+
+                Returns (bytes, None, None) or (None, code, error_msg).
+                """
+                raw_len = self.headers.get("Content-Length")
+                if raw_len is None:
+                    return None, 400, "content-length required"
+                try:
+                    n = int(raw_len)
+                except (TypeError, ValueError):
+                    return None, 400, "content-length required"
+                if n < 0:
+                    return None, 400, "content-length required"
+                if n > cap:
+                    return None, 413, "payload too large"
+                try:
+                    return self.rfile.read(n), None, None
+                except Exception:
+                    return None, 400, "bad request"
+
+            def do_POST(self):
+                # The only HTTP write: POST /v1/report. Any other POST is 404.
+                try:
+                    u = urllib.parse.urlparse(self.path)
+                    if u.path != "/v1/report":
+                        return self._json({"error": "not found"}, 404)
+                    raw, err_code, err_msg = self._read_capped(REPORT_MAX_BYTES)
+                    if err_code:
+                        return self._json({"error": err_msg}, err_code)
+                    obj, code = v1_report(raw, bus)
+                    return self._json(obj, code)
+                except Exception as e:
+                    print(
+                        "switchboard report: handler error %s" % e, file=sys.stderr
+                    )
+                    try:
+                        self._json({"error": "bad request"}, 400)
+                    except Exception:
+                        pass
 
         srv = ThreadingHTTPServer((args.host, args.port), Handler)
         # Request threads must never block process exit, and server_close()
@@ -4745,7 +5213,7 @@ def main():
         description=(
             "OBSERVE/ALERT ONLY by default. Slot registry, event waits, and status "
             "service for agent lanes. "
-            "Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only (no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes."
+            "Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only except POST /v1/report (ledger start/end write; no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes."
         )
     )
     sub = ap.add_subparsers(dest="cmd", required=True)

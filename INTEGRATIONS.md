@@ -17,13 +17,14 @@ Plus an HTTP API for tools/UIs on `127.0.0.1:17920` (`switchboard serve`):
 
 | Endpoint | Notes |
 |---|---|
-| `GET /v1/health` | `version`, `boot_id`, `busy`, `busy_reasons` |
+| `GET /v1/health` | `version`, `build` (short sha256 of the running file), `boot_id`, `busy`, `busy_reasons` |
 | `GET /v1/tasks` | task list |
 | `GET /v1/status[?task=T]` | lanes with derived `state`; terminal rows include `ended_s` |
 | `GET /v1/events?task=T` | observation log tail |
-| `GET /v1/cli` | spawn-tree forest (`kind`: `claude` \| `grok` \| `cursor` \| `agent_dispatch`, plus pid-less virtual `grok-sub` children on grok nodes; per-node `status`: `running` \| `active` \| `completed` \| `cancelled` \| `failed` \| `error`; optional `model`) |
+| `GET /v1/cli` | spawn-tree forest (`kind`: `claude` \| `grok` \| `cursor` \| `agent_dispatch`, plus pid-less virtual `grok-sub` children on grok nodes; per-node `status`: `running` \| `active` \| `completed` \| `cancelled` \| `failed` \| `error`; per-node `observed_at` (true sweep/event time); optional `model`) |
 | `GET /v1/advise?task=T` | current advise payload (closed `next` verbs) |
 | `GET /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55]` | long-poll; `gap:true` if cursor behind ring; HTTP 503 + `Retry-After` when wait capacity is full |
+| `POST /v1/report` | **only HTTP write.** Ledger `start`/`end` for `p:`/`gs:`/`cs:` ids. Requires live `(pid, lstart)` identity match, except pid-less `cs:` reports which require a live Claude `session_id` independently resolved from the process table. Never a heartbeat. |
 
 ### Hub, iOS, and other API consumers
 
@@ -50,7 +51,7 @@ What changes for consumers:
 Clients should tolerate unknown fields and absent optional keys.
 
 Everything is **OBSERVE/ALERT ONLY by default**: the switchboard never kills, restarts, or
-re-dispatches — your orchestrator reads the alerts and decides. Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only (no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes. (The viewer
+re-dispatches — your orchestrator reads the alerts and decides. Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only except POST /v1/report (ledger start/end write; no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes. (The viewer
 **START DAEMON** button and CLI `--ensure` only kickstart the launchd job for
 the daemon itself.) `state/<task>/advise.json` is rewritten on every wait
 return and on lane transitions. A sample Claude `SubagentStop` hook at

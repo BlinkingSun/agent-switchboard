@@ -40,7 +40,7 @@ from what the OS already knows:
 
 **OBSERVE/ALERT ONLY by default:** the switchboard never kills, restarts, or
 re-dispatches anything. It tells your orchestrator; your orchestrator decides.
-Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only (no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes.
+Bounded exception (CLI-only, AGENT_SWITCHBOARD_REAPER=1): `switchboard reap --task T --lane L` may SIGTERM then SIGKILL one confirmed worker pid. HTTP stays GET-only except POST /v1/report (ledger start/end write; no /v1/reap, no path under any method that can signal a process). The watcher never reaps. Confirm file required; STALLED or ORPHAN only; identity is pid+prog_base+start-time. Never launcher CLIs, virtual subs, the daemon, or stall-* lanes.
 
 ## The three verbs
 
@@ -74,18 +74,19 @@ while the parent CLI is still alive so the forest can reattach it.
 ## Background service + HTTP API
 
 ```bash
-switchboard serve            # 127.0.0.1:17920, read-only
+switchboard serve            # 127.0.0.1:17920, GET-only except POST /v1/report
 ```
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /v1/health` | liveness, `version`, `boot_id`, `busy` / `busy_reasons` |
+| `GET /v1/health` | liveness, `version`, `build` (short sha256 of the running file), `boot_id`, `busy` / `busy_reasons` |
 | `GET /v1/tasks` | known task names |
 | `GET /v1/status[?task=T]` | derived lanes (includes `ended_s` for terminal rows) |
 | `GET /v1/events?task=T` | recent observation log (tail-read; rotates under size cap) |
-| `GET /v1/cli` | spawn-tree forest of live CLI sessions (claude / grok / cursor / agent_dispatch), including **virtual `grok-sub` rows** for a grok session's active in-process native subagents (pid-less, `virtual: true`, counted in `counts.grok_subagents`). Cursor slaves are real OS processes and nest by ppid. Each node carries `status` (see below). `counts.totals` carries per-family totals plus `live`. |
+| `GET /v1/cli` | spawn-tree forest of live CLI sessions (claude / grok / cursor / agent_dispatch), including **virtual `grok-sub` rows** for a grok session's active in-process native subagents (pid-less, `virtual: true`, counted in `counts.grok_subagents`). Cursor slaves are real OS processes and nest by ppid. Each node carries `status` (see below) and `observed_at` (true sweep/event time, never restamped on a cache hit). `counts.totals` carries per-family totals plus `live`. |
 | `GET /v1/advise?task=T` | current advise payload (closed `next` verb list) |
 | `GET /v1/wait?cursor=N[&task=T][&lanes=a,b][&timeout=55]` | long-poll; returns within ~1s of a transition; `gap:true` if the cursor fell behind the ring; HTTP 503 + `Retry-After` when wait capacity is full |
+| `POST /v1/report` | **only HTTP write.** Ledger `start`/`end` for `p:`/`gs:`/`cs:` ids. Requires live `(pid, lstart)` identity match, except pid-less `cs:` reports which require a live Claude `session_id` independently resolved from the process table. Never a heartbeat/activity write. |
 
 ### `/v1/cli` node `status`
 
