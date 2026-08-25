@@ -9,7 +9,7 @@
   :root{
     --page:#0b0e12; --panel:#14181f; --slot:#1b212a; --slot-hi:#20272f;
     --border:#262d38; --ink:#e8ecf2; --mut:#8b93a1; --dim:#4a5261;
-    --run:#35d07a; --wait:#e0a52e; --fail:#e5484d; --done:#4a5261; --inv:#5b8fd9;
+    --run:#35d07a; --wait:#e0a52e; --fail:#e5484d; --done:#4a5261; --inv:#5b8fd9; --sys:#a855f7;
     --pill-border:#33506b; --pill-ink:#9cc6ea;
     --mono:"SF Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
     --r:9px;
@@ -93,6 +93,7 @@
   .lamp.fail{background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%); box-shadow:0 0 8px 1px rgba(229,72,77,.5)}
   .lamp.stall{background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%); box-shadow:0 0 8px 1px rgba(229,72,77,.45)}
   .lamp.died{background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%); box-shadow:0 0 8px 1px rgba(229,72,77,.5)}
+  .lamp.system{background:radial-gradient(circle at 35% 32%, #d8b4fe, var(--sys) 62%); box-shadow:0 0 8px 1px rgba(168,85,247,.55)}
   .lamp.orphan{background:transparent; border:2px solid var(--wait)}
   .lamp.stall-inv{animation:stall-inv-flash 1s steps(2,end) infinite}
   @keyframes stall-inv-flash{
@@ -101,10 +102,12 @@
   }
   @media (prefers-reduced-motion:reduce){.lamp.stall-inv{animation:none;background:radial-gradient(circle at 35% 32%, #f4938f, var(--fail) 62%)}}
 
-  .name{font-weight:700; letter-spacing:.4px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:0 1 auto}
+  /* harness (claude/grok/cursor) always visible; model chip yields on narrow rows */
+  .name{font-weight:700; letter-spacing:.4px; white-space:nowrap; flex-shrink:0}
   .pill{border:1px solid var(--border); color:var(--mut); border-radius:6px; padding:2px 8px; font-size:10.5px; letter-spacing:1.2px; white-space:nowrap; flex-shrink:0}
   .pill.mode{border-color:var(--pill-border); color:var(--pill-ink)}
-  .pill.model{background:#12161c; color:var(--mut); letter-spacing:.6px; font-size:11px}
+  .pill.mode.system{border-color:#6b21a8; color:#d8b4fe}
+  .pill.model{background:#12161c; color:var(--mut); letter-spacing:.6px; font-size:11px; min-width:0; max-width:44%; overflow:hidden; text-overflow:ellipsis; flex-shrink:1}
   .meta{color:var(--mut); font-size:12.5px; letter-spacing:.3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; flex:1 1 0%}
   .meta .k{color:var(--dim)}
   .up{margin-left:auto; color:var(--mut); font-size:12.5px; letter-spacing:.5px; white-space:nowrap; font-variant-numeric:tabular-nums; padding-left:8px; flex-shrink:0}
@@ -135,8 +138,10 @@
   .idle{color:var(--dim); text-align:center; padding:60px 20px; letter-spacing:.5px; font-size:13px}
   .collapsed{display:none}
 
+  .row.sys .pill.model{max-width:34%}
   @media (max-width:760px){
     .meta{max-width:42vw}
+    .row.sys .pill.model{max-width:28%}
   }
 </style>
 </head>
@@ -232,6 +237,7 @@ function lampClassFromState(state){
 }
 function resolveLampClass(opts){
   opts=opts||{};
+  if(opts.system) return 'system';
   if(opts.fallback==='died') return 'fail';
   const fromStatus=lampClassFromStatus(opts.status);
   if(fromStatus) return fromStatus;
@@ -339,24 +345,41 @@ function familyName(kind){
   if(kind==='forest-watch') return 'forest-watch';
   return kind||'?';
 }
+function isSystemNode(n){
+  if(!n) return false;
+  if(n.role==='system') return true;
+  const job=String(n.label||n.channel||'').toLowerCase();
+  return n.kind==='grok' && job==='remote relay';
+}
+function systemJobLabel(n){
+  return (n && (n.label || n.channel)) || 'remote relay';
+}
+function isSystemSlot(s){
+  if(!s) return false;
+  if(s.role==='system') return true;
+  const job=String(s.channel||s.lane||'').toLowerCase();
+  return s.kind==='grok' && job==='remote relay';
+}
 function nodeHTML(n){
   const kids = (n.children&&n.children.length) ? n.children : null;
   const isDisp = !hasLamp(n.kind);
+  const sys = isSystemNode(n);
   const tri = kids ? '<span class="tri open" data-node></span>' : '<span class="tri hidden"></span>';
-  const lc=resolveLampClass({status:n.status,state:n.state});
+  const lc=resolveLampClass({status:n.status,state:n.state,system:sys});
   const si=isStalledFlash(n.state,n.channel,n.label,n.lane);
   const lamp = isDisp ? '' : '<span class="'+lampSpanClass(lc,si,false)+'"></span>';
   const nm = isDisp
     ? '<span class="name">team-dispatch</span>'+(n.channel||n.lane?' <span class="meta">'+esc(n.channel||n.lane)+'</span>':'')
     : '<span class="name">'+esc(familyName(n.kind))+'</span>';
-  const mode = (!isDisp&&n.mode) ? '<span class="pill mode">'+esc(String(n.mode).toUpperCase())+'</span>' : '';
+  const modeLabel=sys?'SYSTEM':(n.mode?String(n.mode).toUpperCase():'');
+  const mode = (!isDisp&&modeLabel) ? '<span class="pill mode'+(sys?' system':'')+'">'+esc(modeLabel)+'</span>' : '';
   const modelLabel=(!isDisp&&n.model)?formatModelLabel(n.model):null;
   const model=modelLabel?'<span class="pill model">'+esc(modelLabel)+'</span>':'';
-  const pid = (!isDisp&&n.pid!=null&&n.pid!=='') ? '<span class="meta">'+esc(String(n.pid))+'</span>' : '';
-  const ident = n.tty || n.channel || n.label;
+  const jobMeta = (!isDisp&&sys) ? '<span class="meta">'+esc(systemJobLabel(n))+'</span>' : '';
+  const ident = n.tty || (!sys && (n.channel || n.label));
   const chan = (!isDisp&&ident) ? '<span class="meta">'+esc(ident)+'</span>' : '';
   const tip = [familyName(n.kind),n.model,n.mode,n.pid!=null?String(n.pid):'',n.tty,n.channel,n.label,n.status].filter(Boolean).join(' \u00b7 ')+' \u00b7 UP '+fmtDur(n.uptime_s);
-  const row = '<div class="row" title="'+esc(tip)+'">'+tri+lamp+nm+mode+model+pid+chan+'<span class="up">UP '+fmtDur(n.uptime_s)+'</span></div>';
+  const row = '<div class="row'+(sys?' sys':'')+'" title="'+esc(tip)+'">'+tri+lamp+nm+mode+model+jobMeta+chan+'<span class="up">UP '+fmtDur(n.uptime_s)+'</span></div>';
   const children = kids ? '<div class="kids">'+kids.map(c=>'<div class="node">'+nodeHTML(c)+'</div>').join('')+'</div>' : '';
   return row+children;
 }
@@ -476,7 +499,8 @@ function renderTasks(){
     (h.tasks||[]).forEach(t=>{
       const slots=t.slots||[];
       const inner='<div class="grid">'+slots.map(s=>{
-          const lc=resolveLampClass({state:s.state});
+          const sys=isSystemSlot(s);
+          const lc=resolveLampClass({state:s.state,system:sys});
           const si=isStalledFlash(s.state,s.channel,s.lane,s.lane);
           const tip=esc(s.lane)+' \u00b7 '+String(s.state||'').toUpperCase()+' \u00b7 '+fmtDur(s.age_s)+(s.channel?' \u00b7 '+esc(s.channel):'');
           return '<div class="cell" title="'+tip+'"><span class="'+lampSpanClass(lc,si,true)+'"></span><span class="nm">'+esc(s.lane)+'</span><span class="cage">'+fmtDur(s.age_s)+'</span></div>';
@@ -583,14 +607,23 @@ document.addEventListener('click', e=>{
 document.addEventListener('keydown', e=>{ if((e.key==='Enter'||e.key===' ')&&e.target.classList&&e.target.classList.contains('chip')){ e.preventDefault(); e.target.click(); } });
 
 /* ---- Tauri host: this-machine from local daemon; other hosts from Halus/LAN ---- */
-const FLEET_REFRESH_MS = 30000;
-const LOCAL_WAIT_TIMEOUT_S = 25;
+const FLEET_REFRESH_MS = 15000;
+const LOCAL_WAIT_TIMEOUT_S = 55;
+const HOST_CONTRIB_DEBOUNCE_MS = 2500;
 const LOCAL_HOST_ID = 'mbp';
 const KEEP_KINDS = {claude:1, grok:1, cursor:1, 'claude-sub':1, 'grok-sub':1, 'cursor-sub':1, 'forest-watch':1};
 const WRAP_KINDS = {team_dispatch:1, 'team-dispatch':1, agent_dispatch:1, python:1};
 let FLEET_DOC = null;
 let LOCAL_MBP = null;
 let localCursor = 0;
+let hostContribPushTimer = null;
+function scheduleHostContribPush(){
+  if(hostContribPushTimer) clearTimeout(hostContribPushTimer);
+  hostContribPushTimer = setTimeout(function(){
+    hostContribPushTimer = null;
+    tauriInvoke('push_host_contrib').catch(function(){});
+  }, HOST_CONTRIB_DEBOUNCE_MS);
+}
 function resolveTauriInvoke(){
   try{
     const t=window.__TAURI__;
@@ -805,8 +838,12 @@ async function localWaitLoop(){
   while(true){
     try{
       await refreshLocalMbp();
+      const prevCursor = localCursor;
       const w=await tauriInvoke('wait_local', {cursor: localCursor, timeout: LOCAL_WAIT_TIMEOUT_S});
-      if(w && typeof w.cursor==='number') localCursor=w.cursor;
+      if(w && typeof w.cursor==='number'){
+        if(w.cursor !== prevCursor) scheduleHostContribPush();
+        localCursor=w.cursor;
+      }
     }catch(e){
       await new Promise(r=>setTimeout(r, 2000));
     }
@@ -1116,7 +1153,21 @@ function runModelLabelFixtures(){
   const fableHtml=nodeHTML({kind:'claude',model:'claude-fable-5',mode:'interactive',channel:'tty',uptime_s:10});
   chk('model-render-fable', fableHtml.indexOf('>fable<')>=0&&fableHtml.indexOf('>claude-fable-5<')<0);
   chk('model-render-title-raw', fableHtml.indexOf('claude-fable-5')>=0);
-  return ['PASS model-label-map','PASS model-null-no-chip','PASS model-render-fable','PASS model-render-title-raw'];
+  const harnessHtml=nodeHTML({kind:'cursor',model:'composer-2.5',mode:'interactive',channel:'tty',uptime_s:10});
+  chk('harness-full-cursor', harnessHtml.indexOf('class="name">cursor</span>')>=0);
+  chk('harness-full-claude', nodeHTML({kind:'claude',model:'sonnet',mode:'interactive',channel:'tty',uptime_s:10}).indexOf('class="name">claude</span>')>=0);
+  const sysHtml=nodeHTML({kind:'grok',role:'system',model:'grok-4.6',mode:'headless',channel:'remote relay',status:'running',state:'quiet',pid:4242,uptime_s:10});
+  chk('system-lamp-class', sysHtml.indexOf('class="lamp system"')>=0);
+  chk('system-mode-badge', sysHtml.indexOf('>SYSTEM<')>=0);
+  chk('system-job-right', sysHtml.indexOf('class="meta">remote relay</span>')>=0);
+  chk('system-no-pid-visible', !/class="meta">\d+<\/span>/.test(sysHtml));
+  const sysFallback=nodeHTML({kind:'grok',model:'grok-4.6',mode:'headless',channel:'remote relay',status:'running',state:'quiet',session_id:'sess-1',uptime_s:10});
+  chk('system-fallback-with-session', sysFallback.indexOf('class="lamp system"')>=0);
+  const sysPhone=nodeHTML({kind:'grok',role:'system',model:'grok-4.6',mode:'headless',channel:'remote relay',status:'running',state:'quiet',uptime_s:10});
+  chk('system-phone-label', sysPhone.indexOf('class="lamp system"')>=0&&sysPhone.indexOf('remote relay')>=0);
+  const cursorHtml=nodeHTML({kind:'cursor',model:'composer-2.5',mode:'interactive',pid:29662,channel:'ttys000',status:'running',uptime_s:10});
+  chk('tree-no-pid-meta', cursorHtml.indexOf('class="meta">29662')<0&&cursorHtml.indexOf('class="meta">ttys000')>=0);
+  return ['PASS model-label-map','PASS model-null-no-chip','PASS model-render-fable','PASS model-render-title-raw','PASS harness-full-label','PASS system-lamp-class','PASS system-mode-badge','PASS system-job-right','PASS system-no-pid-visible','PASS system-fallback-with-session','PASS system-phone-label','PASS tree-no-pid-meta'];
 }
 function runTreeRootFixtures(){
   return runSpawnGridFixtures().concat(runModelLabelFixtures());
@@ -1150,6 +1201,11 @@ function boot(){
   if(/[?&]mock=1\b/.test(location.search)){ window.overwatchRender(mockDoc()); return; }
   if(window.isTauri || tauriContext() || resolveTauriInvoke()){
     startFleetHost();
+    return;
+  }
+  if(window.__hosted){
+    document.getElementById('idle').style.display='none';
+    document.getElementById('clipanel').style.display='';
     return;
   }
   renderAll();

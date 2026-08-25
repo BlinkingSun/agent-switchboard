@@ -30,6 +30,9 @@ pub struct EdgeConfig {
     /// Optional mini LAN base URL (e.g. http://192.168.x.x:PORT). Used on-fleet only; halus fallback.
     #[serde(default)]
     pub lan_url: Option<String>,
+    /// Optional IP fallback when lan_url hostname resolution fails on LAN.
+    #[serde(default)]
+    pub lan_url_ip: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

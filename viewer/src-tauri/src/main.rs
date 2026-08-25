@@ -8,6 +8,7 @@ mod crypto;
 mod network;
 mod spawn;
 
+use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
@@ -49,14 +50,15 @@ fn fetch_fleet_dashboard_inner() -> Result<Value, String> {
     let bearer = cfg.bearer.trim();
     let halus = cfg.url.trim().trim_end_matches('/');
 
-    let lan_base = cfg
-        .lan_url
-        .as_ref()
-        .map(|s| s.trim().trim_end_matches('/'))
-        .filter(|s| !s.is_empty());
+    let lan_candidates: Vec<String> = [cfg.lan_url.as_deref(), cfg.lan_url_ip.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     if network::on_fleet_network() {
-        if let Some(lan) = lan_base {
+        for lan in &lan_candidates {
             if let Ok(doc) = get_dashboard(lan, bearer) {
                 return Ok(doc);
             }
@@ -200,6 +202,27 @@ fn start_daemon() -> Result<String, String> {
     Err(format!("kickstart {}: {last_err}", labels.join(" then ")))
 }
 
+fn overwatch_contrib_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join("overwatch-contrib"))
+}
+
+/// Fast path: push this machine's switchboard block to halus after a local daemon event.
+#[tauri::command]
+fn push_host_contrib() -> Result<(), String> {
+    let contrib_dir = overwatch_contrib_dir().ok_or_else(|| "HOME not set".to_string())?;
+    let script = contrib_dir.join("run-contrib.sh");
+    if !script.is_file() {
+        return Err(format!("contrib script missing: {}", script.display()));
+    }
+    Command::new(script)
+        .arg("--host-only")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn contrib: {e}"))?;
+    Ok(())
+}
+
 fn main() { // viewer revive: instant tauri boot
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -209,6 +232,7 @@ fn main() { // viewer revive: instant tauri boot
             fetch_local_status,
             fetch_local_health,
             wait_local,
+            push_host_contrib,
             spawn_pairing_available,
             submit_spawn,
             fetch_spawn_result,
